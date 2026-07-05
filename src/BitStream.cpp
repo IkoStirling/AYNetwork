@@ -1,0 +1,217 @@
+// BitStream.cpp - 位流序列化实现
+
+#include <AYNetwork.h>
+#include <cstring>
+#include <algorithm>
+
+namespace ayt::net
+{
+
+BitStream::BitStream()
+    : _data(nullptr)
+    , _allocatedSize(0)
+    , _bitPosition(0)
+    , _bitCount(0)
+    , _ownsData(true)
+{
+    _allocatedSize = 4096;
+    _data = malloc(_allocatedSize);
+}
+
+BitStream::BitStream(void* data, size_t size)
+    : _data(data)
+    , _allocatedSize(size)
+    , _bitPosition(0)
+    , _bitCount(size * 8)
+    , _ownsData(false)
+{
+}
+
+BitStream::~BitStream() {
+    if (_ownsData && _data) {
+        free(_data);
+    }
+}
+
+void BitStream::writeBits(const void* data, size_t bitCount) {
+    if (!data || bitCount == 0) return;
+
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    size_t byteCount = (bitCount + 7) >> 3;
+
+    ensureCapacity(byteCount);
+
+    uint8_t* dest = static_cast<uint8_t*>(_data);
+    for (size_t i = 0; i < byteCount; ++i) {
+        dest[_bitPosition >> 3] = src[i];
+        _bitPosition += 8;
+    }
+    _bitCount = std::max(_bitCount, _bitPosition);
+}
+
+void BitStream::writeByte(uint8_t byte) {
+    if (_ownsData && (_bitPosition >> 3) >= _allocatedSize) {
+        _allocatedSize *= 2;
+        _data = realloc(_data, _allocatedSize);
+    }
+
+    uint8_t* ptr = static_cast<uint8_t*>(_data);
+    ptr[_bitPosition >> 3] = byte;
+    _bitPosition += 8;
+    _bitCount += 8;
+}
+
+void BitStream::writeInt(int32_t value, int32_t minValue, int32_t maxValue) {
+    // 变长整数编码 (variable length integer)
+    uint32_t range = static_cast<uint32_t>(maxValue - minValue);
+    uint32_t unsignedValue = static_cast<uint32_t>(value - minValue);
+
+    // 计算所需位数
+    uint32_t bitsNeeded = 0;
+    if (range > 0) {
+        bitsNeeded = 1;
+        while ((1u << bitsNeeded) - 1 < range) {
+            bitsNeeded++;
+        }
+    }
+
+    // 写入所需位数
+    uint32_t mask = (1u << bitsNeeded) - 1;
+    uint32_t remaining = unsignedValue;
+
+    while (remaining > 0) {
+        uint8_t byte = remaining & 0x7F;
+        remaining >>= 7;
+        if (remaining > 0) {
+            byte |= 0x80;
+        }
+        writeByte(static_cast<uint8_t>(byte));
+    }
+
+    // 如果范围为0，写入一个0字节表示
+    if (bitsNeeded == 0) {
+        writeByte(0);
+    }
+}
+
+void BitStream::writeFloat(float value, float minValue, float maxValue) {
+    // 归一化到 [0, 1]
+    float normalized = (value - minValue) / (maxValue - minValue);
+    normalized = std::clamp(normalized, 0.0f, 1.0f);
+
+    // 定点数编码为 16 位
+    uint16_t fixed = static_cast<uint16_t>(normalized * 65535.0f);
+
+    writeByte(static_cast<uint8_t>(fixed & 0xFF));
+    writeByte(static_cast<uint8_t>((fixed >> 8) & 0xFF));
+}
+
+void BitStream::writeString(const char* str) {
+    if (!str) {
+        writeInt(0, 0, INT32_MAX);
+        return;
+    }
+
+    size_t len = strlen(str);
+    writeInt(static_cast<int32_t>(len), 0, INT32_MAX);
+
+    for (size_t i = 0; i < len; ++i) {
+        writeByte(static_cast<uint8_t>(str[i]));
+    }
+}
+
+void BitStream::readBits(void* data, size_t bitCount) {
+    if (!data || bitCount == 0) return;
+
+    uint8_t* dest = static_cast<uint8_t*>(data);
+    size_t byteCount = (bitCount + 7) >> 3;
+
+    uint8_t* src = static_cast<uint8_t*>(_data);
+    for (size_t i = 0; i < byteCount; ++i) {
+        dest[i] = src[_bitPosition >> 3];
+        _bitPosition += 8;
+    }
+}
+
+uint8_t BitStream::readByte() {
+    uint8_t* ptr = static_cast<uint8_t*>(_data);
+    uint8_t value = ptr[_bitPosition >> 3];
+    _bitPosition += 8;
+    return value;
+}
+
+int32_t BitStream::readInt(int32_t minValue, int32_t maxValue) {
+    uint32_t range = static_cast<uint32_t>(maxValue - minValue);
+
+    // 计算位数
+    uint32_t bitsNeeded = 0;
+    if (range > 0) {
+        bitsNeeded = 1;
+        while ((1u << bitsNeeded) - 1 < range) {
+            bitsNeeded++;
+        }
+    }
+
+    // 读取位
+    uint32_t result = 0;
+    uint32_t shift = 0;
+    uint8_t byte;
+
+    do {
+        byte = readByte();
+        result |= (static_cast<uint32_t>(byte & 0x7F) << shift);
+        shift += 7;
+    } while ((byte & 0x80) != 0 && shift < 32);
+
+    return static_cast<int32_t>(result) + minValue;
+}
+
+float BitStream::readFloat(float minValue, float maxValue) {
+    uint16_t fixed = readByte();
+    fixed |= (static_cast<uint16_t>(readByte()) << 8);
+
+    float normalized = static_cast<float>(fixed) / 65535.0f;
+    return minValue + normalized * (maxValue - minValue);
+}
+
+void BitStream::readString(char* out, size_t maxLen) {
+    int32_t len = readInt(0, INT32_MAX);
+
+    if (len <= 0 || !out) {
+        if (out && maxLen > 0) out[0] = '\0';
+        return;
+    }
+
+    size_t toRead = std::min(static_cast<size_t>(len), maxLen - 1);
+    uint8_t* ptr = static_cast<uint8_t*>(_data);
+
+    for (size_t i = 0; i < toRead; ++i) {
+        out[i] = static_cast<char>(ptr[_bitPosition >> 3]);
+        _bitPosition += 8;
+    }
+    out[toRead] = '\0';
+}
+
+void BitStream::reset() {
+    _bitPosition = 0;
+    _bitCount = 0;
+}
+
+void BitStream::resetForRead() {
+    _bitPosition = 0;
+}
+
+void BitStream::ensureCapacity(size_t additionalBytes) {
+    if (!_ownsData) return;
+
+    size_t currentBytes = (_bitPosition + 7) >> 3;
+    size_t needed = currentBytes + additionalBytes;
+
+    if (needed > _allocatedSize) {
+        size_t newSize = std::max(_allocatedSize * 2, needed);
+        _data = realloc(_data, newSize);
+        _allocatedSize = newSize;
+    }
+}
+
+} // namespace ayt::net
