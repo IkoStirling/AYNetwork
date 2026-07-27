@@ -565,22 +565,29 @@ AYNetwork
 | 自研 `SequenceNumber` | ✅ R2 删 | 与 GNS 双计 seq 禁止, PacketHeader v2 无 packetId |
 | 协议一致性测试 | ✅ R2 | AYTest_PacketCodec.cpp: 7 纯 + 3 GNS, 含末片/乱序/重复/丢包 |
 
-### Phase 3：复制层（**未完成**）
+### Phase 3：复制层 — **R3.0 MVP 完成 (2026-07-27)**
 
 **目标**：基于 AYReflect 的自动同步 + §6.6 Authority
 
-**当前实现度**：类骨架存在，**核心方法全空**
+**当前实现度**：R3.0 MVP ship — 226/226 tests PASS
 
-| 子项 | 当前状态 | 缺口 |
+| 子项 | 当前状态 | 备注 |
 |------|---------|------|
-| `ReplicationManager::registerObject/findObject` | ✅ | 基本 CRUD OK |
-| `ReplicationManager::replicate` | ❌ 空 | TODO |
-| `ReplicationManager::onReceive` | ❌ 空 | TODO |
-| `serializeObject` + AYReflect | ❌ | R3 |
-| `ReplicationSystem ↔ Manager` | ❌ | 禁止双 map |
-| Authority / Ownership（§6.6） | ❌ 规格已锁 | R3 实现 |
-| Full Snapshot + Delta | ❌ | R3 |
-| 目录重复 `ReplicationManager.cpp` | ✅ 已处理方向 | 以 CMake 为准 |
+| `ReplicationManager::registerObject(void*, ITypeInfo*, uint32_t)` | ✅ | 主路径 |
+| `ReplicationManager::registerObject(IReplicable*, uint32_t)` | ⚠ deprecated | R1 wrapper，R3.0 默认空 `replicate` impl；R3.1 删除 |
+| `ReplicationManager::findType/findObject/findIReplicable` | ✅ | R3.0 新增 |
+| `ReplicationManager::tick` | ✅ | 服务端 Full Snapshot 每 tick |
+| `ReplicationManager::onReceive` | ✅ | inner u16 msgType demux |
+| `ReplicationManager::forceReplicate` | ⚠ no-op | R3.1 dirty-tracking 才真实现 |
+| `ReflectSerializer` (H+CPP) | ✅ NEW | 12 WireTypeId dispatch + AYReflect walk |
+| `ReplicationSystem ↔ Manager` | ✅ | 删除 netId↔entityId 双 map；System 降级 adapter |
+| Authority / Ownership（§6.6） | ✅ Server-only 实现 | clients 不 broadcast；服务端拒绝未知 netId |
+| Full Snapshot | ✅ | R3.0 MVP：每 tick 全量 |
+| Delta Update | ❌ | **R3.1 work** — `_fieldVersions[netId, fieldIdx]` 表 |
+| `EntityReplicationAdapter.h` | ✅ NEW | ECS 桥接 |
+| `IReplicable::replicate/onReplicate` | ⚠ deprecated | R3.0 默认空实现，R3.1 删除 |
+| 嵌套 struct / array 字段 | ❌ | **R3.2 work** — 扩展 WireTypeId 12..15 |
+| Simulated/Autonomous Proxy gate | ❌ | **R5 work** — lag comp 一并做 |
 
 ### Phase 4：RPC（**未开始**）
 
@@ -666,14 +673,16 @@ AYNetwork
 5. 协议一致性测试：乱序/丢包/重复/分片 注入 ✅
 6. 握手包迁移到 PacketHeader v2 (msgType=0xFFFF) ✅ (R2 done bonus, was originally R3)
 
-### Phase R3（4 周）：复制层真接通
+### Phase R3.0（4 周 → R3.0 MVP 1 周）：复制层真接通
 
-1. `ReplicationManager::serializeObject(const ITypeInfo*, void*, BitStream&)` 走 AYReflect 反射遍历字段，按 `FieldAttribute::NetReplicate` 决定是否序列化
-2. `replicate()` 真发，`onReceive(BitStream&)` 真收
-3. `ReplicationSystem` ↔ `ReplicationManager` 互通
-4. Authoritative Server 模型（`NetComponent::isOwner()` 真影响 replication 决策）
-5. Full Snapshot（新连接加入时一次全量）+ Delta Update（脏字段增量）
-6. **删除空宏** `AY_NET_FIELD`（统一走 AYReflect 元数据）
+1. `ReplicationManager::serializeObject(const ITypeInfo*, void*, BitStream&)` 走 AYReflect 反射遍历字段，按 `FieldAttribute::NetReplicate` 决定是否序列化 — ✅ 实现为 `ReflectSerializer::serializeObject(type, obj, netId, BitStream&)`
+2. `replicate()` 真发，`onReceive(BitStream&)` 真收 — ✅ `tick()` 服务端 broadcast + `onReceive(BitStream&, NetConnection*)` 解码
+3. `ReplicationSystem` ↔ `ReplicationManager` 互通 — ✅ 删双 map；System 降级 adapter，`onUpdate` → `ReplicationManager::tick`
+4. Authoritative Server 模型（`NetComponent::isOwner()` 真影响 replication 决策）— ✅ §6.6 v1 = Server 权威；clients 不 broadcast；服务端对未知 netId 帧拒绝；**Simulated/Autonomous Proxy gate 留 R5**
+5. Full Snapshot（新连接加入时一次全量）+ Delta Update（脏字段增量）— ✅ Full Snapshot 每 tick；**Delta Update 留 R3.1**
+6. **删除空宏** `AY_NET_FIELD`（统一走 AYReflect 元数据）— ✅ R2 已删，`AYTYPE_FIELD_EX(... NetReplicate)` 是新规约
+
+**R3.0 = 226/226 PASS, 2026-07-27 ship**
 
 ### Phase R4（3 周）：RPC + Interest Management
 
@@ -830,6 +839,7 @@ Platform Layer                ← AYPlatform 已有 Thread/Mutex
 | 2026-07-27 | **R1.A 多连接 pump**：GnsConnection 引入 `s_adoptFactory` + `serverAdopters()` fallback；AYNetworkSubSystem 持 `_serverClients` 列表，`update()` pump server parent + N children，`broadcast()` 真广播；新增 `MultiClientEcho` 测试（1 server + 2 clients）；53/53 PASS |
 | 2026-07-27 | **R1 done 收口**：新增 `DisconnectReason` 枚举 + `HandshakeMsgType` 枚举 + HELLO/WELCOME/REJECT 线协议；`GnsConnection` 加 `setProtocolVersion()` + `getLastDisconnectReason()` + `Handshaking/Ready` 状态；onConnectionChange 签名扩展为 `(NetConnection*, bool, DisconnectReason)`；新增 `AYTest_Handshake` suite 3 个 case（HappyPath/VersionMismatch/PeerClose）；**R1 全 ship = LAN 玩具**；68/68 PASS |
 | 2026-07-27 | **R2 协议层完成**：PacketHeader v2 12B (msgType/schemaVersion/length/channel/flags/timestampMs) + 末尾 4B CRC32C (Castagnoli) + `PacketCodec` 纯函数 encode/decode + lz4 (decode 复用 AYStorage::Lz4Decompressor, encode R2 内薄包 `<lz4.h>`) + `PacketAssembler` 真做 fragment/consume (末片可变长, robust 乱序/重复/丢包) + SequenceNumber 完全删除 + 握手包迁移到 PacketHeader (msgType=0xFFFF) + AYTest_PacketCodec.cpp 10 case (7 纯 + 3 GNS);**173/173 PASS, 0 FAIL** |
+| 2026-07-27 | **R3.0 复制层 MVP ship** — design §13 R3 6 项全 ✅ + §6.6 Authority v1 = Server 权威实现：<br>• 新增 `WireTypeId` 12 primitive dispatch + BitStream raw helpers (writeBool/Int8..64/UInt8..64/FloatRaw/Double + readers)<br>• 新增 `kMsgTypeReplication=0x0001` / `kMsgTypeEntitySpawn=0x0002` / `kMsgTypeEntityDespawn=0x0003`<br>• 新增 `ReflectSerializer` (H+CPP) — 走 AYReflect `ITypeInfo` 元数据，按 `FieldAttribute::NetReplicate` 过滤，12-type dispatch (Bool/Int*/UInt*/Float/Double/String) 用 `typeid(T).hash_code()` 比对<br>• ReplicationFrame wire format：`[u32 netId][u16 typeHash][u8 fieldCount][u8 reserved]` + 字段 record `[u16 FNV-1a nameHash][u8 WireTypeId][value bytes]`；body 前缀 `[u16 innerMsgType]` 自描述（无需 GnsConnection 改 API）<br>• `ReplicationManager` 实装：`registerObject(void*, ITypeInfo*, uint32_t)` 主路径；`registerObject(IReplicable*, uint32_t)` 标记 deprecated wrapper（R3.0 默认空实现 + R3.1 删除 `replicate/onReplicate` 虚函数）；`tick()` 服务端 Full Snapshot 经 PacketCodec seal + CHANNEL_RELIABLE broadcast；`onReceive(BitStream&, NetConnection*)` 按 inner msgType demux；**Authority gate：客户端不 broadcast；服务端对未知 netId 的 replicate 帧拒绝**<br>• `ReplicationSystem` 降级为 adapter：**删除 _netIdToEntity / _entityToNetId 双 map**（design §13 R3 第 3 项锁定）；`onUpdate` 转发到 `ReplicationManager::tick`<br>• `IReplicable::replicate(BitStream&)` / `onReplicate(BitStream&)` 标 deprecated 空 default impl<br>• 新增 `EntityReplicationAdapter.h` ECS 桥接（`registerEntityComponent<T>` 取 component 指针 + reflect type → `ReplicationManager::registerObject`）<br>• AYReflect 配套：`AYReflect.cpp` 注册 native C++ 原生类型 `int8_t..int64_t` / `uint8_t..uint64_t` / `float` / `double` / `bool` / `std::string` 的 `typeid(T).hash_code()` 入 by-id 映射（之前只注册了 AYMath 别名），让 `AYTYPE_FIELD_EX` 直接拿 native 字段不报错<br>• 新增 `unittest/AYTest_Replication.cpp` 6 case：RoundTripPrimitives (12 WireTypeId) / FiltersNonReplicated / SnapshotBroadcast (端到端 GNS) / EntitySpawnAndDespawn / **AuthorityServerDropsClientReplicate** (§6.6 gate) / BitstreamPacketCodecIntegration<br>**R3.0 = 226/226 PASS (R2 baseline 173 + 53 new), test exit=0** |
 
 ---
 
