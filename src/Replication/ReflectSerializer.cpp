@@ -23,6 +23,7 @@
 #include <Replication/ReflectSerializer.h>
 
 #include <ayreflect/IReflect.h>
+#include <Protocol/PacketCodec.h>
 #include <cstring>
 #include <string>
 
@@ -258,6 +259,102 @@ bool ReflectSerializer::deserializeObject(const ayt::reflect::ITypeInfo* type, v
         if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) return false;
 
         if (!readFieldValue(s, wid, field->get(obj))) return false;
+    }
+    return true;
+}
+
+// =============================================================================
+// R3.1 (2026-07-27): serializeDirtyFields + hashFieldValue
+//
+// The server tracks per-field CRC32C hashes via ReflectedEntry::_fieldHashes
+// (size = NetReplicate field count). On tick() it compares the current value's
+// hash to the stored one and only emits a field record for the dirty ones.
+// This keeps Delta frames tiny — typically 5–15 B per dirty field versus the
+// Full Snapshot which always carries every NetReplicate field.
+//
+// Wire format produced by serializeDirtyFields is byte-for-byte the same as
+// serializeObject's frame: same 8B header, same field records. The receiver's
+// deserializeObject doesn't care which envelope msgType wrapped it.
+// =============================================================================
+
+namespace {
+
+// CRC32C over the raw bytes of a field value. std::string is special-cased
+// because it's not trivially-copyable. Empty strings hash to a deterministic
+// value (CRC32C of zero-length input).
+uint32_t crcOfFieldValue(WireTypeId id, const void* fieldPtr) {
+    switch (id) {
+        case WireTypeId::Bool:   { bool    v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Int8:   { int8_t  v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Int16:  { int16_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Int32:  { int32_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Int64:  { int64_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::UInt8:  { uint8_t  v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::UInt16: { uint16_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::UInt32: { uint32_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::UInt64: { uint64_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Float:  { float    v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Double: { double   v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::String: {
+            const auto* strPtr = static_cast<const std::string*>(fieldPtr);
+            return PacketCodec::computeCrc32c(
+                reinterpret_cast<const uint8_t*>(strPtr->data()), strPtr->size());
+        }
+    }
+    return 0;
+}
+
+} // anonymous namespace
+
+uint32_t ReflectSerializer::hashFieldValue(WireTypeId id, const void* fieldPtr) {
+    if (!fieldPtr) return 0;
+    return crcOfFieldValue(id, fieldPtr);
+}
+
+bool ReflectSerializer::serializeDirtyFields(const ayt::reflect::ITypeInfo* type, const void* obj,
+                                             uint32_t netId, const std::vector<uint32_t>& denseIndices,
+                                             BitStream& s) {
+    if (!type || !obj || denseIndices.empty()) return false;
+
+    const uint32_t total = type->getFieldCount();
+    const uint32_t fieldCount = static_cast<uint32_t>(denseIndices.size());
+    if (fieldCount > 255) return false; // frame header fieldCount is u8
+
+    // Walk type fields once, collecting NetReplicate ones into a dense list.
+    // The `denseIndices[k]` is the index into THAT dense list, NOT into
+    // type->getField(). So we rebuild the dense list here too.
+    //
+    // For typical entity counts (a few per tick) and modest field counts
+    // (≤32), this O(N+M) scan is cheaper than maintaining a side index.
+    std::vector<const ayt::reflect::IFieldInfo*> netFields;
+    netFields.reserve(total);
+    for (uint32_t i = 0; i < total; ++i) {
+        const auto* f = type->getField(i);
+        if (!f) continue;
+        if (!f->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
+        WireTypeId wid;
+        if (!resolveWireTypeId(f->getType(), wid)) continue; // unsupported type → skip
+        netFields.push_back(f);
+    }
+
+    // Validate every requested dense index resolves to a supported field.
+    for (uint32_t k = 0; k < fieldCount; ++k) {
+        if (denseIndices[k] >= netFields.size()) return false;
+    }
+
+    const size_t typeHash = static_cast<size_t>(type->getId() & 0xFFFFu);
+    writeReplicationFrameHeader(s, netId, static_cast<uint16_t>(typeHash),
+                                static_cast<uint8_t>(fieldCount));
+
+    for (uint32_t k = 0; k < fieldCount; ++k) {
+        const auto* field = netFields[denseIndices[k]];
+        WireTypeId wid;
+        resolveWireTypeId(field->getType(), wid); // already verified above
+
+        const uint16_t nameHash = hashFieldName(field->getName());
+        s.writeUInt16(nameHash);
+        s.writeUInt8(static_cast<uint8_t>(wid));
+        writeFieldValue(s, wid, field->get(const_cast<void*>(obj)));
     }
     return true;
 }

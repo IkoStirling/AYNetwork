@@ -1,17 +1,22 @@
 #pragma once
-// ReflectSerializer.h - R3.0 AYReflect-driven wire format serializer
+// ReflectSerializer.h - R3.0/R3.1 AYReflect-driven wire format serializer
 //
 // R3.0 (2026-07-27): serialization is driven entirely by ayt::reflect::ITypeInfo
 // metadata. The user tags fields with FieldAttribute::NetReplicate; this header
 // walks them and packs into the wire format below. The user does NOT need to
 // implement any virtual.
 //
+// R3.1 (2026-07-27): adds serializeDirtyFields + hashFieldValue so the server
+// can detect which fields actually changed since the last broadcast and pack
+// only those into a Delta frame. Wire format is identical to the R3.0 Full
+// Snapshot frame; receivers don't distinguish.
+//
 // Wire format (server → client):
 //
-//   ReplicationFrame body (one entity per frame):
+//   ReplicationFrame / DeltaFrame body (one entity per frame):
 //     [u32 netId]                       // 4 B
 //     [u16 typeHash]                    // 2 B — ayt::reflect::ITypeInfo::getId()
-//     [u8  fieldCount]                  // 1 B — number of NetReplicate fields
+//     [u8  fieldCount]                  // 1 B — number of fields in this frame
 //     [u8  reserved]                    // 1 B — 0
 //     [field records × fieldCount]
 //
@@ -29,7 +34,7 @@
 // Unsupported field types (any ITypeInfo not in WireTypeId, including nested
 // structs, arrays, pointers, std::string-in-struct-nested, etc.) cause
 // serializeObject to return false — the field is silently skipped (logged at
-// debug verbosity). R3.1+ extends WireTypeId range to cover more cases.
+// debug verbosity). R3.2+ extends WireTypeId range to cover more cases.
 
 #include <IAYNetwork.h>
 
@@ -52,6 +57,30 @@ public:
     static bool serializeObject(const ayt::reflect::ITypeInfo* type, const void* obj,
                                 uint32_t netId, BitStream& s);
 
+    // R3.1 (2026-07-27): serialize ONLY the NetReplicate fields whose
+    // dense-indices are listed in `denseIndices`. Same wire format as
+    // serializeObject (same 8B header, same field records). `denseIndices`
+    // is the position within the NetReplicate-only subset of type->getField()
+    // (i.e. denseIndices[0] refers to the first NetReplicate field, NOT the
+    // first type field in general — see ReplicationManager::_netFieldSparseIndex
+    // for the mapping).
+    //
+    // Returns false if denseIndices is empty, obj/type is null, or none of
+    // the listed fields have a supported WireTypeId. Frame header's fieldCount
+    // equals denseIndices.size() in the success case.
+    static bool serializeDirtyFields(const ayt::reflect::ITypeInfo* type, const void* obj,
+                                     uint32_t netId, const std::vector<uint32_t>& denseIndices,
+                                     BitStream& s);
+
+    // R3.1 (2026-07-27): compute the CRC32C of a single field's current
+    // in-memory value. Returns the hash so the server can detect whether a
+    // field changed since the last broadcast (compare against
+    // ReflectedEntry::_fieldHashes[denseIdx]).
+    //
+    // Uses PacketCodec::computeCrc32c on the raw bytes (with a fallback for
+    // std::string which is not trivially-copyable).
+    static uint32_t hashFieldValue(WireTypeId id, const void* fieldPtr);
+
     // Inverse of serializeObject. Reads `expectedFieldCount` field records
     // (from the frame header fieldCount byte) and writes values back into
     // `obj`. Returns false on:
@@ -62,6 +91,10 @@ public:
     // On false, obj is partially mutated — caller should treat state as
     // indeterminate (typical real-game reaction: snapshot is dropped, next
     // tick's snapshot will heal).
+    //
+    // R3.1 note: this path is also used by kMsgTypeDelta. Wire format is
+    // identical to kMsgTypeReplication so a single deserializeObject
+    // implementation covers both.
     static bool deserializeObject(const ayt::reflect::ITypeInfo* type, void* obj, BitStream& s, uint8_t expectedFieldCount);
 
     // ---- Body frame helpers (called by ReplicationManager) ----

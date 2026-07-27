@@ -18,11 +18,26 @@ namespace ayt::net
 // ReflectedEntry — single record kept in _objects.
 // Both register paths (IReplicable* legacy and (void*, ITypeInfo*) primary)
 // populate the same entry so dispatch in tick/onReceive is uniform.
+//
+// R3.1 (2026-07-27) dirty-tracking state:
+//   - _netFieldSparseIndex[denseIdx] = type->getField() sparse index for the
+//     corresponding NetReplicate field. The dense list has one entry per
+//     NetReplicate field (in the order they appear in type->getField()).
+//   - _fieldHashes[denseIdx] = CRC32C of the last successfully broadcast
+//     value for that field. The invariant after each tick() is:
+//       _fieldHashes[i] == hash of the receiver-side current value of field i
+//   - _initialized is false until the first tick has emitted the Full
+//     Snapshot; the next tick uses _fieldHashes as the comparison baseline.
 // =============================================================================
 struct ReplicationManager::ReflectedEntry {
     void*                          obj = nullptr;   // live object memory
     const ayt::reflect::ITypeInfo* type = nullptr;  // metadata for serializer
     IReplicable*                   iface = nullptr; // optional IReplicable adapter
+
+    // ---- R3.1 dirty-tracking ----
+    std::vector<uint32_t> _fieldHashes;            // dense-indexed CRC32C cache
+    std::vector<uint32_t> _netFieldSparseIndex;   // dense → type->getField() sparse
+    bool                  _initialized = false;   // false until first Full Snapshot emitted
 };
 
 // =============================================================================
@@ -39,12 +54,48 @@ ReplicationManager::~ReplicationManager() {
 // =============================================================================
 // R3.0 primary register path
 // =============================================================================
+namespace {
+
+// Walk type fields once, collecting NetReplicate ones into two parallel arrays:
+//   sparseIndex[k] = type->getField() index of the k-th NetReplicate field
+// The size of the result equals the number of NetReplicate fields the type
+// actually has (after filtering by NetReplicate AND by a supported WireTypeId).
+//
+// R3.1 dirty-tracking uses the same scan that serializeObject uses internally
+// to compute fieldCount, so the wire layout stays in lock-step with the
+// server-side hash baseline.
+void buildNetFieldMap(const ayt::reflect::ITypeInfo* type,
+                      std::vector<uint32_t>& sparseIndex) {
+    sparseIndex.clear();
+    if (!type) return;
+    const uint32_t total = type->getFieldCount();
+    for (uint32_t i = 0; i < total; ++i) {
+        const auto* f = type->getField(i);
+        if (!f) continue;
+        if (!f->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
+        WireTypeId wid;
+        if (!ReflectSerializer::resolveWireTypeId(f->getType(), wid)) continue;
+        sparseIndex.push_back(i);
+    }
+}
+
+} // anonymous namespace
+
 void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId) {
     if (!obj || !type || netId == 0) return;
 
     ReflectedEntry e;
     e.obj  = obj;
     e.type = type;
+
+    // R3.1: build the dense→sparse mapping once, sized to the NetReplicate
+    // field count. _fieldHashes stays zero-initialized so the first tick
+    // comparison forces a Full Snapshot (every field's current hash != 0
+    // sentinel, OR _initialized==false gate below — see tick()).
+    buildNetFieldMap(type, e._netFieldSparseIndex);
+    e._fieldHashes.assign(e._netFieldSparseIndex.size(), 0u);
+    e._initialized = false;
+
     _objects[netId] = e;
 
     // R3.0: server authority also broadcasts an EntitySpawn announcement so
@@ -137,11 +188,17 @@ IReplicable* ReplicationManager::findIReplicable(uint32_t netId) const {
 
 // =============================================================================
 // tick — server-side only (authority gate). Iterates registered objects and
-// broadcasts a ReplicationFrame per object via PacketCodec seal. Each frame
-// is independent: per-object failure (no NetReplicate fields or unsupported
-// types) does not affect other objects.
+// broadcasts either a Full Snapshot (kMsgTypeReplication on CHANNEL_RELIABLE)
+// or a Delta frame (kMsgTypeDelta on CHANNEL_UNRELIABLE), depending on the
+// dirty-tracking state.
 //
-// R3.0: Full Snapshot every tick. Dirty-bit Delta is R3.1 work.
+// R3.0 (pre-R3.1): Full Snapshot every tick — wasted bandwidth when nothing
+//                  changed.
+// R3.1 (2026-07-27): per-NetReplicate-field CRC32C baseline in
+//                   ReflectedEntry::_fieldHashes; tick() compares current
+//                   hashes against the baseline and emits ONLY the dirty
+//                   fields. First tick (or after forceReplicate) emits Full.
+//                   Steady state with zero changes emits NO frame.
 // =============================================================================
 void ReplicationManager::tick(float /*deltaTime*/) {
     if (!_network && !_broadcastSink) return;
@@ -159,25 +216,69 @@ void ReplicationManager::tick(float /*deltaTime*/) {
     for (uint32_t netId : netIds) {
         auto it = _objects.find(netId);
         if (it == _objects.end()) continue;
-        const ReflectedEntry& e = it->second;
+        ReflectedEntry& e = it->second;
 
         // Skip legacy IReplicable entries (type==nullptr). R3.0 sends only
         // EntitySpawn for them — full Snapshot frames require AYReflect metadata.
         if (!e.type) continue;
 
-        BitStream body;
-        body.writeUInt16(kMsgTypeReplication); // inner msgType discriminator
-        if (!ReflectSerializer::serializeObject(e.type, e.obj, netId, body)) {
-            // No supported NetReplicate fields — skip silently.
-            continue;
+        // Compute current CRC32C for each NetReplicate field. We always walk
+        // every field even in steady state because we need the hash to compare
+        // against _fieldHashes.
+        const uint32_t nFields = static_cast<uint32_t>(e._netFieldSparseIndex.size());
+        std::vector<uint32_t> currentHashes(nFields);
+        std::vector<uint32_t> dirtyIndices; dirtyIndices.reserve(nFields);
+        for (uint32_t k = 0; k < nFields; ++k) {
+            const auto* field = e.type->getField(e._netFieldSparseIndex[k]);
+            if (!field) continue; // shouldn't happen, but defensive
+            WireTypeId wid;
+            if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
+            currentHashes[k] = ReflectSerializer::hashFieldValue(wid, field->get(e.obj));
+            if (!e._initialized || currentHashes[k] != e._fieldHashes[k]) {
+                dirtyIndices.push_back(k);
+            }
         }
-        std::vector<uint8_t> sealed = PacketCodec::encode(
-            static_cast<const uint8_t*>(body.getData()), body.getSize(),
-            kMsgTypeReplication, kSchemaVersion,
-            CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
-            /*compress=*/ false);
-        if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
-        else                _network->broadcast(CHANNEL_RELIABLE, sealed.data(), sealed.size());
+
+        // Decision:
+        //   - Not yet initialized → emit Full Snapshot (R3.0 path, RELIABLE)
+        //   - No dirty fields (steady state) → emit nothing
+        //   - Some dirty fields → emit Delta (R3.1 path, UNRELIABLE)
+        //   - forceReplicate → set _initialized=false → next tick goes Full
+        if (!e._initialized) {
+            BitStream body;
+            body.writeUInt16(kMsgTypeReplication); // inner msgType discriminator
+            if (ReflectSerializer::serializeObject(e.type, e.obj, netId, body)) {
+                std::vector<uint8_t> sealed = PacketCodec::encode(
+                    static_cast<const uint8_t*>(body.getData()), body.getSize(),
+                    kMsgTypeReplication, kSchemaVersion,
+                    CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+                    /*compress=*/ false);
+                if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
+                else                _network->broadcast(CHANNEL_RELIABLE, sealed.data(), sealed.size());
+                // Update hash baseline to current values so subsequent ticks
+                // only emit Delta for fields that change AGAIN.
+                e._fieldHashes = currentHashes;
+            }
+            e._initialized = true;
+        }
+        else if (!dirtyIndices.empty()) {
+            BitStream body;
+            body.writeUInt16(kMsgTypeDelta); // inner msgType discriminator
+            if (ReflectSerializer::serializeDirtyFields(e.type, e.obj, netId, dirtyIndices, body)) {
+                std::vector<uint8_t> sealed = PacketCodec::encode(
+                    static_cast<const uint8_t*>(body.getData()), body.getSize(),
+                    kMsgTypeDelta, kSchemaVersion,
+                    CHANNEL_UNRELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+                    /*compress=*/ false);
+                if (_broadcastSink) _broadcastSink(CHANNEL_UNRELIABLE, sealed.data(), sealed.size());
+                else                _network->broadcast(CHANNEL_UNRELIABLE, sealed.data(), sealed.size());
+                // Update only the dirty indices — leave unchanged ones alone
+                // so a false-positive dirty in the same tick is still detected
+                // next tick (defensive against CRC32C collisions).
+                for (uint32_t k : dirtyIndices) e._fieldHashes[k] = currentHashes[k];
+            }
+        }
+        // else: steady state — emit nothing.
     }
 }
 
@@ -211,7 +312,11 @@ bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
     const uint16_t innerMsg = stream.readUInt16();
 
     switch (innerMsg) {
-        case kMsgTypeReplication: {
+        case kMsgTypeReplication:
+        case kMsgTypeDelta: {
+            // R3.1: Delta frames share the wire format with Full Snapshots
+            // (same 8B header, same field records). The receiver doesn't
+            // need to distinguish — just walk the same deserializeObject.
             ReflectSerializer::FrameHeader hdr;
             if (!ReflectSerializer::readReplicationFrameHeader(stream, hdr)) return false;
             // Look up the local object's type info
@@ -253,13 +358,46 @@ bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
 }
 
 // =============================================================================
-// forceReplicate — for testing only. R3.0 already broadcasts every tick so
-// this is a no-op (kept for R1 API compatibility). R3.1+ dirty-tracking will
-// implement this as a flush.
+// forceReplicate — R3.1 real implementation: marks the entry as not-yet-
+// initialized so the next tick emits a Full Snapshot regardless of dirty
+// state. Useful after a client reconnects, after a teleport, or after the
+// user explicitly changes a server-side field that all clients must observe.
+//
+// One-shot behavior: the next tick() sets _initialized=true after emitting
+// the Full Snapshot; subsequent ticks resume dirty-tracking. Callers that
+// want repeated Full Snapshots must call forceReplicate each tick.
 // =============================================================================
 void ReplicationManager::forceReplicate(uint32_t netId) {
-    (void)netId;
-    // R3.0: per-tick broadcast already covers this. R3.1 will narrow to dirty fields.
+    auto it = _objects.find(netId);
+    if (it == _objects.end()) return;
+    it->second._initialized = false;
+}
+
+// =============================================================================
+// getDirtyFieldCount — debug / test helper. Returns the count of NetReplicate
+// fields currently considered dirty. 0 = steady state (no frame on next tick).
+// SIZE_MAX signals "netId not registered" or "legacy IReplicable path" (no
+// type info, no dirty tracking). The value is computed by walking each field
+// and hashing it, just like tick() — caller should treat this as O(N) per call.
+// =============================================================================
+size_t ReplicationManager::getDirtyFieldCount(uint32_t netId) const {
+    auto it = _objects.find(netId);
+    if (it == _objects.end()) return SIZE_MAX;
+    const ReflectedEntry& e = it->second;
+    if (!e.type) return SIZE_MAX;
+    if (!e._initialized) return e._fieldHashes.size(); // first tick = full
+
+    size_t dirtyCount = 0;
+    const uint32_t nFields = static_cast<uint32_t>(e._netFieldSparseIndex.size());
+    for (uint32_t k = 0; k < nFields; ++k) {
+        const auto* field = e.type->getField(e._netFieldSparseIndex[k]);
+        if (!field) continue;
+        WireTypeId wid;
+        if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
+        const uint32_t cur = ReflectSerializer::hashFieldValue(wid, field->get(e.obj));
+        if (cur != e._fieldHashes[k]) ++dirtyCount;
+    }
+    return dirtyCount;
 }
 
 void ReplicationManager::setExtension(INetworkExtension* ext) {

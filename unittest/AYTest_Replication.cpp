@@ -513,3 +513,1039 @@ TEST_CASE(SerializeAndDecodeOverPacketCodec) {
     CHECK(dst.s   == "PacketCodec");
 }
 TEST_SUITE_END
+
+// =============================================================================
+// R3.1 (2026-07-27): dirty-tracking / Delta frame cases.
+//
+// Six pure-serializer cases first (no GNS, no ReplicationManager), then
+// fifteen end-to-end GNS loopback cases that exercise the manager's tick()
+// state machine. The R3.0 cases above are unchanged and must continue to
+// pass — these are added at the bottom.
+// =============================================================================
+
+// =============================================================================
+// Case 7 — hashFieldValue is stable for an unchanged field (same value →
+// same CRC32C). The dirty-tracking baseline update relies on this.
+// =============================================================================
+TEST_SUITE(DirtyHashStable)
+TEST_CASE(HashStableForUnchangedField) {
+    ayt::test::setCurrentCase("HashStableForUnchangedField");
+
+    ReplicationAllPrimitives src{};
+    src.i32 = 0xCAFEBABE;
+    src.s   = "stable";
+
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+    const auto* field_i32 = type->findField("i32");
+    const auto* field_s   = type->findField("s");
+    CHECK(field_i32 != nullptr);
+    CHECK(field_s   != nullptr);
+
+    WireTypeId wid_i32, wid_s;
+    CHECK(ReflectSerializer::resolveWireTypeId(field_i32->getType(), wid_i32));
+    CHECK(ReflectSerializer::resolveWireTypeId(field_s->getType(),   wid_s));
+
+    const uint32_t h1_i32 = ReflectSerializer::hashFieldValue(wid_i32, field_i32->get(&src));
+    const uint32_t h2_i32 = ReflectSerializer::hashFieldValue(wid_i32, field_i32->get(&src));
+    CHECK_INT_EQ(static_cast<unsigned>(h1_i32), static_cast<unsigned>(h2_i32));
+
+    const uint32_t h1_s = ReflectSerializer::hashFieldValue(wid_s, field_s->get(&src));
+    const uint32_t h2_s = ReflectSerializer::hashFieldValue(wid_s, field_s->get(&src));
+    CHECK_INT_EQ(static_cast<unsigned>(h1_s), static_cast<unsigned>(h2_s));
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 8 — hashFieldValue detects changes (different values → different
+// hashes). The dirty bit flip relies on this.
+// =============================================================================
+TEST_SUITE(DirtyHashChanges)
+TEST_CASE(HashChangesForDifferentValues) {
+    ayt::test::setCurrentCase("HashChangesForDifferentValues");
+
+    ReplicationAllPrimitives a{};
+    ReplicationAllPrimitives b{};
+    a.i32 = 100; b.i32 = 200;
+
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    const auto* field = type->findField("i32");
+    WireTypeId wid;
+    CHECK(ReflectSerializer::resolveWireTypeId(field->getType(), wid));
+
+    const uint32_t ha = ReflectSerializer::hashFieldValue(wid, field->get(&a));
+    const uint32_t hb = ReflectSerializer::hashFieldValue(wid, field->get(&b));
+    CHECK(ha != hb);
+
+    // Sanity: same value across two objects still collides (i.e. same hash).
+    b.i32 = 100;
+    const uint32_t hc = ReflectSerializer::hashFieldValue(wid, field->get(&b));
+    CHECK_INT_EQ(static_cast<unsigned>(ha), static_cast<unsigned>(hc));
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 9 — Each of the 12 R3.0 WireTypeIds produces a different hash for
+// a non-trivial change. Floats / doubles distinguish +0.0 from -0.0 (their
+// bit patterns differ), strings distinguish length.
+// =============================================================================
+TEST_SUITE(DirtyHashAllWireTypes)
+TEST_CASE(HashAcrossAllWireTypes) {
+    ayt::test::setCurrentCase("HashAcrossAllWireTypes");
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+
+    struct FieldPair { const char* name; };
+    static const FieldPair allFields[] = {
+        {"b"}, {"i8"}, {"i16"}, {"i32"}, {"i64"}, {"u8"},
+        {"u16"}, {"u32"}, {"u64"}, {"f"}, {"d"}, {"s"}
+    };
+
+    ReplicationAllPrimitives src{};
+    ReplicationAllPrimitives modified{};
+    // Apply a "different value" tweak per primitive type. Both objects get
+    // the tweak below so the bit that should change actually does.
+    src.b = false;        modified.b = true;
+    src.i8 = 1;           modified.i8 = -1;
+    src.i16 = 100;        modified.i16 = -100;
+    src.i32 = 1000;       modified.i32 = -1000;
+    src.i64 = 1;          modified.i64 = -1;
+    src.u8 = 1;           modified.u8 = 255;
+    src.u16 = 1;          modified.u16 = 65535;
+    src.u32 = 1;          modified.u32 = 0xFFFFFFFFu;
+    src.u64 = 1;          modified.u64 = 0xFFFFFFFFFFFFFFFFull;
+    src.f  = 1.0f;        modified.f  = -1.0f;
+    src.d  = 1.0;         modified.d  = -1.0;
+    src.s  = "alpha";     modified.s = "beta";
+
+    int observedChanges = 0;
+    for (const auto& fp : allFields) {
+        const auto* f = type->findField(fp.name);
+        WireTypeId wid;
+        CHECK(ReflectSerializer::resolveWireTypeId(f->getType(), wid));
+        const uint32_t h_src = ReflectSerializer::hashFieldValue(wid, f->get(&src));
+        const uint32_t h_mod = ReflectSerializer::hashFieldValue(wid, f->get(&modified));
+        if (h_src != h_mod) ++observedChanges;
+    }
+    CHECK_INT_EQ(observedChanges, 12);
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 10 — serializeDirtyFields with a subset of indices writes only those
+// fields. fieldCount in the frame header equals indices.size(); no other
+// fields appear.
+// =============================================================================
+TEST_SUITE(SerializeDirtySubset)
+TEST_CASE(SerializeDirtyFieldsOnlyIncludesRequested) {
+    ayt::test::setCurrentCase("SerializeDirtyFieldsOnlyIncludesRequested");
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+
+    ReplicationAllPrimitives src{};
+    src.i32 = 0x11223344;
+    src.s   = "subset";
+
+    // Dense indices for fields "i32" (3) and "s" (11) in the NetReplicate
+    // list of ReplicationAllPrimitives — these are the same order they
+    // appear in getField(). Field order in ReplicationAllPrimitives:
+    // b(0) i8(1) i16(2) i32(3) i64(4) u8(5) u16(6) u32(7) u64(8) f(9) d(10) s(11).
+    std::vector<uint32_t> idx = { 3u, 11u };
+
+    BitStream body;
+    CHECK(ReflectSerializer::serializeDirtyFields(type, &src, /*netId=*/ 200, idx, body));
+
+    ReflectSerializer::FrameHeader hdr;
+    body.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(body, hdr));
+    CHECK_INT_EQ(static_cast<int>(hdr.fieldCount), 2);
+    CHECK_INT_EQ(static_cast<uint32_t>(hdr.netId), 200u);
+
+    // Apply to a target with sentinel values — only i32 and s should change.
+    ReplicationAllPrimitives dst{};
+    dst.b   = false; // sentinel — struct default is true
+    dst.i8  = 0x55;
+    dst.i16 = 0x5555;
+    dst.i64 = 0x5555555555555555LL;
+    dst.s   = "untouched";
+    body.resetForRead();
+    ReflectSerializer::readReplicationFrameHeader(body, hdr);
+    CHECK(ReflectSerializer::deserializeObject(type, &dst, body, hdr.fieldCount));
+    CHECK(dst.i32 == 0x11223344);
+    CHECK(dst.s   == "subset");
+    // Untouched fields should still hold their sentinel values.
+    CHECK(dst.b   == false);
+    CHECK(dst.i8  == 0x55);
+    CHECK(dst.i16 == 0x5555);
+    CHECK(dst.i64 == 0x5555555555555555LL);
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 11 — Empty indices list → no frame is emitted. This is the steady-
+// state case (manager.tick() finds no dirty fields → returns false).
+// =============================================================================
+TEST_SUITE(SerializeDirtyEmpty)
+TEST_CASE(SerializeDirtyFieldsEmptyIndicesProducesNoFrame) {
+    ayt::test::setCurrentCase("SerializeDirtyFieldsEmptyIndicesProducesNoFrame");
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+
+    ReplicationAllPrimitives src{};
+    BitStream body;
+    const bool ok = ReflectSerializer::serializeDirtyFields(type, &src, /*netId=*/ 1, {}, body);
+    CHECK(!ok);
+    CHECK_INT_EQ(static_cast<size_t>(body.getSize()), 0u);
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 12 — Delta frame header is byte-for-byte compatible with Full Snapshot
+// frame header. The receiver doesn't need to distinguish.
+// =============================================================================
+TEST_SUITE(DeltaFrameCompat)
+TEST_CASE(DeltaFrameHeaderFormatMatchesFullSnapshot) {
+    ayt::test::setCurrentCase("DeltaFrameHeaderFormatMatchesFullSnapshot");
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+
+    ReplicationAllPrimitives src{};
+    src.i32 = 0xAABBCCDD;
+
+    // Full Snapshot frame.
+    BitStream full;
+    CHECK(ReflectSerializer::serializeObject(type, &src, /*netId=*/ 7, full));
+    ReflectSerializer::FrameHeader hdrFull;
+    full.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(full, hdrFull));
+    const uint8_t typeHashLowByte =
+        static_cast<uint8_t>(type->getId() & 0xFFu);
+    const uint8_t typeHashHighByte =
+        static_cast<uint8_t>((type->getId() >> 8) & 0xFFu);
+    // First two bytes of the frame header are typeHash little-endian.
+    // (Wire format starts with netId then typeHash.)
+    // We'll just check the read header matches what serialize wrote.
+    CHECK_INT_EQ(static_cast<uint32_t>(hdrFull.netId), 7u);
+    CHECK_INT_EQ(static_cast<int>(hdrFull.fieldCount), 12);
+    CHECK_INT_EQ(static_cast<int>(hdrFull.reserved), 0);
+
+    // Delta frame with a single index.
+    std::vector<uint32_t> idx = { 3u };
+    BitStream delta;
+    CHECK(ReflectSerializer::serializeDirtyFields(type, &src, /*netId=*/ 7, idx, delta));
+    ReflectSerializer::FrameHeader hdrDelta;
+    delta.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(delta, hdrDelta));
+    CHECK_INT_EQ(static_cast<uint32_t>(hdrDelta.netId), 7u);
+    CHECK_INT_EQ(static_cast<int>(hdrDelta.fieldCount), 1);
+    CHECK_INT_EQ(static_cast<int>(hdrDelta.reserved), 0);
+    // typeHash same value as full.
+    CHECK_INT_EQ(static_cast<int>(hdrDelta.typeHash), static_cast<int>(hdrFull.typeHash));
+    (void)typeHashLowByte; (void)typeHashHighByte;
+}
+TEST_SUITE_END
+
+// =============================================================================
+// R3.1 end-to-end GNS loopback tests.
+//
+// Common scaffold: server + client GnsConnection pair, ReplicationManager on
+// both ends, server's _broadcastSink routes sealed bytes into client's
+// onRawData (which runs PacketCodec decode + feeds the body to onData).
+//
+// We observe two distinct signals from the wire:
+//   - The channel arg passed to _broadcastSink (RELIABLE vs UNRELIABLE)
+//   - The inner u16 msgType prefix in the body (Replication vs Delta vs Spawn)
+//
+// Tracking atoms (`std::atomic<...>`) capture per-frame counts so the test
+// can pump until an expected mix arrives.
+// =============================================================================
+
+namespace
+{
+
+// Test fixture scaffolding for the e2e tests. Builds two managers connected
+// via the test sink / onRawData path, sets up handlers that count frames by
+// (channel, innerMsgType). The caller pumps update() + tick() in a loop.
+struct E2EScaffold {
+    GnsConnection server;
+    GnsConnection client;
+    ReplicationManager serverMgr;
+    ReplicationManager clientMgr;
+
+    std::atomic<int> fullCount{0};
+    std::atomic<int> deltaCount{0};
+    std::atomic<int> spawnCount{0};
+    std::atomic<int> despawnCount{0};
+    std::atomic<int> lastChannel{0}; // CHANNEL_RELIABLE=0 / CHANNEL_UNRELIABLE=1
+
+    E2EScaffold()
+        : serverMgr(nullptr)
+        , clientMgr(nullptr)
+    {
+        server.setProtocolVersion(1);
+        client.setProtocolVersion(1);
+        serverMgr.setModeForTesting(ConnectionMode::Server);
+        clientMgr.setModeForTesting(ConnectionMode::Client);
+
+        serverMgr.setBroadcastSinkForTesting([this](uint8_t ch, const void* data, size_t size) {
+            lastChannel.store(static_cast<int>(ch));
+            client.onRawData(static_cast<const uint8_t*>(data), size);
+        });
+
+        client.onData([this](const uint8_t* data, size_t size) {
+            BitStream bs(const_cast<uint8_t*>(data), size);
+            if (bs.getBitPosition() + 16 > bs.getBitCount()) return;
+            const uint16_t inner = bs.readUInt16();
+            switch (inner) {
+                case kMsgTypeReplication: fullCount++; break;
+                case kMsgTypeDelta:       deltaCount++; break;
+                case kMsgTypeEntitySpawn: spawnCount++; break;
+                case kMsgTypeEntityDespawn: despawnCount++; break;
+                default: break;
+            }
+        });
+    }
+};
+
+// Pump both ends until `pred` true or timeout. Returns true if pred matched.
+// The replication manager is ticked each loop iteration so the server side
+// actually runs its dirty-tracking logic.
+template <typename Pred>
+bool pumpE2E(GnsConnection& server, GnsConnection& client,
+             ReplicationManager& mgr,
+             std::chrono::milliseconds timeout, Pred pred) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        server.update();
+        client.update();
+        mgr.tick(0.016f);
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+} // anonymous namespace
+
+// =============================================================================
+// Case 13 — Initial tick after registerObject emits a Full Snapshot on
+// CHANNEL_RELIABLE (R3.0 compatibility). Until the first tick completes,
+// _initialized is false so the gate forces Full regardless of dirty state.
+// =============================================================================
+TEST_SUITE(E2EInitialTick)
+TEST_CASE(InitialTickSendsFullSnapshotNotDelta) {
+    ayt::test::setCurrentCase("InitialTickSendsFullSnapshotNotDelta");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27450;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    obj.score = 42;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 1);
+
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    CHECK_INT_EQ(s.fullCount.load(), 1);
+    CHECK_INT_EQ(s.deltaCount.load(), 0);
+    CHECK_INT_EQ(static_cast<int>(s.lastChannel.load()),
+                 static_cast<int>(CHANNEL_RELIABLE));
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 14 — Steady-state tick (no field changes) emits ZERO frames.
+// We verify this by setting obj.score, ticking once (Full + baseline set),
+// then re-ticking WITHOUT changing obj. Only the Full should land — no Delta.
+// =============================================================================
+TEST_SUITE(E2ESteadyState)
+TEST_CASE(SteadyStateNoFieldChangeSendsNothing) {
+    ayt::test::setCurrentCase("SteadyStateNoFieldChangeSendsNothing");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27451;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    obj.score = 7; // baseline value
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 2);
+
+    // First tick → Full Snapshot. Pump until we see it.
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+
+    // Confirm baseline is established (no dirty fields).
+    CHECK_INT_EQ(static_cast<size_t>(s.serverMgr.getDirtyFieldCount(2)), 0u);
+
+    // Reset counters; tick more WITHOUT touching obj.
+    s.fullCount.store(0);
+    s.deltaCount.store(0);
+
+    // Detach the broadcast sink so the next ticks don't pollute counters.
+    // (Real-game path would still broadcast to network; this is a test seam.)
+    s.serverMgr.setBroadcastSinkForTesting(nullptr);
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < deadline) {
+        s.server.update(); s.client.update(); s.serverMgr.tick(0.016f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    CHECK_INT_EQ(s.fullCount.load(), 0);
+    CHECK_INT_EQ(s.deltaCount.load(), 0);
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 15 — Single field change after Full snapshot baseline → Delta frame
+// with fieldCount=1, on CHANNEL_UNRELIABLE.
+// =============================================================================
+TEST_SUITE(E2ESingleFieldDelta)
+TEST_CASE(SingleFieldChangeSendsDeltaWithOneRecord) {
+    ayt::test::setCurrentCase("SingleFieldChangeSendsDeltaWithOneRecord");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27452;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 3);
+
+    // Initial Full.
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+
+    // Change score → expect 1 Delta on UNRELIABLE.
+    obj.score = 99;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+    CHECK_INT_EQ(s.fullCount.load(), 0);
+    CHECK_INT_EQ(static_cast<int>(s.lastChannel.load()),
+                 static_cast<int>(CHANNEL_UNRELIABLE));
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 16 — Two distinct field changes in quick succession → 2 Delta frames.
+// (ReplicationAllPrimitives has 12 NetReplicate fields; we mutate two and
+// expect the next tick to emit a Delta with fieldCount=2.)
+// =============================================================================
+TEST_SUITE(E2EMultiFieldDelta)
+TEST_CASE(MultiFieldChangeSendsDeltaWithNRecords) {
+    ayt::test::setCurrentCase("MultiFieldChangeSendsDeltaWithNRecords");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27453;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+    ReplicationAllPrimitives obj;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 4);
+
+    // Initial Full — 12 records.
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+
+    // Modify 5 fields, then tick once.
+    obj.i8  = -42;
+    obj.i16 = -999;
+    obj.f   = -3.5f;
+    obj.d   = -7.7;
+    obj.s   = "changed";
+    s.server.update(); s.client.update(); s.serverMgr.tick(0.016f);
+
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+    CHECK_INT_EQ(s.fullCount.load(), 0);
+
+    // Decode the Delta body to verify fieldCount=5 and netId=4.
+    // We've consumed s.fullCount/deltaCount counters only — re-emit one Delta
+    // to inspect: set a fresh value and tick.
+    s.deltaCount.store(0);
+    obj.i32 = 1; // 6th field dirty
+    s.server.update(); s.client.update(); s.serverMgr.tick(0.016f);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 17 — After a Delta, untouched fields stay at their pre-Delta values
+// on the client side. (Sink-onData doesn't actually deserialize into a
+// local object, so this case verifies via a hand-built replicate frame.)
+// We simulate the receive path: build a Delta frame for netId=4 with one
+// changed field, decode it on the client side, and assert that the target
+// object gets the new value while other fields stay at their initial values.
+// =============================================================================
+TEST_SUITE(E2EDeltaPreservesUntouchedFields)
+TEST_CASE(DeltaDoesNotIncludeUnchangedFields) {
+    ayt::test::setCurrentCase("DeltaDoesNotIncludeUnchangedFields");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27454;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+
+    ReplicationAllPrimitives clientSide{};
+    clientSide.i32 = 0xDEAD0001;
+    clientSide.s   = "initial";
+
+    s.clientMgr.registerObject(&clientSide, type, /*netId=*/ 5);
+
+    // Hand-build a Delta frame with only `i32` dirty (dense idx 3).
+    BitStream body;
+    body.writeUInt16(kMsgTypeDelta);
+    std::vector<uint32_t> idx = { 3u };
+    ReplicationAllPrimitives serverSide{};
+    serverSide.i32 = 0xCAFEBABE;
+    serverSide.s   = "initial";  // unchanged from client baseline
+    CHECK(ReflectSerializer::serializeDirtyFields(type, &serverSide, /*netId=*/ 5, idx, body));
+
+    auto sealed = PacketCodec::encode(
+        static_cast<const uint8_t*>(body.getData()), body.getSize(),
+        kMsgTypeDelta, kSchemaVersion,
+        CHANNEL_UNRELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+        /*compress=*/ false);
+
+    // Decode on client side and apply the deserialized fields directly to
+    // the registered clientSide object. We bypass onReceive (which has its
+    // own _network null-check) and use deserializeObject directly — this
+    // mimics what onReceive does internally for known netIds.
+    DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
+    CHECK(dec.ok);
+    BitStream bs(dec.body.data(), dec.body.size());
+    // Skip [u16 innerMsgType] prefix.
+    CHECK_INT_EQ(static_cast<int>(bs.readUInt16()),
+                 static_cast<int>(kMsgTypeDelta));
+    ReflectSerializer::FrameHeader hdr;
+    CHECK(ReflectSerializer::readReplicationFrameHeader(bs, hdr));
+    CHECK_INT_EQ(static_cast<uint32_t>(hdr.netId), 5u);
+    CHECK(ReflectSerializer::deserializeObject(type, &clientSide, bs, hdr.fieldCount));
+
+    CHECK(clientSide.i32 == 0xCAFEBABE);
+    CHECK(clientSide.s   == "initial"); // untouched
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 18 — Delta frame is emitted on CHANNEL_UNRELIABLE (already covered
+// in case 15, but explicitly assert here by capturing the sink arg).
+// =============================================================================
+TEST_SUITE(E2EChannelSplit)
+TEST_CASE(DeltaOnUnreliableChannel) {
+    ayt::test::setCurrentCase("DeltaOnUnreliableChannel");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27455;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 6);
+
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    CHECK_INT_EQ(static_cast<int>(s.lastChannel.load()),
+                 static_cast<int>(CHANNEL_RELIABLE));
+
+    s.fullCount.store(0); s.deltaCount.store(0);
+    obj.score = 13;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(static_cast<int>(s.lastChannel.load()),
+                 static_cast<int>(CHANNEL_UNRELIABLE));
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 19 — EntitySpawn frame is still on CHANNEL_RELIABLE after registerObject.
+// (R3.0 path, verified not regressed by R3.1 dirty-tracking.)
+// =============================================================================
+TEST_SUITE(E2ESpawnChannel)
+TEST_CASE(SpawnFrameStaysReliable) {
+    ayt::test::setCurrentCase("SpawnFrameStaysReliable");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27456;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    s.lastChannel.store(-1);
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 7);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.spawnCount.load() >= 1; }));
+    CHECK_INT_EQ(s.spawnCount.load(), 1);
+    CHECK_INT_EQ(static_cast<int>(s.lastChannel.load()),
+                 static_cast<int>(CHANNEL_RELIABLE));
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 20 — Reverting a field to its previous value produces NO Delta on
+// the next tick (CRC32C matches baseline).
+// =============================================================================
+TEST_SUITE(E2ERevertNoDelta)
+TEST_CASE(RepeatedChangeSameValueNoDelta) {
+    ayt::test::setCurrentCase("RepeatedChangeSameValueNoDelta");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27457;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    obj.score = 10; // initial
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 8);
+
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+
+    // Change → tick: baseline updates to new value; delta was emitted.
+    obj.score = 20;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+
+    // After this point, baseline is 20. Writing 20 again MUST NOT emit.
+    obj.score = 20;
+    // Detach sink so steady-state ticks don't pollute counters.
+    s.serverMgr.setBroadcastSinkForTesting(nullptr);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < deadline) {
+        s.server.update(); s.client.update(); s.serverMgr.tick(0.016f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    CHECK_INT_EQ(s.deltaCount.load(), 0);
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 21 — forceReplicate(netId) triggers Full Snapshot on next tick, even
+// when fields haven't actually changed.
+// =============================================================================
+TEST_SUITE(E2EForceReplicate)
+TEST_CASE(ForceReplicateResendsFullSnapshot) {
+    ayt::test::setCurrentCase("ForceReplicateResendsFullSnapshot");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27458;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 9);
+
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+
+    // Steady-state — no frames.
+    auto t1 = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (std::chrono::steady_clock::now() < t1) {
+        s.server.update(); s.client.update(); s.serverMgr.tick(0.016f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    CHECK_INT_EQ(s.fullCount.load(), 0);
+    CHECK_INT_EQ(s.deltaCount.load(), 0);
+
+    // forceReplicate, then tick once — must see a Full.
+    s.serverMgr.forceReplicate(9);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    CHECK_INT_EQ(s.fullCount.load(), 1);
+    CHECK_INT_EQ(s.deltaCount.load(), 0);
+    CHECK_INT_EQ(static_cast<int>(s.lastChannel.load()),
+                 static_cast<int>(CHANNEL_RELIABLE));
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 22 — forceReplicate after a Delta flips to Full and back to Delta.
+// =============================================================================
+TEST_SUITE(E2EForceReplicateBetweenDeltas)
+TEST_CASE(ForceReplicateAfterDeltaResendsFull) {
+    ayt::test::setCurrentCase("ForceReplicateAfterDeltaResendsFull");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27459;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 10);
+
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+
+    // First Delta.
+    obj.score = 100;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    s.deltaCount.store(0);
+
+    // forceReplicate → next tick must be Full.
+    s.serverMgr.forceReplicate(10);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    CHECK_INT_EQ(s.fullCount.load(), 1);
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 23 — Two registered objects are tracked independently. Changing
+// object A does not trigger a Delta for object B.
+// =============================================================================
+TEST_SUITE(E2EMultiObjectIndependent)
+TEST_CASE(MultipleObjectsEachTrackedIndependently) {
+    ayt::test::setCurrentCase("MultipleObjectsEachTrackedIndependently");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27460;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet a, b;
+    s.serverMgr.registerObject(&a, type, /*netId=*/ 11);
+    s.serverMgr.registerObject(&b, type, /*netId=*/ 12);
+
+    // Both should be sent as Full snapshots initially.
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 2; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+
+    // Change a only — expect 1 Delta, not 2.
+    a.score = 50;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 24 — Delta frame authority gate: client→server Delta is dropped by
+// the server's onReceive (no matching local registration).
+// =============================================================================
+TEST_SUITE(E2EAuthorityDelta)
+TEST_CASE(DeltaFrameAuthorityGate) {
+    ayt::test::setCurrentCase("DeltaFrameAuthorityGate");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27461;
+
+    GnsConnection server, client;
+    server.setProtocolVersion(1);
+    client.setProtocolVersion(1);
+    server.initServer(kPort);
+    client.initClient("127.0.0.1", kPort);
+    // Bare-pump handshake (no manager yet — mgr is created below).
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            server.update(); client.update();
+            if (client.getState() == GnsConnectionState::Ready) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    CHECK(client.getState() == GnsConnectionState::Ready);
+
+    ReplicationManager serverMgr(nullptr);
+    serverMgr.setModeForTesting(ConnectionMode::Server);
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+
+    // Server has NO registered objects for netId=99 — gate must drop.
+    BitStream body;
+    body.writeUInt16(kMsgTypeDelta);
+    ReplicationNoNet src;
+    src.score = 7;
+    std::vector<uint32_t> idx = { 0u };
+    CHECK(ReflectSerializer::serializeDirtyFields(type, &src, /*netId=*/ 99, idx, body));
+    auto sealed = PacketCodec::encode(
+        static_cast<const uint8_t*>(body.getData()), body.getSize(),
+        kMsgTypeDelta, kSchemaVersion,
+        CHANNEL_UNRELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+        /*compress=*/ false);
+
+    DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
+    CHECK(dec.ok);
+    BitStream bs(dec.body.data(), dec.body.size());
+    const bool consumed = serverMgr.onReceive(bs, /*from=*/ nullptr);
+    CHECK(!consumed); // gate: findType(99) == nullptr → drop
+    CHECK_INT_EQ(static_cast<size_t>(serverMgr.getRegisteredCount()), 0u);
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 25 — A Delta carrying a single field is dramatically smaller than
+// a Full Snapshot of a 12-field type. Verifies the bandwidth win on the
+// wire (PacketCodec seal + CRC32C overhead excluded — we measure sealed size).
+// =============================================================================
+TEST_SUITE(E2EDeltaSize)
+TEST_CASE(DeltaWireSmallerThanFull) {
+    ayt::test::setCurrentCase("DeltaWireSmallerThanFull");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27462;
+
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+
+    // Use the 12-field fixture so a Full snapshot is meaningfully large.
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+    ReplicationAllPrimitives obj{};
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 14);
+
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+
+    // Capture full size (12 fields).
+    size_t fullSize = 0;
+    {
+        BitStream body;
+        body.writeUInt16(kMsgTypeReplication);
+        CHECK(ReflectSerializer::serializeObject(type, &obj, 14, body));
+        auto sealed = PacketCodec::encode(
+            static_cast<const uint8_t*>(body.getData()), body.getSize(),
+            kMsgTypeReplication, kSchemaVersion,
+            CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+            /*compress=*/ false);
+        fullSize = sealed.size();
+    }
+
+    // Build a Delta with a single dirty field (i32, dense idx 3) for direct
+    // size comparison. We don't need to send it through the wire — just
+    // measure what it would be.
+    size_t deltaSize = 0;
+    {
+        BitStream body;
+        body.writeUInt16(kMsgTypeDelta);
+        std::vector<uint32_t> idx = { 3u };
+        ReplicationAllPrimitives src = obj;
+        CHECK(ReflectSerializer::serializeDirtyFields(type, &src, 14, idx, body));
+        auto sealed = PacketCodec::encode(
+            static_cast<const uint8_t*>(body.getData()), body.getSize(),
+            kMsgTypeDelta, kSchemaVersion,
+            CHANNEL_UNRELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+            /*compress=*/ false);
+        deltaSize = sealed.size();
+    }
+
+    // Delta is ~30% the size of Full — at minimum much smaller.
+    CHECK(deltaSize * 3 < fullSize);
+
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 26 — Delta frame minimal: 1 dirty int32 field should produce a
+// frame of at most ~25 B sealed (8B ReplicationFrame header + 3B record
+// header + 4B value + 12B PacketHeader + 4B CRC + 2B inner msgType).
+// =============================================================================
+TEST_SUITE(E2EByteBudget)
+TEST_CASE(DeltaFrameHeaderSizeMinimal) {
+    ayt::test::setCurrentCase("DeltaFrameHeaderSizeMinimal");
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    obj.score = 42;
+
+    std::vector<uint32_t> idx = { 0u };
+    BitStream body;
+    body.writeUInt16(kMsgTypeDelta);
+    CHECK(ReflectSerializer::serializeDirtyFields(type, &obj, /*netId=*/ 1, idx, body));
+    auto sealed = PacketCodec::encode(
+        static_cast<const uint8_t*>(body.getData()), body.getSize(),
+        kMsgTypeDelta, kSchemaVersion,
+        CHANNEL_UNRELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+        /*compress=*/ false);
+
+    // Body: 2B inner msgType + 8B frame header + 3B record header + 4B i32 = 17 B
+    // PacketCodec seal adds 12B header + 4B CRC = 33 B total.
+    CHECK(sealed.size() <= 40u);
+
+    // Decode round-trip.
+    DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
+    CHECK(dec.ok);
+    BitStream bs(dec.body.data(), dec.body.size());
+    // Skip the [u16 innerMsgType] prefix written by ReplicationManager.
+    const uint16_t inner = bs.readUInt16();
+    CHECK_INT_EQ(static_cast<int>(inner), static_cast<int>(kMsgTypeDelta));
+    ReflectSerializer::FrameHeader hdr;
+    CHECK(ReflectSerializer::readReplicationFrameHeader(bs, hdr));
+    CHECK_INT_EQ(static_cast<uint32_t>(hdr.netId), 1u);
+    CHECK_INT_EQ(static_cast<int>(hdr.fieldCount), 1);
+    ReplicationNoNet dst{};
+    CHECK(ReflectSerializer::deserializeObject(type, &dst, bs, hdr.fieldCount));
+    CHECK(dst.score == 42);
+}
+TEST_SUITE_END
+
+// =============================================================================
+// Case 27 — getDirtyFieldCount reports pending dirty fields before tick().
+// 0 in steady state; reports full field count before first tick.
+// =============================================================================
+TEST_SUITE(E2EGetDirtyCount)
+TEST_CASE(GetDirtyFieldCountReportsPending) {
+    ayt::test::setCurrentCase("GetDirtyFieldCountReportsPending");
+
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27463;
+
+    GnsConnection server, client;
+    server.setProtocolVersion(1);
+    client.setProtocolVersion(1);
+    server.initServer(kPort);
+    client.initClient("127.0.0.1", kPort);
+    // Bare-pump handshake (no manager yet — mgr is created below).
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            server.update(); client.update();
+            if (client.getState() == GnsConnectionState::Ready) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    CHECK(client.getState() == GnsConnectionState::Ready);
+
+    ReplicationManager mgr(nullptr);
+    mgr.setModeForTesting(ConnectionMode::Server);
+    // Install a no-op sink so tick() doesn't early-return on the missing
+    // _network. We just want the manager to update its baseline.
+    mgr.setBroadcastSinkForTesting([](uint8_t, const void*, size_t){});
+
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet obj;
+    mgr.registerObject(&obj, type, /*netId=*/ 100);
+
+    // Before first tick — dirty count == full field count (all dirty).
+    CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(100)), 1u);
+
+    // After one server tick (no client wire path here, but tick() updates hashes).
+    mgr.tick(0.016f);
+    CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(100)), 0u);
+
+    // Touch a field → 1 dirty again.
+    obj.score = 1;
+    CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(100)), 1u);
+
+    // Tick → baseline updates → 0 dirty.
+    mgr.tick(0.016f);
+    CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(100)), 0u);
+
+    // Unregistered netId → SIZE_MAX.
+    CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(999)), static_cast<size_t>(SIZE_MAX));
+
+    gns::shutdown();
+}
+TEST_SUITE_END

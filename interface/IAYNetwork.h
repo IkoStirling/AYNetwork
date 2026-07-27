@@ -114,6 +114,12 @@ constexpr uint16_t kMsgTypeReplication  = 0x0001;  // server → clients: full s
 constexpr uint16_t kMsgTypeEntitySpawn  = 0x0002;  // server → clients: register new replicated entity (carries typeHash)
 constexpr uint16_t kMsgTypeEntityDespawn = 0x0003;  // server → clients: unregister replicated entity
 
+// R3.1 (2026-07-27): Delta update msgType slot. Body wire format is identical
+// to kMsgTypeReplication (same 8B header + N field records) — the receiver
+// doesn't need to distinguish; deserialization uses the same path. The only
+// difference is which fields are included (only dirty ones, not all).
+constexpr uint16_t kMsgTypeDelta        = 0x0004;  // server → clients: dirty-fields-only delta update (R3.1)
+
 // R2: schema version stamped into every PacketHeader. Bump on breaking
 // wire-format changes (rare; major version bumps imply a parallel header
 // migration). 1 = R2 baseline.
@@ -221,16 +227,16 @@ public:
 };
 
 // =============================================================================
-// 可复制对象接口 (R3.0 降级 2026-07-27)
+// 可复制对象接口 (R3.1 收口 2026-07-27)
 //
 // R1/R2 stub 时代用户必须实现 replicate(BitStream&) / onReplicate(BitStream&) 两个
 // 虚函数 — 即"手写 wire format"。R3.0 起这两个函数被标记为 DEPRECATED，不再要求
 // 用户实现；AYReflect 自动遍历字段（按 FieldAttribute::NetReplicate 过滤），由
 // ReplicationManager::serializeObject / deserializeObject 走 ITypeInfo 元数据。
+// R3.1 起两个 deprecated 虚函数已**真正删除**（全树 grep 验证无用户实现）。
 //
 // 仍然保留 getNetId / setNetId / getReplicationPriority / getReplicationChannel，
 // 因为 ReplicationManager::registerObject(IReplicable*, ...) 包装路径会读它们。
-// 过渡期内用户实现 replicate/onReplicate 是无害的（不会被调用），R3.1 起彻底删除。
 // =============================================================================
 class IReplicable {
 public:
@@ -242,10 +248,6 @@ public:
     virtual float getReplicationPriority() const { return 1.0f; }
     virtual uint8_t getReplicationChannel() const { return CHANNEL_RELIABLE; }
     virtual bool shouldReplicate() const { return true; }
-
-    // ---- DEPRECATED (R3.0): 旧 stub 接口，保留为 default empty impl，R3.1 删除 ----
-    virtual void replicate(BitStream& /*stream*/) {}
-    virtual void onReplicate(const BitStream& /*stream*/) {}
 };
 
 // =============================================================================
@@ -348,10 +350,17 @@ private:
 // The old IReplicable overload is kept as a deprecated convenience wrapper that
 // pulls netId / channel / priority off the IReplicable getters.
 //
+// R3.1 (2026-07-27): dirty-tracking + Delta frame. Each ReflectedEntry keeps
+// a CRC32C hash of the last-broadcast value for every NetReplicate field.
+// On tick(), the manager compares current hashes to the stored ones, emits
+// either a Full Snapshot (kMsgTypeReplication on CHANNEL_RELIABLE) for the
+// initial transmission OR a Delta frame (kMsgTypeDelta on CHANNEL_UNRELIABLE)
+// carrying only dirty fields. forceReplicate(netId) forces a full resend on
+// the next tick.
+//
 // Storage is a single map keyed by netId. _objects[netId] holds a ReflectedEntry
 // that carries both the (void*, ITypeInfo*) used for serialization AND the
 // optional IReplicable* for callers that still want priority / channel hooks.
-// R3.1+ may add dirty-tracking state here without changing the public API.
 // =============================================================================
 class ReplicationManager {
 public:
@@ -367,7 +376,7 @@ public:
     void registerObject(void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId);
     void unregisterObject(uint32_t netId);
 
-    // ---- R1 deprecated wrapper (kept until R3.1) ----
+    // ---- R1 deprecated wrapper (kept) ----
     void registerObject(IReplicable* obj, uint32_t netId);
 
     // ---- Lookups ----
@@ -378,20 +387,42 @@ public:
 
     // ---- Frame-driven tick entry ----
     // Invoked by INetworkSubSystem::update every frame on the AUTHORITY (server).
-    // Emits one kMsgTypeReplication frame per registered entity over
-    // CHANNEL_RELIABLE via PacketCodec seal. On clients this is a no-op —
-    // the authority gate is enforced here (§6.6 v1=Server 权威).
+    //
+    // R3.1 dirty-tracking behavior:
+    //   - First tick after registerObject: emits a kMsgTypeReplication full
+    //     snapshot on CHANNEL_RELIABLE (so a fresh client has a baseline).
+    //   - Steady-state ticks: compares CRC32C(field_value) per NetReplicate
+    //     field; emits a kMsgTypeDelta frame on CHANNEL_UNRELIABLE carrying
+    //     ONLY the dirty fields. No frame is emitted if nothing changed.
+    //   - forceReplicate(netId): the next tick after this call uses Full
+    //     Snapshot again (one-shot override via _initialized=false).
+    //
+    // On clients this is a no-op — the authority gate is enforced here
+    // (§6.6 v1=Server 权威).
     void tick(float deltaTime);
 
     // ---- Receive path ----
     // Called by GnsConnection::onRawData when msgType ∈ {kMsgTypeReplication,
-    // kMsgTypeEntitySpawn, kMsgTypeEntityDespawn}. Looks up the local type/object
-    // by netId and walks AYReflect to deserialize field values back into memory.
+    // kMsgTypeEntitySpawn, kMsgTypeEntityDespawn, kMsgTypeDelta}. Looks up
+    // the local type/object by netId and walks AYReflect to deserialize
+    // field values back into memory. R3.1: kMsgTypeDelta uses the same
+    // deserializeObject path as kMsgTypeReplication — wire format is
+    // identical, only the fieldCount differs.
     // Returns true if the frame was consumed (registered object exists), false
     // otherwise (frame dropped — e.g. client→server authority gate).
     bool onReceive(BitStream& stream, NetConnection* from);
 
+    // R3.1 real implementation: marks the entry as not-yet-initialized so
+    // the next tick() emits a Full Snapshot regardless of dirty state.
+    // Useful after a client reconnects, after a teleport, or after the user
+    // explicitly changes a server-side field that all clients must observe.
     void forceReplicate(uint32_t netId);
+
+    // R3.1 debug: returns the count of dirty NetReplicate fields pending on
+    // the next tick(). 0 means steady state (no frame will be emitted for
+    // this netId). SIZE_MAX means the netId isn't registered or has no
+    // type info (legacy IReplicable path).
+    size_t getDirtyFieldCount(uint32_t netId) const;
 
     void setExtension(INetworkExtension* ext);
 
