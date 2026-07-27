@@ -14,6 +14,7 @@ set(SRC_FILES
     src/Protocol/PacketCodec.cpp
     src/Replication/ReplicationManager.cpp
     src/Replication/ReplicationSystem.cpp
+    src/Replication/ReflectSerializer.cpp
 )
 
 # R1 (2026-07-26): wire up GameNetworkingSockets via vcpkg. See design.md §14.
@@ -33,6 +34,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
     AYCore
     AYGameLoop
     AYStorage                              # R2: Lz4Decompressor (decode side)
+    AYReflect                              # R3.0: ITypeInfo + FieldAttribute::NetReplicate walk
     GameNetworkingSockets::GameNetworkingSockets   # R1: GNS shared variant
     lz4::lz4                               # R2: PacketCodec encode side
 )

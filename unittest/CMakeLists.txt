@@ -21,6 +21,7 @@ set(SRC_FILES
     AYTest_GnsEchoTest.cpp
     AYTest_Handshake.cpp
     AYTest_PacketCodec.cpp
+    AYTest_Replication.cpp
 )
 
 add_executable(${MODULE_NAME} ${SRC_FILES})

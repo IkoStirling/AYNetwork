@@ -1,32 +1,28 @@
 #pragma once
-// ReplicationSystem.h - ECS system for replication
+// ReplicationSystem.h - R3.0 thin adapter for ECS-style integration
 //
-// R1 (2026-07-26): previously extended `ayt::entity::ISystem` which forced
-// AYNetwork to link against AYEntity. AYEntity transitively pulls AYAnimation
-// (which has its own MSVC env issues), causing unrelated build failures when
-// we try to compile AYNetwork in isolation.
+// R3.0 (2026-07-27): previously held its own netId↔entityId maps and
+// registerEntity/findEntity API. Design §13 R3 explicitly forbids the double
+// map ("ReplicationSystem ↔ ReplicationManager 互通 / 禁止双 map"). This class
+// is now a thin adapter that forwards onUpdate to ReplicationManager::tick so
+// the GameLoop tick path keeps working with AYEntity's ISystem-style
+// interface.
 //
-// This class now exposes a minimal, self-contained interface that R3 will
-// integrate with AYEntity's World::registerSystem by passing the resulting
-// instance through an adapter — see design.md §13 R3.
+// ECS integration strategy:
+//   - The user wires AYEntity::World::registerSystem with an instance of
+//     this class (the ISystem adapter provides getName/onStart/onUpdate).
+//   - ReplicationManager (held by INetworkSubSystem) owns the actual data;
+//     this class never holds netId/object state.
+//   - For per-entity registration, the user calls
+//     EntityReplicationAdapter::registerEntityComponent<T>(mgr, entity, netId).
+//     This class is NOT a peer of ReplicationManager in the data sense.
 
 #include <IAYNetwork.h>
-#include <unordered_map>
 #include <cstdint>
 
 namespace ayt::net
 {
 
-// =============================================================================
-// ReplicationSystem - replicates entity state to subscribed clients
-// =============================================================================
-//
-// Currently R1 provides a tiny helper that maps netId <-> entityId and
-// exposes onUpdate for the GameLoop tick path. R3 will:
-//   - Make this implement the AYEntity ISystem interface via a thin adapter
-//   - Hook into AYEntity's Query<> to iterate replicated components
-//   - Use AYReflect to walk data components and serialise only NetReplicate
-//     fields
 class ReplicationSystem {
 public:
     ReplicationSystem() = default;
@@ -36,18 +32,11 @@ public:
     void onStart();
     void onUpdate(float dt);
 
-    // Set network subsystem
+    // Set network subsystem. Required for onUpdate to forward ticks.
     void setNetwork(INetworkSubSystem* network);
-
-    // Register entity for replication
-    void registerEntity(uint32_t netId, uint32_t entityId);
-    void unregisterEntity(uint32_t netId);
-    uint32_t findEntity(uint32_t netId) const;
 
 private:
     INetworkSubSystem* _network = nullptr;
-    std::unordered_map<uint32_t, uint32_t> _netIdToEntity;
-    std::unordered_map<uint32_t, uint32_t> _entityToNetId;
 };
 
 } // namespace ayt::net
