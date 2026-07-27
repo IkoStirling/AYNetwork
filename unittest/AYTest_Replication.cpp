@@ -1064,8 +1064,8 @@ TEST_CASE(DeltaDoesNotIncludeUnchangedFields) {
     CHECK(dec.ok);
     BitStream bs(dec.body.data(), dec.body.size());
     // Skip [u16 innerMsgType] prefix.
-    CHECK_INT_EQ(static_cast<int>(bs.readUInt16()),
-                 static_cast<int>(kMsgTypeDelta));
+    const uint16_t innerMsg = bs.readUInt16();
+    CHECK_INT_EQ(static_cast<int>(innerMsg), static_cast<int>(kMsgTypeDelta));
     ReflectSerializer::FrameHeader hdr;
     CHECK(ReflectSerializer::readReplicationFrameHeader(bs, hdr));
     CHECK_INT_EQ(static_cast<uint32_t>(hdr.netId), 5u);
