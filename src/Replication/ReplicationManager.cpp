@@ -27,6 +27,15 @@ IReplicable* ReplicationManager::findObject(uint32_t netId) const {
     return (it != _objects.end()) ? it->second : nullptr;
 }
 
+// P0 audit fix (2026-07-26): minimal tick entry point. R1 will route real
+// per-frame work (GNS RunCallbacks dispatch, snapshot diffing, dirty-mark
+// flushing) through here. For now: assert the wiring is alive and forward
+// to replicate() so existing call paths continue to no-op gracefully.
+void ReplicationManager::tick(float deltaTime) {
+    (void)deltaTime;   // unused until R1
+    replicate();
+}
+
 void ReplicationManager::replicate() {
 }
 
@@ -43,8 +52,10 @@ void ReplicationManager::setExtension(INetworkExtension* ext) {
     _extension = ext;
 }
 
-template<typename T>
-void ReplicationManager::serializeObject(T* obj, BitStream& stream) {
-}
+// P0 audit fix (2026-07-26): removed the `template<typename T> serializeObject`
+// stub. The audit (design.md §3.4) flagged this as a misdesigned API —
+// it forced per-type specialization instead of walking AYReflect metadata.
+// R3 will reintroduce the method as a non-template:
+//   void serializeObject(const ayt::reflect::ITypeInfo* type, void* obj, BitStream& s);
 
 } // namespace ayt::net

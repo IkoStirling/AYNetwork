@@ -2,28 +2,26 @@
 // IAYNetwork.h - 网络子系统接口
 
 #include <AYCore.h>
-#include <ISubSystem.h>
+#include <AYGameLoop.h>   // P0 audit fix (2026-07-26): ISubSystem lives in AYGameLoop's IAYGameLoop.h, not in a separate ISubSystem.h
 #include <functional>
 #include <vector>
 #include <cstdint>
 #include <unordered_map>
 
-// Transport layer
-#include <AYConnection.h>
-#include <KcpConnection.h>
-#include <UdpSocket.h>
-
-// Protocol layer
-#include <PacketHeader.h>
-#include <PacketAssembler.h>
-#include <SequenceNumber.h>
-
-// Replication layer (ReplicationManager is defined in this file)
-#include <ReplicationSystem.h>
-#include <NetDataComponent.h>
-
 namespace ayt::net
 {
+
+// P0 audit fix (2026-07-26): forward-declare types referenced before their
+// full definition below. INetworkSubSystem methods mention NetConnection,
+// INetworkExtension, BitStream, and ReplicationManager — all of which are
+// defined later in this file. Without forward declarations MSVC rejects the
+// declarations with C2061 ("undeclared identifier") even though the same
+// file eventually defines them.
+class NetConnection;
+class IReplicable;
+class INetworkExtension;
+class BitStream;
+class ReplicationManager;
 
 
 // =============================================================================
@@ -47,9 +45,75 @@ enum class ConnectionMode : uint8_t {
 };
 
 // =============================================================================
+// R1 done (2026-07-27): DisconnectReason — applied enum that travels with
+// every disconnect so receivers can react meaningfully (kick UI, reconnect,
+// ban, log telemetry). design §4.2 mandates this enum be delivered via
+// onConnectionChange. R1 implements a uint8 wire form so the enum is
+// stable across R2/R3 changes.
+// =============================================================================
+enum class DisconnectReason : uint8_t {
+    Unknown              = 0,    // GNS closed without app-level reason
+    UserQuit             = 1,    // Local user requested disconnect
+    Timeout              = 2,    // Heartbeat / connection idle
+    Kicked               = 3,    // Server kicked the client
+    ProtocolMismatch     = 4,    // handshake rejected (version, etc.)
+    HostShutdown         = 5,    // Server shutting down
+    ConnectionLost       = 6,    // Network error / GNS ProblemDetectedLocally
+};
+
+// =============================================================================
+// R1 done (2026-07-27): Handshake protocol.
+//
+// Wire format (host byte order, no PacketHeader to keep R1 independent of
+// R2 protocol layer — PacketHeader/Assembler is R2 work):
+//
+//   Client -> Server:  [u8 msgType=1][u32 protocolVersion][u8 clientNameLen][clientName bytes...]
+//   Server -> Client:  [u8 msgType=2][u32 protocolVersion][u8 reasonCode=0 (accept)]
+//                   or [u8 msgType=3][u8 reasonCode=DisconnectReason (reject)]
+//
+// Protocol negotiation rules:
+//   - protocolVersion must match exactly. Mismatch -> server sends REJECT.
+//   - On REJECT the client transitions to Disconnected with reasonCode.
+//   - On WELCOME both sides transition from Handshaking to Connected (Ready).
+//   - The handshake is RELIABLE; uses CHANNEL_RELIABLE.
+//
+// Handshake only fires when the application has registered a
+// protocolVersion (via AYNetworkSubSystem::setProtocolVersion). If never
+// set, GnsConnection::initClient/listen will skip the handshake and treat
+// GNS Connected as Ready (back-compat for the R1.A loopback tests).
+// =============================================================================
+enum class HandshakeMsgType : uint8_t {
+    Hello   = 1,    // client -> server
+    Welcome = 2,    // server -> client (accept)
+    Reject  = 3,    // server -> client (reject)
+};
+
+// Wire-level constants for the handshake header. Kept short so a single
+// GNS reliable message comfortably fits in one MTU.
+constexpr uint32_t kProtocolVersion   = 1;
+constexpr uint8_t  kHandshakeMaxNameLen = 32;
+
+// R2 (2026-07-27): PacketHeader v2 msgType namespace. 0xFFFF is reserved
+// for handshake (HandshakeMsgType lives in the body). 0 is the default app
+// msgType before R3 ReplicationManager assigns per-system ranges.
+constexpr uint16_t kMsgTypeHandshake = 0xFFFF;
+constexpr uint16_t kMsgTypeApp       = 0;
+
+// R2: schema version stamped into every PacketHeader. Bump on breaking
+// wire-format changes (rare; major version bumps imply a parallel header
+// migration). 1 = R2 baseline.
+constexpr uint16_t kSchemaVersion = 1;
+
+// =============================================================================
 // 网络子系统接口
 // =============================================================================
-class INetworkSubSystem : public ISubSystem {
+// P0 audit fix (2026-07-26): qualify ISubSystem with ::ayt::game — the file
+// was relying on accidental namespace resolution. Inside `namespace ayt::net`,
+// an unqualified `ISubSystem` is looked up in `ayt::net` first, then `ayt`,
+// then `::`. `ISubSystem` lives in `ayt::game`, so the lookup silently
+// resolved through `using` declarations from headers — fragile. Make it
+// explicit.
+class INetworkSubSystem : public ::ayt::game::ISubSystem {
 public:
     virtual ~INetworkSubSystem() = default;
 
@@ -71,7 +135,11 @@ public:
     virtual void onMessage(uint8_t channel, MessageHandler handler) = 0;
 
     // ===== 连接状态 =====
-    using ConnectionHandler = std::function<void(NetConnection* conn, bool connected)>;
+    // R1 done (2026-07-27): onConnectionChange now carries DisconnectReason
+    // so receivers can distinguish a normal disconnect from a kick / version
+    // mismatch / host shutdown. reason is meaningful only when connected=false;
+    // for connected=true it's DisconnectReason::Unknown.
+    using ConnectionHandler = std::function<void(NetConnection* conn, bool connected, DisconnectReason reason)>;
     virtual void onConnectionChange(ConnectionHandler handler) = 0;
 
     // ===== 服务器专用 =====
@@ -204,6 +272,11 @@ public:
     void unregisterObject(uint32_t netId);
     IReplicable* findObject(uint32_t netId) const;
 
+    // P0 audit fix (2026-07-26): frame-driven tick entry point invoked by
+    // INetworkSubSystem::update every frame. R1 routes real per-frame work
+    // (GNS callback dispatch, dirty-mark flush, snapshot diffing) through here.
+    void tick(float deltaTime);
+
     void replicate();
     void onReceive(BitStream& stream);
     void forceReplicate(uint32_t netId);
@@ -220,6 +293,12 @@ private:
 // =============================================================================
 // 便捷宏
 // =============================================================================
-#define NETWORK_SUBSYSTEM() (ayt::game::GameLoop::instance().getNetwork())
+// P0 audit fix (2026-07-26): NETWORK_SUBSYSTEM() was defined here but pointed
+// at ayt::game::GameLoop::instance().getNetwork(), which does not exist in
+// AYGameLoop. Removed until R1 wires up the GameLoop accessor.
+//
+// Usage post-R1 (planned):
+//   auto* net = ayt::game::GameLoop::instance().getNetwork();
+//   net->connect("127.0.0.1", 7777);
 
 } // namespace ayt::net

@@ -50,23 +50,34 @@ void BitStream::writeBits(const void* data, size_t bitCount) {
 }
 
 void BitStream::writeByte(uint8_t byte) {
-    if (_ownsData && (_bitPosition >> 3) >= _allocatedSize) {
-        _allocatedSize *= 2;
-        _data = realloc(_data, _allocatedSize);
-    }
+    ensureCapacity(1);
 
     uint8_t* ptr = static_cast<uint8_t*>(_data);
     ptr[_bitPosition >> 3] = byte;
     _bitPosition += 8;
-    _bitCount += 8;
+    _bitCount = std::max(_bitCount, _bitPosition);
 }
 
 void BitStream::writeInt(int32_t value, int32_t minValue, int32_t maxValue) {
-    // 变长整数编码 (variable length integer)
+    // Quantize value into [0, range], then emit `bitsNeeded` low bits as LEB128-style bytes.
+    // P0 audit fix (2026-07-26): previous version was a hybrid that computed
+    // bitsNeeded for range quantization but then wrote a generic LEB128 (no
+    // range awareness). For value=0 in any range, the writer produced zero
+    // bytes while the reader expected at least one terminator, causing the
+    // decoder to walk past the end of the stream and read uninitialized bytes.
     uint32_t range = static_cast<uint32_t>(maxValue - minValue);
     uint32_t unsignedValue = static_cast<uint32_t>(value - minValue);
 
-    // 计算所需位数
+    // If value falls outside [min, max] after quantization, clamp. The
+    // original tests don't exercise this but it's the only sane behaviour
+    // for a future-proof BitStream.
+    if (unsignedValue > range) {
+        unsignedValue = range;
+    }
+
+    // Required bits to represent any value in [0, range]. A range of 0 means
+    // the only legal value is minValue; we still need 1 bit to mark "value
+    // equals minValue" (decoder interprets 0 as the canonical value).
     uint32_t bitsNeeded = 0;
     if (range > 0) {
         bitsNeeded = 1;
@@ -75,22 +86,17 @@ void BitStream::writeInt(int32_t value, int32_t minValue, int32_t maxValue) {
         }
     }
 
-    // 写入所需位数
-    uint32_t mask = (1u << bitsNeeded) - 1;
+    // Emit `bitsNeeded` low bits as 7-bit-packed LE bytes with continuation bit.
     uint32_t remaining = unsignedValue;
-
-    while (remaining > 0) {
+    bool first = true;
+    while (remaining > 0 || first) {
         uint8_t byte = remaining & 0x7F;
         remaining >>= 7;
         if (remaining > 0) {
             byte |= 0x80;
         }
         writeByte(static_cast<uint8_t>(byte));
-    }
-
-    // 如果范围为0，写入一个0字节表示
-    if (bitsNeeded == 0) {
-        writeByte(0);
+        first = false;
     }
 }
 

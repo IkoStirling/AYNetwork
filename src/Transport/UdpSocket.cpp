@@ -1,6 +1,7 @@
 // UdpSocket.cpp - UDP socket wrapper
 
 #include <UdpSocket.h>
+#include <atomic>
 #include <cstring>
 
 #if defined(AYT_WINDOWS)
@@ -19,6 +20,34 @@
 namespace ayt::net
 {
 
+// =============================================================================
+// Winsock lifecycle (Windows only)
+// =============================================================================
+// WSACleanup is ref-counted: first socket to call WSAStartup bumps the counter,
+// last socket to close calls WSACleanup. This avoids the bug where one socket
+// closing would tear down Winsock for every other live socket in the process.
+//
+// P0 audit fix (2026-07-26): original code called WSACleanup on every close(),
+// which breaks multi-socket scenarios (e.g. server with N client connections).
+#if defined(AYT_WINDOWS)
+namespace {
+    std::atomic<uint32_t> g_wsaRefCount{0};
+
+    void wsaAcquire() {
+        if (g_wsaRefCount.fetch_add(1) == 0) {
+            WSADATA wsaData;
+            WSAStartup(MAKEWORD(2, 2), &wsaData);
+        }
+    }
+
+    void wsaRelease() {
+        if (g_wsaRefCount.fetch_sub(1) == 1) {
+            WSACleanup();
+        }
+    }
+}
+#endif
+
 UdpSocket::UdpSocket()
     : _sockfd(-1)
     , _nonBlocking(false)
@@ -31,19 +60,24 @@ UdpSocket::~UdpSocket() {
 
 bool UdpSocket::create() {
 #if defined(AYT_WINDOWS)
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    wsaAcquire();
 #endif
 
     _sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    return _sockfd >= 0;
+    if (_sockfd < 0) {
+#if defined(AYT_WINDOWS)
+        wsaRelease();
+#endif
+        return false;
+    }
+    return true;
 }
 
 void UdpSocket::close() {
     if (_sockfd >= 0) {
 #if defined(AYT_WINDOWS)
         closesocket(_sockfd);
-        WSACleanup();
+        wsaRelease();
 #else
         ::close(_sockfd);
 #endif

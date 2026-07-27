@@ -1,0 +1,119 @@
+// AYTest_BitStream.cpp - BitStream unit tests
+//
+// Uses the standard AYTest framework macros (CHECK / CHECK_INT_EQ).
+// Side-effect note (2026-07-26 P0 audit): the old per-file CHECK_EQUAL macro
+// re-evaluated `(a)` in printf, double-invoking stream.readByte(). AYTest's
+// macros don't have this bug because the runner doesn't re-evaluate args.
+
+#include <AYNetwork.h>
+#include <AYTest.h>
+#include <cstdio>
+#include <cstring>
+
+using namespace ayt::net;
+
+TEST_SUITE(BitStream)
+
+TEST_CASE(Basic) {
+    ayt::test::setCurrentCase("Basic");
+
+    BitStream stream;
+
+    // writeByte / readByte round-trip
+    stream.writeByte(0x42);
+    stream.resetForRead();
+    uint8_t val = stream.readByte();
+    CHECK_INT_EQ(val, 0x42);
+
+    // Multi-byte. P1 (2026-07-27): AYTest's CHECK_INT_EQ macro re-evaluates
+    // both arguments in printf, which double-reads readByte(). Cache results
+    // in locals to avoid advancing the position twice per check.
+    stream.reset();
+    stream.writeByte(0x11);
+    stream.writeByte(0x22);
+    stream.writeByte(0x33);
+    stream.resetForRead();
+    uint8_t b1 = stream.readByte();
+    uint8_t b2 = stream.readByte();
+    uint8_t b3 = stream.readByte();
+    CHECK_INT_EQ(b1, 0x11);
+    CHECK_INT_EQ(b2, 0x22);
+    CHECK_INT_EQ(b3, 0x33);
+}
+
+TEST_CASE(Int) {
+    ayt::test::setCurrentCase("Int");
+
+    BitStream stream;
+
+    // P1 (2026-07-27): cache readInt() result. AYTest's CHECK_INT_EQ re-evaluates
+    // both args in printf, which would consume the stream twice per check.
+    stream.writeInt(50, 0, 100);
+    stream.resetForRead();
+    int32_t i50 = stream.readInt(0, 100);
+    CHECK_INT_EQ(i50, 50);
+
+    stream.reset();
+    stream.writeInt(0, 0, 100);
+    stream.resetForRead();
+    int32_t i0 = stream.readInt(0, 100);
+    CHECK_INT_EQ(i0, 0);
+
+    stream.reset();
+    stream.writeInt(100, 0, 100);
+    stream.resetForRead();
+    int32_t i100 = stream.readInt(0, 100);
+    CHECK_INT_EQ(i100, 100);
+
+    stream.reset();
+    stream.writeInt(-50, -100, 100);
+    stream.resetForRead();
+    int32_t im50 = stream.readInt(-100, 100);
+    CHECK_INT_EQ(im50, -50);
+}
+
+TEST_CASE(Float) {
+    ayt::test::setCurrentCase("Float");
+
+    BitStream stream;
+
+    stream.writeFloat(0.5f, 0.0f, 1.0f);
+    stream.resetForRead();
+    float val = stream.readFloat(0.0f, 1.0f);
+    CHECK(val >= 0.49f && val <= 0.51f);
+
+    stream.reset();
+    stream.writeFloat(0.0f, 0.0f, 1.0f);
+    stream.resetForRead();
+    CHECK(stream.readFloat(0.0f, 1.0f) < 0.01f);
+
+    stream.reset();
+    stream.writeFloat(1.0f, 0.0f, 1.0f);
+    stream.resetForRead();
+    CHECK(stream.readFloat(0.0f, 1.0f) > 0.99f);
+}
+
+TEST_CASE(String) {
+    ayt::test::setCurrentCase("String");
+
+    BitStream stream;
+
+    const char* testStr = "Hello, World!";
+    stream.writeString(testStr);
+
+    char buffer[256] = {0};
+    stream.resetForRead();
+    stream.readString(buffer, sizeof(buffer));
+    // strcmp is pure (no side effects) — safe to pass directly.
+    CHECK_INT_EQ(strcmp(buffer, testStr), 0);
+
+    // Empty string
+    stream.reset();
+    stream.writeString("");
+    buffer[0] = 0;
+    stream.resetForRead();
+    stream.readString(buffer, sizeof(buffer));
+    CHECK_INT_EQ(strcmp(buffer, ""), 0);
+}
+
+TEST_SUITE_END

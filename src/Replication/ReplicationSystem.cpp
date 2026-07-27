@@ -6,9 +6,12 @@ namespace ayt::net
 {
 
 void ReplicationSystem::onStart() {
+    // R1 stub. R3 will subscribe to AYEntity's World and prime per-entity
+    // snapshot state.
 }
 
-void ReplicationSystem::onUpdate(float dt) {
+void ReplicationSystem::onUpdate(float /*dt*/) {
+    // R1 stub. R3 will route per-frame work through AYReflect metadata walks.
 }
 
 void ReplicationSystem::setNetwork(INetworkSubSystem* network) {

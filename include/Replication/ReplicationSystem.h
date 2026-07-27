@@ -1,20 +1,40 @@
 #pragma once
 // ReplicationSystem.h - ECS system for replication
+//
+// R1 (2026-07-26): previously extended `ayt::entity::ISystem` which forced
+// AYNetwork to link against AYEntity. AYEntity transitively pulls AYAnimation
+// (which has its own MSVC env issues), causing unrelated build failures when
+// we try to compile AYNetwork in isolation.
+//
+// This class now exposes a minimal, self-contained interface that R3 will
+// integrate with AYEntity's World::registerSystem by passing the resulting
+// instance through an adapter — see design.md §13 R3.
 
 #include <IAYNetwork.h>
+#include <unordered_map>
+#include <cstdint>
 
 namespace ayt::net
 {
 
 // =============================================================================
-// ReplicationSystem - ECS system that replicates entities
+// ReplicationSystem - replicates entity state to subscribed clients
 // =============================================================================
-class ReplicationSystem : public ISystem {
+//
+// Currently R1 provides a tiny helper that maps netId <-> entityId and
+// exposes onUpdate for the GameLoop tick path. R3 will:
+//   - Make this implement the AYEntity ISystem interface via a thin adapter
+//   - Hook into AYEntity's Query<> to iterate replicated components
+//   - Use AYReflect to walk data components and serialise only NetReplicate
+//     fields
+class ReplicationSystem {
 public:
-    const char* getName() const override { return "Replication"; }
+    ReplicationSystem() = default;
 
-    void onStart() override;
-    void onUpdate(float dt) override;
+    const char* getName() const { return "Replication"; }
+
+    void onStart();
+    void onUpdate(float dt);
 
     // Set network subsystem
     void setNetwork(INetworkSubSystem* network);
