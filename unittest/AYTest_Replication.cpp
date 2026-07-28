@@ -26,12 +26,15 @@
 #include <ayreflect/IReflect.h>
 #include <ayreflect/ReflectMacros.h>
 #include <ayreflect/detail/ReflectImpl.h>
+#include <AYReflect.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -68,6 +71,48 @@ struct ReplicationAllPrimitives {
 struct ReplicationNoNet {
     int32_t hp = 100;          // Serialize only — MUST NOT appear on wire
     int32_t score = 42;        // NetReplicate — MUST appear on wire
+};
+
+// =============================================================================
+// R3.2 (2026-07-28): nested wire type fixtures.
+// =============================================================================
+
+struct NestedInner {
+    int32_t x = 1;
+    int32_t y = 2;
+    std::string label = "inner";
+};
+
+struct NestedOuter {
+    int32_t top = 100;             // primitive NetReplicate
+    NestedInner inner;             // nested struct NetReplicate
+    int32_t bottom = 200;          // primitive NetReplicate
+};
+
+struct ArrayOuter {
+    int32_t tag = 0;
+    std::array<int32_t, 4> ints{}; // FixedArray NetReplicate (elem 0..3)
+    std::array<float, 3> coords{}; // FixedArray NetReplicate
+};
+
+struct VectorOuter {
+    int32_t tag = 0;
+    std::vector<int32_t> ints;     // DynamicArray NetReplicate
+    std::vector<float> floats;     // DynamicArray NetReplicate
+};
+
+struct MapOuter {
+    int32_t tag = 0;
+    std::map<std::string, int32_t> inventory;  // StringMap NetReplicate
+    std::map<std::string, float>  weights;    // StringMap NetReplicate
+};
+
+struct MixedOuter {
+    int32_t id = 0;
+    NestedInner inner;                     // NestedStruct
+    std::array<int32_t, 2> pair{};         // FixedArray
+    std::vector<float> trajectory;         // DynamicArray
+    std::map<std::string, int32_t> tags;   // StringMap
 };
 
 namespace
@@ -122,6 +167,133 @@ struct ReplicationFixtureRegistrar {
             info->addField(new FieldInfoImpl("hp",    reg.findType<int32_t>(), offsetof(T, hp),    FA::Serialize));
             info->addField(new FieldInfoImpl("score", reg.findType<int32_t>(), offsetof(T, score), FA::Serialize | FA::NetReplicate));
             reg.registerTypeInfo("ReplicationNoNet", info);
+        }
+
+        // R3.2 nested struct fixtures.
+        if (!reg.findType("NestedInner")) {
+            auto* info = new TypeInfoImpl<NestedInner>(
+                "NestedInner",
+                defaultCreate<NestedInner>,
+                defaultDestroy<NestedInner>,
+                defaultCopy<NestedInner>);
+            using T = NestedInner;
+            using FA = FieldAttribute;
+            auto NR = FA::Serialize | FA::NetReplicate;
+            info->addField(new FieldInfoImpl("x",     reg.findType<int32_t>(),      offsetof(T, x),     NR));
+            info->addField(new FieldInfoImpl("y",     reg.findType<int32_t>(),      offsetof(T, y),     NR));
+            info->addField(new FieldInfoImpl("label", reg.findType<std::string>(),  offsetof(T, label), NR));
+            reg.registerTypeInfo("NestedInner", info);
+        }
+        if (!reg.findType("NestedOuter")) {
+            auto* info = new TypeInfoImpl<NestedOuter>(
+                "NestedOuter",
+                defaultCreate<NestedOuter>,
+                defaultDestroy<NestedOuter>,
+                defaultCopy<NestedOuter>);
+            using T = NestedOuter;
+            using FA = FieldAttribute;
+            auto NR = FA::Serialize | FA::NetReplicate;
+            info->addField(new FieldInfoImpl("top",    reg.findType<int32_t>(),     offsetof(T, top),    NR));
+            info->addField(new FieldInfoImpl("inner",  reg.findType<NestedInner>(), offsetof(T, inner),  NR));
+            info->addField(new FieldInfoImpl("bottom", reg.findType<int32_t>(),     offsetof(T, bottom), NR));
+            reg.registerTypeInfo("NestedOuter", info);
+        }
+
+        // R3.2 fixed-array fixture.
+        // Register std::array types so findType<std::array<T,N>>() returns
+        // the ArrayTypeInfo<T,N> instance (which inherits IContainerTypeInfo
+        // and resolves to WireTypeId::FixedArray).
+        if (!reg.findType("std::array<int32_t,4>")) {
+            ayt::reflect::registerArrayType<int32_t, 4>("std::array<int32_t,4>");
+        }
+        if (!reg.findType("std::array<float,3>")) {
+            ayt::reflect::registerArrayType<float, 3>("std::array<float,3>");
+        }
+        if (!reg.findType("std::array<int32_t,2>")) {
+            ayt::reflect::registerArrayType<int32_t, 2>("std::array<int32_t,2>");
+        }
+        // Register std::vector types (same pattern).
+        if (!reg.findType("std::vector<int32_t>")) {
+            ayt::reflect::registerVectorType<int32_t>("std::vector<int32_t>");
+        }
+        if (!reg.findType("std::vector<float>")) {
+            ayt::reflect::registerVectorType<float>("std::vector<float>");
+        }
+
+        if (!reg.findType("ArrayOuter")) {
+            auto* info = new TypeInfoImpl<ArrayOuter>(
+                "ArrayOuter",
+                defaultCreate<ArrayOuter>,
+                defaultDestroy<ArrayOuter>,
+                defaultCopy<ArrayOuter>);
+            using T = ArrayOuter;
+            using FA = FieldAttribute;
+            auto NR = FA::Serialize | FA::NetReplicate;
+            info->addField(new FieldInfoImpl("tag",    reg.findType<int32_t>(),                                  offsetof(T, tag),    NR));
+            info->addField(new FieldInfoImpl("ints",   reg.findType<std::array<int32_t, 4>>(),                  offsetof(T, ints),   NR));
+            info->addField(new FieldInfoImpl("coords", reg.findType<std::array<float, 3>>(),                    offsetof(T, coords), NR));
+            reg.registerTypeInfo("ArrayOuter", info);
+        }
+
+        // R3.2 dynamic-array fixture.
+        if (!reg.findType("VectorOuter")) {
+            auto* info = new TypeInfoImpl<VectorOuter>(
+                "VectorOuter",
+                defaultCreate<VectorOuter>,
+                defaultDestroy<VectorOuter>,
+                defaultCopy<VectorOuter>);
+            using T = VectorOuter;
+            using FA = FieldAttribute;
+            auto NR = FA::Serialize | FA::NetReplicate;
+            info->addField(new FieldInfoImpl("tag",    reg.findType<int32_t>(),                       offsetof(T, tag),    NR));
+            info->addField(new FieldInfoImpl("ints",   reg.findType<std::vector<int32_t>>(),          offsetof(T, ints),   NR));
+            info->addField(new FieldInfoImpl("floats", reg.findType<std::vector<float>>(),            offsetof(T, floats), NR));
+            reg.registerTypeInfo("VectorOuter", info);
+        }
+
+        // R3.2 string-map fixture. Map types must be registered BEFORE the struct
+        // fixtures reference them in their FieldInfoImpl.
+        if (!reg.findType("std::map<std::string,int32_t>")) {
+            ayt::reflect::registerMapType<int32_t>(
+                "std::map<std::string,int32_t>", "int32_t");
+        }
+        if (!reg.findType("std::map<std::string,float>")) {
+            ayt::reflect::registerMapType<float>(
+                "std::map<std::string,float>", "float");
+        }
+
+        // R3.2 string-map struct fixture.
+        if (!reg.findType("MapOuter")) {
+            auto* info = new TypeInfoImpl<MapOuter>(
+                "MapOuter",
+                defaultCreate<MapOuter>,
+                defaultDestroy<MapOuter>,
+                defaultCopy<MapOuter>);
+            using T = MapOuter;
+            using FA = FieldAttribute;
+            auto NR = FA::Serialize | FA::NetReplicate;
+            info->addField(new FieldInfoImpl("tag",       reg.findType<int32_t>(),                          offsetof(T, tag),       NR));
+            info->addField(new FieldInfoImpl("inventory", reg.findType("std::map<std::string,int32_t>"),   offsetof(T, inventory), NR));
+            info->addField(new FieldInfoImpl("weights",   reg.findType("std::map<std::string,float>"),     offsetof(T, weights),   NR));
+            reg.registerTypeInfo("MapOuter", info);
+        }
+
+        // R3.2 mixed-type fixture (uses all 4 nested wire types).
+        if (!reg.findType("MixedOuter")) {
+            auto* info = new TypeInfoImpl<MixedOuter>(
+                "MixedOuter",
+                defaultCreate<MixedOuter>,
+                defaultDestroy<MixedOuter>,
+                defaultCopy<MixedOuter>);
+            using T = MixedOuter;
+            using FA = FieldAttribute;
+            auto NR = FA::Serialize | FA::NetReplicate;
+            info->addField(new FieldInfoImpl("id",         reg.findType<int32_t>(),                       offsetof(T, id),         NR));
+            info->addField(new FieldInfoImpl("inner",      reg.findType<NestedInner>(),                   offsetof(T, inner),      NR));
+            info->addField(new FieldInfoImpl("pair",       reg.findType<std::array<int32_t, 2>>(),        offsetof(T, pair),       NR));
+            info->addField(new FieldInfoImpl("trajectory", reg.findType<std::vector<float>>(),            offsetof(T, trajectory), NR));
+            info->addField(new FieldInfoImpl("tags",       reg.findType("std::map<std::string,int32_t>"), offsetof(T, tags),       NR));
+            reg.registerTypeInfo("MixedOuter", info);
         }
     }
 };
@@ -1546,6 +1718,439 @@ TEST_CASE(GetDirtyFieldCountReportsPending) {
     // Unregistered netId → SIZE_MAX.
     CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(999)), static_cast<size_t>(SIZE_MAX));
 
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+// =============================================================================
+// R3.2 (2026-07-28): nested wire type tests.
+// =============================================================================
+
+TEST_SUITE(NestedStructPure)
+TEST_CASE(NestedStructRoundTrip) {
+    ayt::test::setCurrentCase("NestedStructRoundTrip");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<NestedOuter>();
+    CHECK(type != nullptr);
+    NestedOuter src{};
+    src.top = 42;
+    src.inner.x = 7; src.inner.y = 11; src.inner.label = "hi";
+    src.bottom = 99;
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &src, /*netId=*/ 1, wire));
+    ReflectSerializer::FrameHeader hdr;
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, hdr));
+    CHECK_INT_EQ(static_cast<uint32_t>(hdr.netId), 1u);
+    CHECK_INT_EQ(static_cast<int>(hdr.fieldCount), 3);
+    NestedOuter dst{};
+    dst.top = -1; dst.bottom = -2;
+    dst.inner.x = -3; dst.inner.y = -4; dst.inner.label = "sentinel";
+    CHECK(ReflectSerializer::deserializeObject(type, &dst, wire, hdr.fieldCount));
+    CHECK(dst.top == 42);
+    CHECK(dst.bottom == 99);
+    CHECK(dst.inner.x == 7);
+    CHECK(dst.inner.label == "hi");
+}
+TEST_SUITE_END
+
+TEST_SUITE(FixedArrayPure)
+TEST_CASE(FixedArrayRoundTrip) {
+    ayt::test::setCurrentCase("FixedArrayRoundTrip");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ArrayOuter>();
+    CHECK(type != nullptr);
+    ArrayOuter src{};
+    src.tag = 5;
+    src.ints = {10, 20, 30, 40};
+    src.coords = {1.5f, 2.5f, 3.5f};
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &src, /*netId=*/ 7, wire));
+    ReflectSerializer::FrameHeader hdr;
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, hdr));
+    CHECK_INT_EQ(static_cast<int>(hdr.fieldCount), 3);
+    ArrayOuter dst{};
+    dst.tag = -1;
+    dst.ints.fill(-99);
+    dst.coords.fill(-99.0f);
+    CHECK(ReflectSerializer::deserializeObject(type, &dst, wire, hdr.fieldCount));
+    CHECK(dst.tag == 5);
+    CHECK(dst.ints[0] == 10);
+    CHECK(dst.ints[3] == 40);
+    CHECK(dst.coords[0] == 1.5f);
+    CHECK(dst.coords[2] == 3.5f);
+}
+TEST_SUITE_END
+
+TEST_SUITE(DynamicArrayPure)
+TEST_CASE(DynamicArrayRoundTrip) {
+    ayt::test::setCurrentCase("DynamicArrayRoundTrip");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<VectorOuter>();
+    CHECK(type != nullptr);
+    VectorOuter src{};
+    src.tag = 11;
+    src.ints = {1, 2, 3, 4, 5};
+    src.floats = {0.5f, 1.5f};
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &src, /*netId=*/ 9, wire));
+    ReflectSerializer::FrameHeader hdr;
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, hdr));
+    CHECK_INT_EQ(static_cast<int>(hdr.fieldCount), 3);
+    VectorOuter dst{};
+    dst.tag = -1;
+    CHECK(ReflectSerializer::deserializeObject(type, &dst, wire, hdr.fieldCount));
+    CHECK(dst.tag == 11);
+    CHECK(dst.ints.size() == 5);
+    CHECK(dst.ints[4] == 5);
+    CHECK(dst.floats.size() == 2);
+    CHECK(dst.floats[1] == 1.5f);
+}
+TEST_SUITE_END
+
+TEST_SUITE(StringMapPure)
+TEST_CASE(StringMapRoundTrip) {
+    ayt::test::setCurrentCase("StringMapRoundTrip");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<MapOuter>();
+    CHECK(type != nullptr);
+    MapOuter src{};
+    src.tag = 99;
+    src.inventory["apple"] = 3;
+    src.inventory["banana"] = 5;
+    src.inventory["cherry"] = 7;
+    src.weights["light"] = 1.5f;
+    src.weights["heavy"] = 9.9f;
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &src, /*netId=*/ 13, wire));
+    ReflectSerializer::FrameHeader hdr;
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, hdr));
+    CHECK_INT_EQ(static_cast<int>(hdr.fieldCount), 3);
+    MapOuter dst{};
+    dst.tag = -1;
+    CHECK(ReflectSerializer::deserializeObject(type, &dst, wire, hdr.fieldCount));
+    CHECK(dst.tag == 99);
+    CHECK(dst.inventory.size() == 3);
+    CHECK(dst.inventory["apple"] == 3);
+    CHECK(dst.inventory["cherry"] == 7);
+    CHECK(dst.weights.size() == 2);
+    CHECK(dst.weights["heavy"] == 9.9f);
+}
+TEST_SUITE_END
+
+TEST_SUITE(MixedNestedPure)
+TEST_CASE(MixedNestedTypesRoundTrip) {
+    ayt::test::setCurrentCase("MixedNestedTypesRoundTrip");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<MixedOuter>();
+    CHECK(type != nullptr);
+    MixedOuter src{};
+    src.id = 100;
+    src.inner.x = 1; src.inner.y = 2; src.inner.label = "mix";
+    src.pair = {7, 8};
+    src.trajectory = {1.0f, 2.0f, 3.0f};
+    src.tags["a"] = 11;
+    src.tags["b"] = 22;
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &src, /*netId=*/ 17, wire));
+    ReflectSerializer::FrameHeader hdr;
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, hdr));
+    CHECK_INT_EQ(static_cast<int>(hdr.fieldCount), 5);
+    MixedOuter dst{};
+    dst.id = -1;
+    dst.inner.label = "sentinel";
+    CHECK(ReflectSerializer::deserializeObject(type, &dst, wire, hdr.fieldCount));
+    CHECK(dst.id == 100);
+    CHECK(dst.inner.label == "mix");
+    CHECK(dst.pair[0] == 7);
+    CHECK(dst.trajectory.size() == 3);
+    CHECK(dst.trajectory[2] == 3.0f);
+    CHECK(dst.tags.size() == 2);
+    CHECK(dst.tags["a"] == 11);
+}
+TEST_SUITE_END
+
+TEST_SUITE(R31CompatibilityPure)
+TEST_CASE(NestedStructAcceptedByR32Receiver) {
+    ayt::test::setCurrentCase("NestedStructAcceptedByR32Receiver");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<NestedOuter>();
+    CHECK(type != nullptr);
+    NestedOuter src{};
+    src.top = 1; src.inner.x = 2; src.inner.y = 3; src.inner.label = "r32"; src.bottom = 4;
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &src, /*netId=*/ 1, wire));
+    ReflectSerializer::FrameHeader hdr;
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, hdr));
+    NestedOuter dst{};
+    const bool ok = ReflectSerializer::deserializeObject(type, &dst, wire, hdr.fieldCount);
+    CHECK(ok);
+    CHECK(dst.top == 1);
+    CHECK(dst.inner.x == 2);
+    CHECK(dst.inner.label == "r32");
+    CHECK(dst.bottom == 4);
+}
+TEST_SUITE_END
+
+TEST_SUITE(E2ENestedStruct)
+TEST_CASE(NestedStructInitialFullAndDelta) {
+    ayt::test::setCurrentCase("NestedStructInitialFullAndDelta");
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27464;
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<NestedOuter>();
+    CHECK(type != nullptr);
+    NestedOuter obj{};
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 100);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    CHECK_INT_EQ(s.fullCount.load(), 1);
+    s.fullCount.store(0); s.deltaCount.store(0);
+    obj.inner.x = 999;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+    CHECK_INT_EQ(s.fullCount.load(), 0);
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+TEST_SUITE(E2EFixedArray)
+TEST_CASE(FixedArrayElementChange) {
+    ayt::test::setCurrentCase("FixedArrayElementChange");
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27465;
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ArrayOuter>();
+    CHECK(type != nullptr);
+    ArrayOuter obj{};
+    obj.ints = {1, 2, 3, 4};
+    obj.coords = {0.0f, 0.0f, 0.0f};
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 101);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+    obj.ints[2] = 99;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+TEST_SUITE(E2EDynamicArray)
+TEST_CASE(DynamicArraySizeChange) {
+    ayt::test::setCurrentCase("DynamicArraySizeChange");
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27466;
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<VectorOuter>();
+    CHECK(type != nullptr);
+    VectorOuter obj{};
+    obj.ints = {1, 2, 3};
+    obj.floats = {1.0f};
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 102);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+    obj.ints.push_back(4);
+    obj.floats.push_back(2.0f);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+TEST_SUITE(E2EStringMap)
+TEST_CASE(StringMapKeyAdd) {
+    ayt::test::setCurrentCase("StringMapKeyAdd");
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27467;
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<MapOuter>();
+    CHECK(type != nullptr);
+    MapOuter obj{};
+    obj.inventory["initial"] = 1;
+    obj.weights["light"] = 0.5f;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 103);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+    obj.inventory["added"] = 99;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+TEST_SUITE(E2ENestedHash)
+TEST_CASE(NestedStructHashDetectsInnerChange) {
+    ayt::test::setCurrentCase("NestedStructHashDetectsInnerChange");
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27468;
+    GnsConnection server, client;
+    server.setProtocolVersion(1);
+    client.setProtocolVersion(1);
+    server.initServer(kPort);
+    client.initClient("127.0.0.1", kPort);
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            server.update(); client.update();
+            if (client.getState() == GnsConnectionState::Ready) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    CHECK(client.getState() == GnsConnectionState::Ready);
+    ReplicationManager mgr(nullptr);
+    mgr.setModeForTesting(ConnectionMode::Server);
+    mgr.setBroadcastSinkForTesting([](uint8_t, const void*, size_t){});
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<NestedOuter>();
+    CHECK(type != nullptr);
+    NestedOuter obj{};
+    mgr.registerObject(&obj, type, /*netId=*/ 200);
+    mgr.tick(0.016f);
+    CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(200)), 0u);
+    obj.inner.x = 42;
+    CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(200)), 1u);
+    mgr.tick(0.016f);
+    CHECK_INT_EQ(static_cast<size_t>(mgr.getDirtyFieldCount(200)), 0u);
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+TEST_SUITE(R32RegressionR30Primitives)
+TEST_CASE(R30PrimitivesStillWork) {
+    ayt::test::setCurrentCase("R30PrimitivesStillWork");
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27470;
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
+    CHECK(type != nullptr);
+    ReplicationAllPrimitives obj{};
+    obj.i32 = 0xCAFE;
+    obj.s = "primitive";
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 400);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    CHECK_INT_EQ(s.fullCount.load(), 1);
+    obj.i32 = 0xBABE;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+TEST_SUITE(R32RegressionR31Delta)
+TEST_CASE(R31DeltaStillTriggersForPrimitive) {
+    ayt::test::setCurrentCase("R31DeltaStillTriggersForPrimitive");
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27471;
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<MixedOuter>();
+    CHECK(type != nullptr);
+    MixedOuter obj{};
+    obj.id = 1;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 500);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    s.fullCount.store(0); s.deltaCount.store(0);
+    obj.id = 2;
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.deltaCount.load() >= 1; }));
+    CHECK_INT_EQ(s.deltaCount.load(), 1);
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+TEST_SUITE(R32RegressionMixedInitial)
+TEST_CASE(NestedStructInInitialTickDoesNotPolluteR31Path) {
+    ayt::test::setCurrentCase("NestedStructInInitialTickDoesNotPolluteR31Path");
+    if (!gns::init()) { CHECK(false); return; }
+    constexpr uint16_t kPort = 27472;
+    E2EScaffold s;
+    s.server.initServer(kPort);
+    s.client.initClient("127.0.0.1", kPort);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(5),
+                  [&]() { return s.client.getState() == GnsConnectionState::Ready; }));
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<MixedOuter>();
+    CHECK(type != nullptr);
+    MixedOuter obj{};
+    obj.inner.x = 1; obj.inner.y = 2; obj.inner.label = "init";
+    obj.pair = {5, 6};
+    obj.trajectory = {1.0f, 2.0f};
+    obj.tags["k"] = 7;
+    s.serverMgr.registerObject(&obj, type, /*netId=*/ 600);
+    CHECK(pumpE2E(s.server, s.client, s.serverMgr, std::chrono::seconds(3),
+                  [&]() { return s.fullCount.load() >= 1; }));
+    CHECK_INT_EQ(s.fullCount.load(), 1);
+    CHECK_INT_EQ(s.deltaCount.load(), 0);
+    CHECK_INT_EQ(static_cast<int>(s.lastChannel.load()),
+                 static_cast<int>(CHANNEL_RELIABLE));
+    gns::shutdown();
+}
+TEST_SUITE_END
+
+TEST_SUITE(E2ER31DropFrame)
+TEST_CASE(R32FrameSurvivesPacketCodec) {
+    ayt::test::setCurrentCase("R32FrameSurvivesPacketCodec");
+    if (!gns::init()) { CHECK(false); return; }
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<NestedOuter>();
+    CHECK(type != nullptr);
+    NestedOuter serverSide{};
+    serverSide.top = 100;
+    serverSide.inner.x = 999;
+    serverSide.inner.y = 1;
+    serverSide.inner.label = "codec";
+    serverSide.bottom = 200;
+    BitStream body;
+    body.writeUInt16(kMsgTypeReplication);
+    CHECK(ReflectSerializer::serializeObject(type, &serverSide, /*netId=*/ 300, body));
+    auto sealed = PacketCodec::encode(
+        static_cast<const uint8_t*>(body.getData()), body.getSize(),
+        kMsgTypeReplication, kSchemaVersion,
+        CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+        /*compress=*/ false);
+    DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
+    CHECK(dec.ok);
+    BitStream bs(dec.body.data(), dec.body.size());
+    const uint16_t inner = bs.readUInt16();
+    CHECK_INT_EQ(static_cast<int>(inner), static_cast<int>(kMsgTypeReplication));
+    ReflectSerializer::FrameHeader hdr;
+    CHECK(ReflectSerializer::readReplicationFrameHeader(bs, hdr));
+    NestedOuter clientSide{};
+    const bool ok = ReflectSerializer::deserializeObject(type, &clientSide, bs, hdr.fieldCount);
+    CHECK(ok);
+    CHECK(clientSide.top == 100);
+    CHECK(clientSide.inner.x == 999);
+    CHECK(clientSide.inner.label == "codec");
+    CHECK(clientSide.bottom == 200);
     gns::shutdown();
 }
 TEST_SUITE_END

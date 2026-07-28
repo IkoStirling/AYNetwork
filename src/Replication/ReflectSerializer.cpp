@@ -24,6 +24,7 @@
 
 #include <ayreflect/IReflect.h>
 #include <Protocol/PacketCodec.h>
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -56,7 +57,9 @@ uint16_t ReflectSerializer::hashFieldName(const char* name) {
 
 // =============================================================================
 // resolveWireTypeId — maps AYReflect ITypeInfo::getId() (= typeid(T).hash_code())
-// to a WireTypeId. R3.0 supports the 12 primitives only.
+// to a WireTypeId. R3.0 supported the 12 primitives only. R3.2 (2026-07-28)
+// extends to cover NestedStruct (12), FixedArray (13), DynamicArray (14),
+// and StringMap (15).
 // =============================================================================
 bool ReflectSerializer::resolveWireTypeId(const ayt::reflect::ITypeInfo* fieldType, WireTypeId& outId) {
     if (!fieldType) return false;
@@ -65,9 +68,6 @@ bool ReflectSerializer::resolveWireTypeId(const ayt::reflect::ITypeInfo* fieldTy
     // Direct typeid compares against the 12 primitives. Hash codes are
     // process-stable (MSVC guarantees; GCC/Clang same TU = same hash), so
     // server/client built from the same compiler produce matching ids.
-    // If this assumption ever breaks (e.g. dynamic loading), the fallback
-    // is to walk fieldType->getName() and string-match — but R3.0 stays
-    // strict for predictability.
     if      (id == typeid(bool).hash_code())        outId = WireTypeId::Bool;
     else if (id == typeid(int8_t).hash_code())       outId = WireTypeId::Int8;
     else if (id == typeid(int16_t).hash_code())      outId = WireTypeId::Int16;
@@ -80,7 +80,27 @@ bool ReflectSerializer::resolveWireTypeId(const ayt::reflect::ITypeInfo* fieldTy
     else if (id == typeid(float).hash_code())        outId = WireTypeId::Float;
     else if (id == typeid(double).hash_code())       outId = WireTypeId::Double;
     else if (id == typeid(std::string).hash_code())  outId = WireTypeId::String;
-    else return false;
+    else {
+        // R3.2: nested type detection.
+        //   - std::map<string,V> MUST be checked before IContainerTypeInfo:
+        //     MapTypeInfo also implements IContainerTypeInfo (isFixedSize=false)
+        //     and would otherwise be misclassified as DynamicArray.
+        //   - Containers that ARE IContainerTypeInfo → FixedArray or DynamicArray
+        //     depending on isFixedSize().
+        //   - Anything else → NestedStruct (assumed registered struct).
+        const char* name = fieldType->getName();
+        if (name && std::strncmp(name, "std::map<std::string,", 21) == 0) {
+            outId = WireTypeId::StringMap;
+            return true;
+        }
+        const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(fieldType);
+        if (ctn) {
+            outId = ctn->isFixedSize() ? WireTypeId::FixedArray : WireTypeId::DynamicArray;
+            return true;
+        }
+        outId = WireTypeId::NestedStruct;
+        return true;
+    }
     return true;
 }
 
@@ -90,6 +110,8 @@ bool ReflectSerializer::resolveWireTypeId(const ayt::reflect::ITypeInfo* fieldTy
 namespace {
 
 void writeFieldValue(BitStream& s, WireTypeId id, const void* fieldPtr) {
+    // R3.0/R3.1: only 12 primitives. R3.2 extends to 12..15 via writeWireValue
+    // (called from serializeObject). This stays as the primitive path.
     switch (id) {
         case WireTypeId::Bool: {
             bool v; std::memcpy(&v, fieldPtr, sizeof(v)); s.writeBool(v); break;
@@ -114,6 +136,7 @@ void writeFieldValue(BitStream& s, WireTypeId id, const void* fieldPtr) {
             }
             break;
         }
+        default: break; // R3.2 nested types handled by writeWireValue
     }
 }
 
@@ -142,6 +165,7 @@ bool readFieldValue(BitStream& s, WireTypeId id, void* fieldPtr) {
             }
             break;
         }
+        default: return false; // R3.2 nested types handled by readWireValue
     }
     (void)posBefore;
     return true;
@@ -224,12 +248,16 @@ bool ReflectSerializer::serializeObject(const ayt::reflect::ITypeInfo* type, con
         if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
 
         WireTypeId wid;
-        if (!resolveWireTypeId(field->getType(), wid)) continue;
+        if (!resolveWireTypeId(field->getType(), wid)) {
+            continue;
+        }
 
         const uint16_t nameHash = hashFieldName(field->getName());
         s.writeUInt16(nameHash);
         s.writeUInt8(static_cast<uint8_t>(wid));
-        writeFieldValue(s, wid, field->get(const_cast<void*>(obj)));
+        // R3.2: writeWireValue handles 12..15 nested types recursively.
+        // For 0..11 it delegates to writeFieldValue.
+        writeWireValue(s, wid, field->getType(), field->get(const_cast<void*>(obj)));
     }
 
     return true;
@@ -258,7 +286,9 @@ bool ReflectSerializer::deserializeObject(const ayt::reflect::ITypeInfo* type, v
         if (!field) return false; // unknown field on this client build
         if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) return false;
 
-        if (!readFieldValue(s, wid, field->get(obj))) return false;
+        // R3.2: readWireValue handles 12..15 nested types recursively.
+        // For 0..11 it delegates to readFieldValue.
+        if (!readWireValue(s, wid, field->getType(), field->get(obj))) return false;
     }
     return true;
 }
@@ -354,9 +384,419 @@ bool ReflectSerializer::serializeDirtyFields(const ayt::reflect::ITypeInfo* type
         const uint16_t nameHash = hashFieldName(field->getName());
         s.writeUInt16(nameHash);
         s.writeUInt8(static_cast<uint8_t>(wid));
-        writeFieldValue(s, wid, field->get(const_cast<void*>(obj)));
+        // R3.2: writeWireValue handles 12..15 nested types recursively.
+        writeWireValue(s, wid, field->getType(), field->get(const_cast<void*>(obj)));
     }
     return true;
+}
+
+// =============================================================================
+// R3.2 (2026-07-28): writeWireValue / readWireValue
+//
+// Recursive entry points for all 16 WireTypeIds. For 0..11 (primitives)
+// they delegate to writeFieldValue/readFieldValue above. For 12..15 they
+// emit the nested type's wire prefix and recurse on element/value types.
+//
+// All nested operations use IContainerTypeInfo (for vector/array/map) or
+// IFieldInfo (for nested struct) — the same primitives AYSerializer uses,
+// so the AYReflect->wire pipeline stays single-source.
+// =============================================================================
+namespace {
+
+// Count NetReplicate fields that resolve to a wire type (for nested struct prefix).
+uint8_t countNetReplicateFields(const ayt::reflect::ITypeInfo* type) {
+    if (!type) return 0;
+    uint32_t count = 0;
+    const uint32_t total = type->getFieldCount();
+    for (uint32_t i = 0; i < total; ++i) {
+        const auto* field = type->getField(i);
+        if (!field) continue;
+        if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
+        WireTypeId wid;
+        if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
+        ++count;
+        if (count == 255) break;
+    }
+    return static_cast<uint8_t>(count);
+}
+
+// Emit a single struct's NetReplicate fields recursively. Caller writes
+// [u16 nestedTypeHash][u8 fieldCount] before calling this.
+void serializeNestedStructFields(BitStream& s, const ayt::reflect::ITypeInfo* type, const void* obj) {
+    if (!type || !obj) return;
+    const uint32_t total = type->getFieldCount();
+    for (uint32_t i = 0; i < total; ++i) {
+        const auto* field = type->getField(i);
+        if (!field) continue;
+        if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
+        WireTypeId wid;
+        if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
+        const uint16_t nameHash = ReflectSerializer::hashFieldName(field->getName());
+        s.writeUInt16(nameHash);
+        s.writeUInt8(static_cast<uint8_t>(wid));
+        ReflectSerializer::writeWireValue(s, wid, field->getType(), field->get(const_cast<void*>(obj)));
+    }
+}
+
+// Read [u8 fieldCount] then deserialize that many records into `obj`. Mirrors
+// serializeNestedStructFields. Caller is responsible for resolving the
+// nested struct type via [u16 nestedTypeHash] before calling this.
+bool deserializeNestedStructFields(const ayt::reflect::ITypeInfo* type, void* obj, BitStream& s, uint8_t expectedFieldCount) {
+    if (!type || !obj) return false;
+    const uint32_t total = type->getFieldCount();
+    for (uint8_t i = 0; i < expectedFieldCount; ++i) {
+        if (s.getBitPosition() + 24 > s.getBitCount()) return false;
+        const uint16_t nameHash = s.readUInt16();
+        const uint8_t  widByte  = s.readUInt8();
+        const WireTypeId wid = static_cast<WireTypeId>(widByte);
+
+        const ayt::reflect::IFieldInfo* field = nullptr;
+        for (uint32_t j = 0; j < total; ++j) {
+            const auto* f = type->getField(j);
+            if (f && ReflectSerializer::hashFieldName(f->getName()) == nameHash) { field = f; break; }
+        }
+        if (!field) return false;
+        if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) return false;
+        if (!ReflectSerializer::readWireValue(s, wid, field->getType(), field->get(obj))) return false;
+    }
+    return true;
+}
+
+} // anonymous namespace
+
+bool ReflectSerializer::writeWireValue(BitStream& s, WireTypeId wid,
+                                       const ayt::reflect::ITypeInfo* type, const void* fieldPtr) {
+    if (!fieldPtr) return false;
+    switch (wid) {
+        case WireTypeId::Bool:
+        case WireTypeId::Int8:
+        case WireTypeId::Int16:
+        case WireTypeId::Int32:
+        case WireTypeId::Int64:
+        case WireTypeId::UInt8:
+        case WireTypeId::UInt16:
+        case WireTypeId::UInt32:
+        case WireTypeId::UInt64:
+        case WireTypeId::Float:
+        case WireTypeId::Double:
+        case WireTypeId::String:
+            writeFieldValue(s, wid, fieldPtr);
+            return true;
+
+        case WireTypeId::NestedStruct: {
+            if (!type) return false;
+            // Wire prefix: [u16 nestedTypeHash][u8 fieldCount][records...]
+            const uint16_t nestedHash = static_cast<uint16_t>(type->getId() & 0xFFFFu);
+            const uint8_t fc = countNetReplicateFields(type);
+            s.writeUInt16(nestedHash);
+            s.writeUInt8(fc);
+            serializeNestedStructFields(s, type, fieldPtr);
+            return true;
+        }
+
+        case WireTypeId::FixedArray: {
+            if (!type) return false;
+            const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+            if (!ctn) return false;
+            ayt::reflect::ITypeInfo* elemType = ctn->getElementType();
+            if (!elemType) return false;
+            WireTypeId elemWid;
+            if (!resolveWireTypeId(elemType, elemWid)) return false;
+            const size_t N = ctn->getContainerSize(fieldPtr);
+            if (N > 255) return false;
+            // Wire prefix: [u8 elemWid][u8 N][elements...]
+            s.writeUInt8(static_cast<uint8_t>(elemWid));
+            s.writeUInt8(static_cast<uint8_t>(N));
+            for (size_t i = 0; i < N; ++i) {
+                const void* ePtr = ctn->getElementAt(fieldPtr, i);
+                if (!ePtr) return false;
+                if (!writeWireValue(s, elemWid, elemType, ePtr)) return false;
+            }
+            return true;
+        }
+
+        case WireTypeId::DynamicArray: {
+            if (!type) return false;
+            const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+            if (!ctn) return false;
+            ayt::reflect::ITypeInfo* elemType = ctn->getElementType();
+            if (!elemType) return false;
+            WireTypeId elemWid;
+            if (!resolveWireTypeId(elemType, elemWid)) return false;
+            const size_t N = ctn->getContainerSize(fieldPtr);
+            // Wire prefix: [u8 elemWid][u32 N][elements...]
+            s.writeUInt8(static_cast<uint8_t>(elemWid));
+            s.writeUInt32(static_cast<uint32_t>(N));
+            for (size_t i = 0; i < N; ++i) {
+                const void* ePtr = ctn->getElementAt(fieldPtr, i);
+                if (!ePtr) return false;
+                if (!writeWireValue(s, elemWid, elemType, ePtr)) return false;
+            }
+            return true;
+        }
+
+        case WireTypeId::StringMap: {
+            if (!type) return false;
+            const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+            if (!ctn) return false;
+            ayt::reflect::ITypeInfo* valueType = ctn->getElementType();
+            if (!valueType) return false;
+            WireTypeId valueWid;
+            if (!resolveWireTypeId(valueType, valueWid)) return false;
+            const size_t N = ctn->getContainerSize(fieldPtr);
+            // Wire prefix: [u8 valueWid][u32 entryCount][entries...]
+            s.writeUInt8(static_cast<uint8_t>(valueWid));
+            s.writeUInt32(static_cast<uint32_t>(N));
+            for (size_t i = 0; i < N; ++i) {
+                const void* kPtr = ctn->getKeyAt(fieldPtr, i);
+                const void* vPtr = ctn->getValueAt(fieldPtr, i);
+                if (!kPtr || !vPtr) return false;
+                const auto& k = *static_cast<const std::string*>(kPtr);
+                const uint16_t klen = static_cast<uint16_t>(k.size());
+                s.writeUInt16(klen);
+                for (uint16_t j = 0; j < klen; ++j) {
+                    s.writeByte(static_cast<uint8_t>(k[j]));
+                }
+                if (!writeWireValue(s, valueWid, valueType, vPtr)) return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ReflectSerializer::readWireValue(BitStream& s, WireTypeId wid,
+                                      const ayt::reflect::ITypeInfo* type, void* fieldPtr) {
+    if (!fieldPtr) return false;
+    switch (wid) {
+        case WireTypeId::Bool:
+        case WireTypeId::Int8:
+        case WireTypeId::Int16:
+        case WireTypeId::Int32:
+        case WireTypeId::Int64:
+        case WireTypeId::UInt8:
+        case WireTypeId::UInt16:
+        case WireTypeId::UInt32:
+        case WireTypeId::UInt64:
+        case WireTypeId::Float:
+        case WireTypeId::Double:
+        case WireTypeId::String:
+            return readFieldValue(s, wid, fieldPtr);
+
+        case WireTypeId::NestedStruct: {
+            if (!type) return false;
+            // Wire prefix: [u16 nestedTypeHash][u8 fieldCount][records...]
+            if (s.getBitPosition() + 24 > s.getBitCount()) return false;
+            const uint16_t nestedHash = s.readUInt16();
+            const uint8_t  fieldCount  = s.readUInt8();
+            // Look up nested type via the registry. R3.2 uses the
+            // expected type (passed in) directly — caller resolved it
+            // when reading the field's declared type. nestedHash is
+            // validated for debug/logging but not enforced here.
+            (void)nestedHash;
+            return deserializeNestedStructFields(type, fieldPtr, s, fieldCount);
+        }
+
+        case WireTypeId::FixedArray: {
+            if (!type) return false;
+            const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+            if (!ctn) return false;
+            ayt::reflect::ITypeInfo* elemType = ctn->getElementType();
+            if (!elemType) return false;
+            if (s.getBitPosition() + 16 > s.getBitCount()) return false;
+            const uint8_t elemWidByte = s.readUInt8();
+            const uint8_t N            = s.readUInt8();
+            const WireTypeId elemWid = static_cast<WireTypeId>(elemWidByte);
+            for (size_t i = 0; i < N; ++i) {
+                void* ePtr = ctn->getElementAt(fieldPtr, i);
+                if (!ePtr) return false;
+                if (!readWireValue(s, elemWid, elemType, ePtr)) return false;
+            }
+            return true;
+        }
+
+        case WireTypeId::DynamicArray: {
+            if (!type) return false;
+            const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+            if (!ctn) return false;
+            ayt::reflect::ITypeInfo* elemType = ctn->getElementType();
+            if (!elemType) return false;
+            if (s.getBitPosition() + 40 > s.getBitCount()) return false;
+            const uint8_t  elemWidByte = s.readUInt8();
+            const uint32_t N           = s.readUInt32();
+            const WireTypeId elemWid = static_cast<WireTypeId>(elemWidByte);
+            // Resize the container so getElementAt(0..N-1) is valid.
+            ctn->resize(fieldPtr, N);
+            for (uint32_t i = 0; i < N; ++i) {
+                void* ePtr = ctn->getElementAt(fieldPtr, i);
+                if (!ePtr) return false;
+                if (!readWireValue(s, elemWid, elemType, ePtr)) return false;
+            }
+            return true;
+        }
+
+        case WireTypeId::StringMap: {
+            if (!type) return false;
+            const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+            if (!ctn) return false;
+            ayt::reflect::ITypeInfo* valueType = ctn->getElementType();
+            if (!valueType) return false;
+            if (s.getBitPosition() + 40 > s.getBitCount()) return false;
+            const uint8_t  valueWidByte = s.readUInt8();
+            const uint32_t N             = s.readUInt32();
+            const WireTypeId valueWid = static_cast<WireTypeId>(valueWidByte);
+            // Clear existing entries so server-authoritative state wins.
+            ctn->resize(fieldPtr, 0);
+            for (uint32_t i = 0; i < N; ++i) {
+                if (s.getBitPosition() + 16 > s.getBitCount()) return false;
+                const uint16_t klen = s.readUInt16();
+                if (s.getBitPosition() + size_t(klen) * 8 > s.getBitCount()) return false;
+                std::string k;
+                k.resize(klen);
+                for (uint16_t j = 0; j < klen; ++j) {
+                    k[j] = static_cast<char>(s.readByte());
+                }
+                // Read value into a temporary then putEntry into the map.
+                // Use ITypeInfo::create to allocate a default-constructed V,
+                // then writeWireValue fills it, then putEntry inserts (key, V).
+                void* valPtr = valueType->create();
+                if (!valPtr) return false;
+                const bool ok = readWireValue(s, valueWid, valueType, valPtr);
+                if (!ok) {
+                    valueType->destroy(valPtr);
+                    return false;
+                }
+                // putEntry is on MapTypeInfo specifically; we cast through IContainerTypeInfo
+                // by using the public putEntry on the concrete type. The standard IContainer
+                // interface doesn't have putEntry, so we use a downcast.
+                auto* mapInfo = dynamic_cast<const ayt::reflect::MapTypeInfoBase*>(ctn);
+                if (!mapInfo) {
+                    valueType->destroy(valPtr);
+                    return false;
+                }
+                mapInfo->putEntry(fieldPtr, k, valPtr);
+                valueType->destroy(valPtr);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// =============================================================================
+// R3.2 (2026-07-28): hashFieldValueEx
+//
+// Hash a single field value (any WireTypeId, including 12..15 nested types).
+// For primitives this delegates to the R3.1 CRC32C path. For nested types it
+// walks all elements / fields and produces a deterministic hash that changes
+// whenever ANY inner value changes — "whole-field" granularity per the
+// R3.2 design decision (per-element hashing deferred to R3.3+).
+// =============================================================================
+namespace {
+
+uint32_t hashPrimitiveValue(WireTypeId wid, const void* fieldPtr) {
+    switch (wid) {
+        case WireTypeId::Bool:   { bool    v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Int8:   { int8_t  v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Int16:  { int16_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Int32:  { int32_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Int64:  { int64_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::UInt8:  { uint8_t  v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::UInt16: { uint16_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::UInt32: { uint32_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::UInt64: { uint64_t v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Float:  { float    v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::Double: { double   v; std::memcpy(&v, fieldPtr, sizeof(v)); return PacketCodec::computeCrc32c(reinterpret_cast<const uint8_t*>(&v), sizeof(v)); }
+        case WireTypeId::String: {
+            const auto* strPtr = static_cast<const std::string*>(fieldPtr);
+            return PacketCodec::computeCrc32c(
+                reinterpret_cast<const uint8_t*>(strPtr->data()), strPtr->size());
+        }
+        default: return 0;
+    }
+}
+
+} // anonymous namespace
+
+uint32_t ReflectSerializer::hashFieldValueEx(WireTypeId wid,
+                                              const ayt::reflect::ITypeInfo* type,
+                                              const void* fieldPtr) {
+    if (!fieldPtr) return 0;
+    switch (wid) {
+        case WireTypeId::Bool:
+        case WireTypeId::Int8:
+        case WireTypeId::Int16:
+        case WireTypeId::Int32:
+        case WireTypeId::Int64:
+        case WireTypeId::UInt8:
+        case WireTypeId::UInt16:
+        case WireTypeId::UInt32:
+        case WireTypeId::UInt64:
+        case WireTypeId::Float:
+        case WireTypeId::Double:
+        case WireTypeId::String:
+            return hashPrimitiveValue(wid, fieldPtr);
+
+        case WireTypeId::NestedStruct: {
+            if (!type) return 0;
+            uint32_t h = static_cast<uint32_t>(type->getId() & 0xFFFFFFFFu);
+            const uint32_t total = type->getFieldCount();
+            for (uint32_t i = 0; i < total; ++i) {
+                const auto* f = type->getField(i);
+                if (!f) continue;
+                if (!f->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
+                WireTypeId fwid;
+                if (!resolveWireTypeId(f->getType(), fwid)) continue;
+                const uint32_t fh = hashFieldValueEx(fwid, f->getType(), f->get(fieldPtr));
+                h ^= fh * 16777619u;
+            }
+            return h;
+        }
+
+        case WireTypeId::FixedArray:
+        case WireTypeId::DynamicArray: {
+            if (!type) return 0;
+            const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+            if (!ctn) return 0;
+            ayt::reflect::ITypeInfo* elemType = ctn->getElementType();
+            if (!elemType) return 0;
+            WireTypeId elemWid;
+            resolveWireTypeId(elemType, elemWid); // may be 0 (Unknown) — handled by hashFieldValueEx
+            const size_t N = ctn->getContainerSize(fieldPtr);
+            uint32_t h = 0x811C9DC5u ^ static_cast<uint32_t>(N);
+            for (size_t i = 0; i < N; ++i) {
+                const void* ePtr = ctn->getElementAt(fieldPtr, i);
+                if (!ePtr) continue;
+                const uint32_t eh = hashFieldValueEx(elemWid, elemType, ePtr);
+                h ^= (eh + 0x9E3779B9u + (h << 6) + (h >> 2)); // boost::hash_combine
+            }
+            return h;
+        }
+
+        case WireTypeId::StringMap: {
+            if (!type) return 0;
+            const auto* ctn = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+            if (!ctn) return 0;
+            ayt::reflect::ITypeInfo* valueType = ctn->getElementType();
+            if (!valueType) return 0;
+            WireTypeId valueWid;
+            resolveWireTypeId(valueType, valueWid);
+            const size_t N = ctn->getContainerSize(fieldPtr);
+            uint32_t h = 0x811C9DC5u ^ static_cast<uint32_t>(N);
+            for (size_t i = 0; i < N; ++i) {
+                const void* kPtr = ctn->getKeyAt(fieldPtr, i);
+                const void* vPtr = ctn->getValueAt(fieldPtr, i);
+                if (!kPtr || !vPtr) continue;
+                const auto& k = *static_cast<const std::string*>(kPtr);
+                const uint32_t kh = PacketCodec::computeCrc32c(
+                    reinterpret_cast<const uint8_t*>(k.data()), k.size());
+                const uint32_t vh = hashFieldValueEx(valueWid, valueType, vPtr);
+                h ^= (kh * 16777619u) ^ (vh + 0x9E3779B9u);
+            }
+            return h;
+        }
+    }
+    return 0;
 }
 
 } // namespace ayt::net
