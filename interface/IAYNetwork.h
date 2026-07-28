@@ -128,9 +128,13 @@ constexpr uint16_t kSchemaVersion = 1;
 // =============================================================================
 // R3.0 (2026-07-27): WireTypeId — closed enumeration of primitive field types
 // that the AYReflect-driven ReflectSerializer knows how to pack into the wire.
-// Each id maps to exactly one C++ primitive type. Reserved ids 12..15 are
-// for R3.1+ (nested struct / array / pointer) — receivers must reject unknown
-// ids rather than silently ignore them.
+// Each id maps to exactly one C++ primitive type.
+// =============================================================================
+// R3.2 (2026-07-28): ids 12..15 cover nested struct + container types. See
+// design.md §5.1 wire format for the per-id byte layout. R3.0/R3.1 receivers
+// hit `default: return false` in resolveWireTypeId / deserializeObject for
+// these ids and silently drop the entire frame (next tick Full re-sync heals
+// the state). This keeps wire schemaVersion = 1 unchanged across R3.0..R3.2.
 // =============================================================================
 enum class WireTypeId : uint8_t {
     Bool   = 0,
@@ -145,7 +149,11 @@ enum class WireTypeId : uint8_t {
     Float  = 9,
     Double = 10,
     String = 11,
-    // 12..15 reserved for R3.1+
+    // R3.2 nested types:
+    NestedStruct  = 12,  // struct with its own ITypeInfo (recursive)
+    FixedArray    = 13,  // std::array<T, N> — N ≤ 255
+    DynamicArray  = 14,  // std::vector<T> — size u32 (no upper bound)
+    StringMap     = 15,  // std::map<std::string, V> — heterogeneous key/value
 };
 
 // =============================================================================

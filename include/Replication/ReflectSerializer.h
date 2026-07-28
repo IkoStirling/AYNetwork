@@ -81,6 +81,26 @@ public:
     // std::string which is not trivially-copyable).
     static uint32_t hashFieldValue(WireTypeId id, const void* fieldPtr);
 
+    // R3.2 (2026-07-28): hash function that walks nested wire types
+    // (NestedStruct / FixedArray / DynamicArray / StringMap). The whole
+    // nested field is hashed as a single value (per-element hash granularity
+    // is out of scope per design §13 R3.2). For primitive WireTypeIds the
+    // result matches hashFieldValue() above.
+    //
+    // `type` is required for nested types so we can dispatch into the
+    // element type's WireTypeId; for primitives the type is unused.
+    static uint32_t hashFieldValueEx(WireTypeId wid, const ayt::reflect::ITypeInfo* type, const void* fieldPtr);
+
+    // R3.2 (2026-07-28): recursive write/read. The serializer calls
+    // writeWireValue for each field record after the [u8 WireTypeId] byte;
+    // the deserializer mirrors it. For WireTypeId 0..11 these delegate to
+    // the existing R3.0 writeFieldValue/readFieldValue paths; for 12..15
+    // they emit the nested wire prefix and recurse.
+    static bool writeWireValue(BitStream& s, WireTypeId wid,
+                               const ayt::reflect::ITypeInfo* type, const void* fieldPtr);
+    static bool readWireValue(BitStream& s, WireTypeId wid,
+                              const ayt::reflect::ITypeInfo* type, void* fieldPtr);
+
     // Inverse of serializeObject. Reads `expectedFieldCount` field records
     // (from the frame header fieldCount byte) and writes values back into
     // `obj`. Returns false on:

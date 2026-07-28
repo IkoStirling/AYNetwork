@@ -233,7 +233,10 @@ void ReplicationManager::tick(float /*deltaTime*/) {
             if (!field) continue; // shouldn't happen, but defensive
             WireTypeId wid;
             if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
-            currentHashes[k] = ReflectSerializer::hashFieldValue(wid, field->get(e.obj));
+            // R3.2: hashFieldValueEx walks nested types (NestedStruct /
+            // FixedArray / DynamicArray / StringMap). For primitives it
+            // returns the same hash as hashFieldValue.
+            currentHashes[k] = ReflectSerializer::hashFieldValueEx(wid, field->getType(), field->get(e.obj));
             if (!e._initialized || currentHashes[k] != e._fieldHashes[k]) {
                 dirtyIndices.push_back(k);
             }
@@ -394,7 +397,7 @@ size_t ReplicationManager::getDirtyFieldCount(uint32_t netId) const {
         if (!field) continue;
         WireTypeId wid;
         if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
-        const uint32_t cur = ReflectSerializer::hashFieldValue(wid, field->get(e.obj));
+        const uint32_t cur = ReflectSerializer::hashFieldValueEx(wid, field->getType(), field->get(e.obj));
         if (cur != e._fieldHashes[k]) ++dirtyCount;
     }
     return dirtyCount;
