@@ -16,6 +16,8 @@
 #include <ayreflect/IReflect.h>
 #include <ayreflect/ReflectRegistry.h>
 
+#include <lz4.h>
+
 #include <cstring>
 #include <cstdio>
 #include <chrono>
@@ -43,6 +45,23 @@ inline uint16_t fnv1a16(const char* s) {
         h *= 16777619u;
     }
     return static_cast<uint16_t>(h & 0xFFFFu);
+}
+
+// R4.1-B: only compress RpcResponse when lz4 shrinks the sealed body.
+bool shouldAutoCompressRpcResponse(const uint8_t* body, size_t bodyLen, size_t minBytes) {
+    if (body == nullptr || bodyLen < minBytes) return false;
+    const int maxCompressed = LZ4_compressBound(static_cast<int>(bodyLen));
+    if (maxCompressed <= 0) return false;
+    std::vector<char> scratch(static_cast<size_t>(maxCompressed));
+    const int n = LZ4_compress_default(
+        reinterpret_cast<const char*>(body),
+        scratch.data(),
+        static_cast<int>(bodyLen),
+        maxCompressed);
+    if (n <= 0) return false;
+    const size_t compressedWire =
+        PacketCodec::kUncompressedSizePrefix + static_cast<size_t>(n);
+    return compressedWire < bodyLen;
 }
 
 } // anonymous namespace
@@ -514,10 +533,15 @@ void RpcHandler::emitRpcRejectIfTracked(ayt::reflect::RpcKind rpcKind, uint64_t 
 bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream& body,
                       NetConnection* target) {
     if (!_network && !_broadcastSink) return false;
+    const uint8_t* bodyBytes = static_cast<const uint8_t*>(body.getData());
+    const size_t bodyLen = body.getSize();
+    const bool compress =
+        (envelopeMsgType == kMsgTypeRpcResponse) &&
+        shouldAutoCompressRpcResponse(bodyBytes, bodyLen, _responseCompressMinBytes);
     std::vector<uint8_t> sealed = PacketCodec::encode(
-        static_cast<const uint8_t*>(body.getData()), body.getSize(),
+        bodyBytes, bodyLen,
         envelopeMsgType, kSchemaVersion,
-        channel, /*flags=*/ 0, /*timestampMs=*/ 0, /*compress=*/ false);
+        channel, /*flags=*/ 0, /*timestampMs=*/ 0, compress);
     if (_broadcastSink) {
         _broadcastSink(channel, sealed.data(), sealed.size());
         return true;

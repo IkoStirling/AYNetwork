@@ -126,6 +126,9 @@ constexpr uint32_t RpcDefaultTimeoutMs     = 30000;
 constexpr uint32_t RpcDefaultMaxRetries      = 3;
 constexpr uint32_t RpcDefaultRetryBaseMs     = 100;
 constexpr uint32_t RpcSyncBudgetMs           = 16;
+// R4.1-B: auto-lz4 RpcResponse bodies at or above this uncompressed size
+// when compression shrinks the on-wire frame (see RpcHandler::emit).
+constexpr size_t RpcResponseCompressMinBytes = 64;
 
 class RpcAsyncPool;
 
@@ -242,6 +245,7 @@ public:
         _retryBaseMs = retryBaseMs;
         _pendingTimeoutMs = attemptTimeoutMs;
     }
+    void setResponseCompressMinBytesForTesting(size_t bytes) { _responseCompressMinBytes = bytes; }
 
     // ===== Registry access (for tests + downstream RpcSerializer callers) =====
     //
@@ -324,6 +328,7 @@ private:
     uint32_t _pendingTimeoutMs = RpcDefaultTimeoutMs;
     uint32_t _maxRetries = RpcDefaultMaxRetries;
     uint32_t _retryBaseMs = RpcDefaultRetryBaseMs;
+    size_t _responseCompressMinBytes = RpcResponseCompressMinBytes;
     std::unique_ptr<RpcAsyncPool> _asyncPool;
 };
 

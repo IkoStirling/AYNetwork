@@ -1,6 +1,6 @@
 // AYTest_RpcHandler.cpp - R4.0 RPC dispatcher + 4-channel + Validator tests
 //
-// R4.0 (2026-07-29): 22 cases total (12 pure + 7 e2e + 3 regression).
+// R4.0 (2026-07-29): 25 cases total (15 pure + 7 e2e + 3 regression).
 // Reuses the R3.2 fixture pattern (TypeInfoImpl<T> + addMethod for
 // RPC metadata). Adds a hand-rolled RpcMethodInfoImpl<R(Args...)>
 // template so test fixtures can register Server/Client/Multicast
@@ -14,6 +14,7 @@
 #include <RPC/RpcHandler.h>
 #include <Replication/ReflectSerializer.h>
 #include <Protocol/PacketCodec.h>
+#include <Protocol/PacketHeader.h>
 #include <Transport/GnsConnection.h>
 
 #include <ayreflect/IReflect.h>
@@ -41,6 +42,8 @@ using ayt::net::kMsgTypeRpcRequest;
 using ayt::net::kMsgTypeRpcResponse;
 using ayt::net::kMsgTypeRpcReject;
 using ayt::net::WireTypeId;
+using ayt::net::PacketFlag;
+using ayt::net::hasFlag;
 
 // =============================================================================
 // RpcMethodInfoImpl — hand-rolled IMethodInfo derived class for fixtures.
@@ -285,6 +288,21 @@ struct RpcFixtureRegistrar {
                 },
                 /*validate=*/[](const void*) { return true; },
                 /*async=*/true));
+
+            // ServerReturnBlob(int32_t byteCount) — returns a large std::string
+            // payload for RpcResponse auto-lz4 tests.
+            info->addMethod(new RpcMethodInfoImpl<std::string, int32_t>(
+                "ServerReturnBlob",
+                RpcKind::Server,
+                reg.findType<std::string>(),
+                { reg.findType<int32_t>() },
+                { "byteCount" },
+                /*unreliable=*/false,
+                /*invoker=*/[](int32_t byteCount) -> std::string {
+                    if (byteCount < 0) byteCount = 0;
+                    return std::string(static_cast<size_t>(byteCount), 'Z');
+                },
+                /*validate=*/[](const void*) { return true; }));
 
             reg.registerTypeInfo("PlayerRpc", info);
         }
@@ -552,6 +570,123 @@ TEST_CASE(WildcardMulticastInboundWithoutRegisterMethod) {
     CHECK_INT_EQ(recv.announceCalls.load(), 1);
     CHECK_INT_EQ(recv.lastAnnounceScore.load(), 123);
     CHECK_INT_EQ(outboundFrames.load(), 0);
+}
+
+TEST_CASE(RpcResponseAutoCompressesLargePayload) {
+    ayt::test::setCurrentCase("RpcResponseAutoCompressesLargePayload");
+    RpcHandler h(nullptr);
+    h.setModeForTesting(ayt::net::ConnectionMode::Server);
+    static PlayerRpcReceiver recv;
+    CHECK(h.registerMethod("PlayerRpc", "ServerReturnBlob", &recv));
+
+    std::vector<uint8_t> sealed;
+    h.setBroadcastSinkForTesting([&](uint8_t, const void* data, size_t size) {
+        sealed.assign(static_cast<const uint8_t*>(data),
+                      static_cast<const uint8_t*>(data) + size);
+    });
+
+    auto& reg = ayt::reflect::TypeRegistryImpl::instance();
+    auto* typeInfo = reg.findType("PlayerRpc");
+    CHECK(typeInfo != nullptr);
+    auto* methodInfo = typeInfo->findMethod("ServerReturnBlob");
+    CHECK(methodInfo != nullptr);
+
+    const char* nm = "ServerReturnBlob";
+    uint32_t h32 = 0x811C9DC5u;
+    for (const char* p = nm; *p; ++p) { h32 ^= static_cast<uint8_t>(*p); h32 *= 16777619u; }
+    const uint16_t methodHash = static_cast<uint16_t>(h32 & 0xFFFFu);
+
+    int32_t byteCount = 256;
+    const void* args[1] = { &byteCount };
+    BitStream req;
+    CHECK(RpcSerializer::writeRpcArgs(req, nullptr, methodInfo,
+                                      ayt::reflect::RpcKind::Server,
+                                      methodHash, 0x1111222233334444ull, args, 1));
+    CHECK(h.onRpcRequest(req, nullptr));
+    CHECK(!sealed.empty());
+
+    auto decoded = ayt::net::PacketCodec::decode(sealed.data(), sealed.size());
+    CHECK(decoded.ok);
+    CHECK(hasFlag(decoded.header.flags, PacketFlag::Compressed));
+    CHECK_INT_EQ(static_cast<int>(decoded.header.msgType),
+                 static_cast<int>(kMsgTypeRpcResponse));
+}
+
+TEST_CASE(RpcResponseSkipsCompressForSmallReturn) {
+    ayt::test::setCurrentCase("RpcResponseSkipsCompressForSmallReturn");
+    RpcHandler h(nullptr);
+    h.setModeForTesting(ayt::net::ConnectionMode::Server);
+    static PlayerRpcReceiver recv;
+    g_activeReceiver = &recv;
+    CHECK(h.registerMethod("PlayerRpc", "ServerHeal", &recv));
+
+    std::vector<uint8_t> sealed;
+    h.setBroadcastSinkForTesting([&](uint8_t, const void* data, size_t size) {
+        sealed.assign(static_cast<const uint8_t*>(data),
+                      static_cast<const uint8_t*>(data) + size);
+    });
+
+    auto& reg = ayt::reflect::TypeRegistryImpl::instance();
+    auto* typeInfo = reg.findType("PlayerRpc");
+    auto* methodInfo = typeInfo->findMethod("ServerHeal");
+    CHECK(methodInfo != nullptr);
+
+    const char* nm = "ServerHeal";
+    uint32_t h32 = 0x811C9DC5u;
+    for (const char* p = nm; *p; ++p) { h32 ^= static_cast<uint8_t>(*p); h32 *= 16777619u; }
+    const uint16_t methodHash = static_cast<uint16_t>(h32 & 0xFFFFu);
+
+    int32_t hp = 42;
+    const void* args[1] = { &hp };
+    BitStream req;
+    CHECK(RpcSerializer::writeRpcArgs(req, nullptr, methodInfo,
+                                      ayt::reflect::RpcKind::Server,
+                                      methodHash, 0x5555666677778888ull, args, 1));
+    CHECK(h.onRpcRequest(req, nullptr));
+    CHECK(!sealed.empty());
+
+    auto decoded = ayt::net::PacketCodec::decode(sealed.data(), sealed.size());
+    CHECK(decoded.ok);
+    CHECK(!hasFlag(decoded.header.flags, PacketFlag::Compressed));
+    CHECK_INT_EQ(static_cast<int>(decoded.header.msgType),
+                 static_cast<int>(kMsgTypeRpcResponse));
+}
+
+TEST_CASE(RpcResponseCompressedBodyRoundTrip) {
+    ayt::test::setCurrentCase("RpcResponseCompressedBodyRoundTrip");
+    RpcHandler h(nullptr);
+    h.setModeForTesting(ayt::net::ConnectionMode::Server);
+    static PlayerRpcReceiver recv;
+    CHECK(h.registerMethod("PlayerRpc", "ServerReturnBlob", &recv));
+
+    std::vector<uint8_t> sealed;
+    h.setBroadcastSinkForTesting([&](uint8_t, const void* data, size_t size) {
+        sealed.assign(static_cast<const uint8_t*>(data),
+                      static_cast<const uint8_t*>(data) + size);
+    });
+
+    auto& reg = ayt::reflect::TypeRegistryImpl::instance();
+    auto* typeInfo = reg.findType("PlayerRpc");
+    auto* methodInfo = typeInfo->findMethod("ServerReturnBlob");
+    CHECK(methodInfo != nullptr);
+
+    const char* nm = "ServerReturnBlob";
+    uint32_t h32 = 0x811C9DC5u;
+    for (const char* p = nm; *p; ++p) { h32 ^= static_cast<uint8_t>(*p); h32 *= 16777619u; }
+    const uint16_t methodHash = static_cast<uint16_t>(h32 & 0xFFFFu);
+
+    int32_t byteCount = 512;
+    const void* args[1] = { &byteCount };
+    BitStream req;
+    CHECK(RpcSerializer::writeRpcArgs(req, nullptr, methodInfo,
+                                      ayt::reflect::RpcKind::Server,
+                                      methodHash, 0xAAAABBBBCCCCDDDDull, args, 1));
+    CHECK(h.onRpcRequest(req, nullptr));
+
+    auto decoded = ayt::net::PacketCodec::decode(sealed.data(), sealed.size());
+    CHECK(decoded.ok);
+    CHECK(hasFlag(decoded.header.flags, PacketFlag::Compressed));
+    CHECK(decoded.body.size() >= ayt::net::RpcResponseCompressMinBytes);
 }
 TEST_SUITE_END
 
