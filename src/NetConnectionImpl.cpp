@@ -1,36 +1,34 @@
-// NetConnectionImpl.cpp - 连接实现
+// NetConnectionImpl.cpp - GnsConnection → NetConnection 适配器实现 (R4.1)
+//
+// 类定义见 include/Transport/NetConnectionImpl.h。本 TU 只做方法实现。
 
-#include <AYNetwork.h>
+#include <Transport/NetConnectionImpl.h>
+#include <Transport/GnsConnection.h>
 
 namespace ayt::net
 {
 
-class NetConnectionImpl : public NetConnection {
-public:
-    uint32_t getId() const override { return _id; }
-    uint32_t getHostId() const override { return _hostId; }
-    const char* getAddress() const override { return _address.c_str(); }
-    bool isConnected() const override { return _connected; }
-    int getPing() const override { return _ping; }
+NetConnectionImpl::NetConnectionImpl(GnsConnection* gns, uint32_t netId)
+    : _gns(gns)
+    , _id(netId)
+    , _hostId(gns ? gns->getInnerConnection() : 0)
+    , _address(gns ? std::string(gns->getAddress()) : std::string{})
+{}
 
-    void send(uint8_t channel, const void* data, size_t size) override {
-        // TODO: 实现
-    }
+bool NetConnectionImpl::isConnected() const {
+    return _gns && _gns->isConnected();
+}
 
-    void disconnect(const char* reason = nullptr) override {
-        // TODO: 实现
-    }
+int NetConnectionImpl::getPing() const {
+    return _gns ? _gns->getPing() : 0;
+}
 
-    void setUserData(void* data) override { _userData = data; }
-    void* getUserData() const override { return _userData; }
+void NetConnectionImpl::send(uint8_t channel, const void* data, size_t size) {
+    if (_gns) _gns->send(channel, data, size);
+}
 
-private:
-    uint32_t _id = 0;
-    uint32_t _hostId = 0;
-    std::string _address;
-    bool _connected = false;
-    int _ping = 0;
-    void* _userData = nullptr;
-};
+void NetConnectionImpl::disconnect(const char* reason /*= nullptr*/) {
+    if (_gns) _gns->disconnect(reason);
+}
 
 } // namespace ayt::net
