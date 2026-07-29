@@ -1,7 +1,9 @@
 // AYNetworkSubSystem.cpp - 网络子系统实现
 
 #include <AYNetwork.h>
+#include <AYNetworkModule.h>
 #include <AYGameLoop.h>
+#include <AYSubSystemRegistry.h>
 #include <GnsConnection.h>
 #include <PacketCodec.h>
 #include <RPC/RpcHandler.h>
@@ -440,8 +442,28 @@ private:
     RpcHandler _rpcHandler{this};
 };
 
-// 注册宏
+// 注册宏 — may be stripped from static libs; callers should also invoke
+// registerNetworkSubSystem() explicitly (Editor Play, tests).
 REGISTER_SUBSYSTEM(NetworkSubSystem, {}, 100);
+
+INetworkSubSystem* findRegisteredNetworkSubSystem()
+{
+    auto* system = ::ayt::game::SubSystemRegistry::instance().findSubSystem("Network");
+    return dynamic_cast<INetworkSubSystem*>(system);
+}
+
+void registerNetworkSubSystem()
+{
+    static bool registered = false;
+    if (registered) {
+        return;
+    }
+    registered = true;
+    if (findRegisteredNetworkSubSystem() != nullptr) {
+        return;
+    }
+    ::ayt::game::IGameLoop::instance().registerSubSystem(new NetworkSubSystem());
+}
 
 #if defined(AYNETWORK_BUILD_TESTS)
 INetworkSubSystem* createNetworkSubSystemForTest() {

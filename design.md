@@ -645,7 +645,7 @@ AYNetwork
 | 修复 `broadcastExcept` 指针比较 | ✅ R4.1-A | iterate `_netConns` by `NetConnection*` |
 | Client `EntitySpawn` 最小可用 | ✅ R4.1-A | `_spawnAnnouncements` + `peekSpawnAnnouncement()` |
 | Subsystem E2E 测试 (1s+2c) | ✅ R4.1-A | `AYTest_SubsystemIntegration.cpp` |
-| 最小 AYEntity demo 接入 | ✅ R4.1-A | `AYTest_EntityReplicationIntegration` (HealthComponent + adapter)；Editor Play 接线待后续 |
+| 最小 AYEntity demo 接入 | ✅ R4.1-A | `AYTest_EntityReplicationIntegration` + Editor Play 接线 |
 | RPC pending timeout + retry / exponential backoff | ✅ R4.1-B | `callServerWithCallback` + `setRetryPolicy` + backoff resend |
 
 **R4.1-A ship 判据**：上述项全 ✅ + 598 baseline 零回归（含 Subsystem + Entity E2E）。
@@ -667,9 +667,9 @@ AYNetwork
 > 原「Phase 5 Interest Management」条目已合并进 **R4.1-B**，避免与 §13 Roadmap 编号冲突。
 ---
 
-## 11. 与 AYEntity 集成（R4.1-A ✅ adapter E2E）
+## 11. 与 AYEntity 集成（✅ adapter + Editor Play）
 
-> R3 复制 API 已 ship（`registerObject(void*, ITypeInfo*, netId)` + `EntityReplicationAdapter.h`）。**R4.1-A** 已通过 `AYTest_EntityReplicationIntegration` 验证 `HealthComponent.currentHp` 经 adapter + Subsystem 全链路复制。Editor Play 场景接线（`AYNetworkComponent` 消费）仍待 Editor 侧 follow-up。
+> R3 复制 API 已 ship（`registerObject(void*, ITypeInfo*, netId)` + `EntityReplicationAdapter.h`）。**R4.1-A** 已通过 `AYTest_EntityReplicationIntegration` 验证 `HealthComponent.currentHp` 经 adapter + Subsystem 全链路复制。**Editor Play 已接线**：`NetworkComponent::bindReplication()` 消费 host 回调 → `EntityReplicationAdapter` → `INetworkSubSystem::getReplicationManager()`；`EditorPlayRuntime::startPlay()` listen-server（默认 7777，`AY_NETWORK_PORT` 覆盖），cube 实体带 `NetworkComponent` + `HealthComponent`。
 
 ---
 
