@@ -19,6 +19,10 @@
 #include <cstring>
 #include <cstdio>
 #include <chrono>
+#include <condition_variable>
+#include <atomic>
+#include <queue>
+#include <thread>
 #include <vector>
 
 namespace ayt::net
@@ -42,6 +46,137 @@ inline uint16_t fnv1a16(const char* s) {
 }
 
 } // anonymous namespace
+
+// =============================================================================
+// R4.1-B: RpcAsyncPool — worker threads invoke isAsync RPCs; completions are
+// drained on the network/game thread via RpcHandler::tick().
+// =============================================================================
+class RpcAsyncPool {
+public:
+    struct Job {
+        const ayt::reflect::IMethodInfo* methodInfo = nullptr;
+        void* obj = nullptr;
+        std::vector<uint8_t> argBuf;
+        uint64_t callId = 0;
+        NetConnection* from = nullptr;
+    };
+
+    struct Completion {
+        uint64_t callId = 0;
+        NetConnection* from = nullptr;
+        const ayt::reflect::ITypeInfo* returnType = nullptr;
+        std::vector<uint8_t> returnBuf;
+        bool hasReturn = false;
+    };
+
+    void start(size_t workerCount) {
+        if (! _workers.empty()) return;
+        _stop.store(false);
+        if (workerCount == 0) workerCount = 1;
+        _workers.reserve(workerCount);
+        for (size_t i = 0; i < workerCount; ++i) {
+            _workers.emplace_back([this]() { workerLoop(); });
+        }
+    }
+
+    void shutdown() {
+        _stop.store(true);
+        _jobCv.notify_all();
+        for (std::thread& t : _workers) {
+            if (t.joinable()) t.join();
+        }
+        _workers.clear();
+        {
+            std::lock_guard<std::mutex> lk(_jobMutex);
+            while (!_jobs.empty()) _jobs.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(_completionMutex);
+            while (!_completions.empty()) _completions.pop();
+        }
+    }
+
+    void submit(Job job) {
+        {
+            std::lock_guard<std::mutex> lk(_jobMutex);
+            _jobs.push(std::move(job));
+        }
+        _jobCv.notify_one();
+    }
+
+    bool tryPopCompletion(Completion& out) {
+        std::lock_guard<std::mutex> lk(_completionMutex);
+        if (_completions.empty()) return false;
+        out = std::move(_completions.front());
+        _completions.pop();
+        return true;
+    }
+
+private:
+    static bool buildArgPtrTable(const ayt::reflect::IMethodInfo* methodInfo,
+                                 const std::vector<uint8_t>& argBuf,
+                                 std::vector<const void*>& argPtrsOut) {
+        if (!methodInfo) return false;
+        const size_t argCount = methodInfo->getParamCount();
+        argPtrsOut.resize(argCount);
+        size_t offset = 0;
+        for (size_t i = 0; i < argCount; ++i) {
+            const ayt::reflect::ITypeInfo* argType = methodInfo->getParamType(i);
+            const size_t argSize = argType ? argType->getSize() : 0;
+            if (offset + argSize > argBuf.size()) return false;
+            argPtrsOut[i] = argBuf.data() + offset;
+            offset += argSize;
+        }
+        return true;
+    }
+
+    void workerLoop() {
+        while (true) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lk(_jobMutex);
+                _jobCv.wait(lk, [this]() { return _stop.load() || !_jobs.empty(); });
+                if (_stop.load() && _jobs.empty()) return;
+                job = std::move(_jobs.front());
+                _jobs.pop();
+            }
+
+            Completion completion;
+            completion.callId = job.callId;
+            completion.from = job.from;
+            if (!job.methodInfo || !job.obj) {
+                completion.hasReturn = false;
+            } else {
+                std::vector<const void*> argPtrs;
+                if (!buildArgPtrTable(job.methodInfo, job.argBuf, argPtrs)) {
+                    completion.hasReturn = false;
+                } else {
+                    const void* retPtr = job.methodInfo->invoke(job.obj, argPtrs.data());
+                    completion.returnType = job.methodInfo->getReturnType();
+                    if (completion.returnType != nullptr && retPtr != nullptr) {
+                        const size_t retSize = completion.returnType->getSize();
+                        completion.returnBuf.resize(retSize);
+                        std::memcpy(completion.returnBuf.data(), retPtr, retSize);
+                        completion.hasReturn = true;
+                    }
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(_completionMutex);
+                _completions.push(std::move(completion));
+            }
+        }
+    }
+
+    std::vector<std::thread> _workers;
+    std::queue<Job> _jobs;
+    std::queue<Completion> _completions;
+    std::mutex _jobMutex;
+    std::mutex _completionMutex;
+    std::condition_variable _jobCv;
+    std::atomic<bool> _stop{false};
+};
 
 // =============================================================================
 // RpcSerializer implementation
@@ -237,9 +372,12 @@ bool RpcSerializer::readRpcReject(BitStream& s, uint64_t& callIdOut, RpcRejectRe
 RpcHandler::RpcHandler(INetworkSubSystem* network)
     : _network(network)
 {
+    _asyncPool = std::make_unique<RpcAsyncPool>();
+    _asyncPool->start(2);
 }
 
 RpcHandler::~RpcHandler() {
+    if (_asyncPool) _asyncPool->shutdown();
     // Locked access for the destructor: trivial since the handler's owner
     // (AYNetworkSubSystem) is single-threaded by design. Pending callbacks
     // are dropped; clients must drain their own state before destroying
@@ -339,7 +477,55 @@ NetConnection* RpcHandler::findNetConnectionById(uint32_t netId) const {
 }
 
 void RpcHandler::tick(float /*deltaTime*/) {
+    drainAsyncRpcCompletions();
     expirePendingCalls();
+}
+
+bool RpcHandler::buildArgPtrTable(const ayt::reflect::IMethodInfo* methodInfo,
+                                  const std::vector<uint8_t>& argBuf,
+                                  std::vector<const void*>& argPtrsOut) const {
+    if (!methodInfo) return false;
+    const size_t argCount = methodInfo->getParamCount();
+    argPtrsOut.resize(argCount);
+    size_t offset = 0;
+    for (size_t i = 0; i < argCount; ++i) {
+        const ayt::reflect::ITypeInfo* argType = methodInfo->getParamType(i);
+        const size_t argSize = argType ? argType->getSize() : 0;
+        if (offset + argSize > argBuf.size()) return false;
+        argPtrsOut[i] = argBuf.data() + offset;
+        offset += argSize;
+    }
+    return true;
+}
+
+void RpcHandler::sendRpcResponse(uint64_t callId, NetConnection* from,
+                                 const ayt::reflect::IMethodInfo* methodInfo,
+                                 const void* retPtr) {
+    if (!methodInfo) return;
+    BitStream respBody;
+    if (methodInfo->getReturnType() != nullptr) {
+        RpcSerializer::writeRpcResponse(respBody, methodInfo->getReturnType(), callId, retPtr);
+    } else {
+        RpcSerializer::writeRpcResponse(respBody, nullptr, callId, nullptr);
+    }
+    emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, from);
+}
+
+void RpcHandler::drainAsyncRpcCompletions() {
+    if (!_asyncPool) return;
+    RpcAsyncPool::Completion completion;
+    while (_asyncPool->tryPopCompletion(completion)) {
+        if (completion.hasReturn && completion.returnType && !completion.returnBuf.empty()) {
+            BitStream respBody;
+            RpcSerializer::writeRpcResponse(respBody, completion.returnType, completion.callId,
+                                            completion.returnBuf.data());
+            emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, completion.from);
+        } else {
+            BitStream respBody;
+            RpcSerializer::writeRpcResponse(respBody, nullptr, completion.callId, nullptr);
+            emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, completion.from);
+        }
+    }
 }
 
 uint32_t RpcHandler::computeRetryBackoffMs(uint32_t retryCount) const {
@@ -657,33 +843,32 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
     // argBuf[argSize0..argSize0+argSize1) is arg 1, etc.
     const size_t argCount = methodInfo->getParamCount();
     std::vector<const void*> argPtrs(argCount);
-    size_t offset = 0;
-    for (size_t i = 0; i < argCount; ++i) {
-        const ayt::reflect::ITypeInfo* argType = methodInfo->getParamType(i);
-        const size_t argSize = argType ? argType->getSize() : 0;
-        if (offset + argSize > argBuf.size()) {
-            // Parse fail — argBuf shorter than expected
+    if (!buildArgPtrTable(methodInfo, argBuf, argPtrs)) {
+        BitStream rejectBody;
+        RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::ParseFail);
+        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+        return false;
+    }
+
+    if (methodInfo->isAsync()) {
+        if (!_asyncPool) {
             BitStream rejectBody;
-            RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::ParseFail);
+            RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::UnknownMethod);
             (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
             return false;
         }
-        argPtrs[i] = &argBuf[offset];
-        offset += argSize;
+        RpcAsyncPool::Job job;
+        job.methodInfo = methodInfo;
+        job.obj = obj;
+        job.argBuf = std::move(argBuf);
+        job.callId = callId;
+        job.from = from;
+        _asyncPool->submit(std::move(job));
+        return true;
     }
 
-    // Invoke. invoke() returns nullptr for void methods or a const void*
-    // into a thread-local buffer for primitive returns.
     const void* retPtr = methodInfo->invoke(obj, argPtrs.data());
-
-    // Send Response (only if the method has a non-void return type).
-    BitStream respBody;
-    if (methodInfo->getReturnType() != nullptr) {
-        RpcSerializer::writeRpcResponse(respBody, methodInfo->getReturnType(), callId, retPtr);
-    } else {
-        RpcSerializer::writeRpcResponse(respBody, nullptr, callId, nullptr);
-    }
-    emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, from);
+    sendRpcResponse(callId, from, methodInfo, retPtr);
 
     (void)rpcKind;
     return true;

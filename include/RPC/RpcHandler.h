@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -119,6 +120,9 @@ public:
 constexpr uint32_t RpcDefaultTimeoutMs     = 30000;
 constexpr uint32_t RpcDefaultMaxRetries      = 3;
 constexpr uint32_t RpcDefaultRetryBaseMs     = 100;
+constexpr uint32_t RpcSyncBudgetMs           = 16;
+
+class RpcAsyncPool;
 
 class RpcHandler {
 public:
@@ -256,6 +260,12 @@ private:
     NetConnection* findNetConnectionById(uint32_t netId) const;
 
     void expirePendingCalls();
+    void drainAsyncRpcCompletions();
+    void sendRpcResponse(uint64_t callId, NetConnection* from,
+                         const ayt::reflect::IMethodInfo* methodInfo, const void* retPtr);
+    bool buildArgPtrTable(const ayt::reflect::IMethodInfo* methodInfo,
+                          const std::vector<uint8_t>& argBuf,
+                          std::vector<const void*>& argPtrsOut) const;
     bool emitRequestBody(uint8_t channel, uint16_t envelopeMsgType,
                          const std::vector<uint8_t>& body, uint32_t targetNetId);
     void registerPendingWithRetry(uint64_t callId, RpcCallback cb,
@@ -296,6 +306,7 @@ private:
     uint32_t _pendingTimeoutMs = RpcDefaultTimeoutMs;
     uint32_t _maxRetries = RpcDefaultMaxRetries;
     uint32_t _retryBaseMs = RpcDefaultRetryBaseMs;
+    std::unique_ptr<RpcAsyncPool> _asyncPool;
 };
 
 } // namespace ayt::net

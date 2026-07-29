@@ -65,7 +65,8 @@ public:
         const std::vector<std::string>& paramNames,
         bool unreliable,
         Invoker invoker,
-        Validator validate)
+        Validator validate,
+        bool async = false)
         : _name(name)
         , _kind(kind)
         , _retType(retType)
@@ -74,6 +75,7 @@ public:
         , _unreliable(unreliable)
         , _invoker(std::move(invoker))
         , _validate(std::move(validate))
+        , _async(async)
     {}
 
     const char* getName() const override { return _name; }
@@ -88,6 +90,7 @@ public:
     }
     ayt::reflect::RpcKind getRpcKind() const override { return _kind; }
     bool isUnreliable() const override { return _unreliable; }
+    bool isAsync() const override { return _async; }
     bool validate(const void* obj) const override {
         return _validate ? _validate(obj) : true;
     }
@@ -135,6 +138,7 @@ private:
     std::vector<ayt::reflect::ITypeInfo*> _paramTypes;
     std::vector<std::string> _paramNames;
     bool _unreliable;
+    bool _async;
     Invoker _invoker;
     Validator _validate;
 };
@@ -264,6 +268,23 @@ struct RpcFixtureRegistrar {
                     return hp;
                 },
                 /*validate=*/[](const void*) { return false; }));
+
+            // ServerHealSlow — async server RPC (simulates >16ms work).
+            info->addMethod(new RpcMethodInfoImpl<int32_t, int32_t>(
+                "ServerHealSlow",
+                RpcKind::Server,
+                reg.findType<int32_t>(),
+                { reg.findType<int32_t>() },
+                { "hp" },
+                /*unreliable=*/false,
+                /*invoker=*/[](int32_t hp) -> int32_t {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                    extern void rpcMethod_ServerHeal(int32_t);
+                    rpcMethod_ServerHeal(hp);
+                    return hp;
+                },
+                /*validate=*/[](const void*) { return true; },
+                /*async=*/true));
 
             reg.registerTypeInfo("PlayerRpc", info);
         }
@@ -663,6 +684,35 @@ TEST_CASE(PendingCallRetriesThenSucceeds) {
     CHECK(succeeded.load());
     CHECK_INT_EQ(clientSends.load(), 3);
     CHECK_INT_EQ(s.serverReceiver.healCalls.load(), 1);
+    CHECK(!s.clientRpc.hasPending(callId));
+}
+
+TEST_CASE(AsyncRpcCompletesOnServerTick) {
+    ayt::test::setCurrentCase("AsyncRpcCompletesOnServerTick");
+    RpcE2EScaffold s;
+    g_activeReceiver = &s.serverReceiver;
+    CHECK(s.serverRpc.registerMethod("PlayerRpc", "ServerHealSlow", &s.serverReceiver));
+
+    std::atomic<bool> succeeded{false};
+    uint64_t callId = 0;
+    int32_t hp = 88;
+    const void* args[1] = { &hp };
+    CHECK(s.clientRpc.callServerWithCallback("PlayerRpc", "ServerHealSlow", args, nullptr, 1, callId,
+        [&](bool accepted, const void*) {
+            if (accepted) succeeded.store(true);
+        }));
+
+    CHECK(!succeeded.load());
+    CHECK_INT_EQ(s.serverReceiver.healCalls.load(), 0);
+
+    for (int i = 0; i < 64 && !succeeded.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        s.serverRpc.tick(0.016f);
+    }
+
+    CHECK(succeeded.load());
+    CHECK_INT_EQ(s.serverReceiver.healCalls.load(), 1);
+    CHECK_INT_EQ(s.serverReceiver.lastHpReceived.load(), 88);
     CHECK(!s.clientRpc.hasPending(callId));
 }
 
