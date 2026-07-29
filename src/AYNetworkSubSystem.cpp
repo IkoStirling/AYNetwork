@@ -5,6 +5,7 @@
 #include <GnsConnection.h>
 #include <PacketCodec.h>
 #include <RPC/RpcHandler.h>
+#include <Transport/NetConnectionImpl.h>
 // R1.A (2026-07-27): pull in EResult + AcceptConnection signature. The
 // GnsConnection.cpp TU-private includes are sufficient because s_gns is a
 // fully-typed pointer in this TU — we just need the constants.
@@ -127,8 +128,26 @@ public:
             });
         }
 
+        // R4.1: wrap the child in a NetConnectionImpl so the upper layer
+        // (ReplicationManager tick per-conn path) can route through the
+        // NetConnection interface. The adapter holds a non-owning GnsConnection*
+        // and forwards send/disconnect/etc. The factory contract still returns
+        // GnsConnection* (preserved); the NetConnectionImpl is installed in
+        // _netConns and exposed via getConnections().
+        GnsConnection* rawChild = child.get();
+        auto netConn = std::make_unique<NetConnectionImpl>(rawChild, ++_nextNetId);
+
+        // R4.1: INetworkExtension::onIncomingConnection gate. Returning false
+        // rejects the connection. Fire BEFORE pushing into _serverClients so
+        // the extension's decision is atomic with the accept.
+        if (_extension && !_extension->onIncomingConnection(netConn.get())) {
+            rawChild->disconnect("rejected by extension");
+            return nullptr;
+        }
+
         GnsConnection* raw = child.get();
         _serverClients.push_back(std::move(child));
+        _netConns.push_back(std::move(netConn));
         ::printf("[Network] accepted incoming client (now %zu clients)\n", _serverClients.size());
         return raw;
     }
@@ -150,14 +169,25 @@ public:
             _serverConn.reset();
         }
         // R1.A: clear any leftover server children from a previous listen.
+        // R4.1: fire onConnectionDisconnected for each before dropping.
+        for (size_t i = 0; i < _netConns.size(); ++i) {
+            if (_extension && _netConns[i]) _extension->onConnectionDisconnected(_netConns[i].get());
+        }
         for (auto& child : _serverClients) {
             if (child) child->disconnect("superseded by listen()");
         }
         _serverClients.clear();
+        _netConns.clear();
+        _nextNetId = 0;
 
         _serverConn = std::make_unique<GnsConnection>();
         _serverConn->initServer(port);
-        _mode = ConnectionMode::Server;
+        // R4.1: listen() means "host is also a player" — design §6.6
+        // distinguishes Server (dedicated) vs ListenServer (host). R4.0
+        // collapsed these; R4.1 fixes the typo so ReplicationManager's
+        // authority gate (which now accepts both via isAuthority()) sees
+        // the right mode.
+        _mode = ConnectionMode::ListenServer;
     }
 
     void disconnect() override {
@@ -169,11 +199,18 @@ public:
             _serverConn->disconnect("server shutdown");
             _serverConn.reset();
         }
-        // R1.A: tear down all server children too.
+        // R1.A: tear down all server children too. R4.1: fire
+        // onConnectionDisconnected BEFORE reset so the extension sees
+        // the conn in its valid state.
+        for (auto& c : _netConns) {
+            if (c && _extension) _extension->onConnectionDisconnected(c.get());
+        }
         for (auto& child : _serverClients) {
             if (child) child->disconnect("server shutdown");
         }
         _serverClients.clear();
+        _netConns.clear();
+        _nextNetId = 0;
         _mode = ConnectionMode::Disconnected;
     }
 
@@ -199,10 +236,12 @@ public:
     }
 
     void sendTo(NetConnection* conn, uint8_t channel, const void* data, size_t size) override {
-        // R3 will use NetConnection::send (per-connection handle). For R1.A the
-        // single-conn subsystem forwards to the active client conn if the
-        // caller passes our wrapper pointer.
-        (void)conn; (void)channel; (void)data; (void)size;
+        // R4.1: per-connection send. NetConnectionImpl::send forwards to the
+        // wrapped GnsConnection::send which routes through the 4-channel
+        // _rawSend switch (R4.0). Single-call indirection cost; identical
+        // wire behavior to broadcast().
+        if (!conn) return;
+        conn->send(channel, data, size);
     }
 
     void broadcast(uint8_t channel, const void* data, size_t size) override {
@@ -314,10 +353,21 @@ public:
     }
 
     void kickConnection(NetConnection* conn, const char* reason) override {
-        (void)conn; (void)reason;
+        // R4.1: real impl — NetConnection::disconnect forwards through the
+        // adapter to the underlying GnsConnection.
+        if (!conn) return;
+        conn->disconnect(reason ? reason : "kicked by server");
     }
 
     const std::vector<NetConnection*>& getConnections() override {
+        // R4.1: rebuild on each call from _netConns (the owning vector).
+        // R4.0 returned a permanently-empty _connections (never populated);
+        // that's the bug. N≤100 → rebuild cost is negligible.
+        _connections.clear();
+        _connections.reserve(_netConns.size());
+        for (auto& c : _netConns) {
+            if (c) _connections.push_back(c.get());
+        }
         return _connections;
     }
 
@@ -363,6 +413,13 @@ private:
     std::unique_ptr<GnsConnection> _clientConn;
     std::unique_ptr<GnsConnection> _serverConn;
     std::vector<std::unique_ptr<GnsConnection>> _serverClients;
+
+    // R4.1: mirror of _serverClients that owns the NetConnectionImpl
+    // adapters. Populated in adoptIncomingClient; cleared on listen()/disconnect().
+    // _netConns is the source of truth for getConnections() (rebuilt into
+    // _connections on each call to avoid stale-pointer bugs).
+    std::vector<std::unique_ptr<NetConnectionImpl>> _netConns;
+    uint32_t _nextNetId = 0;
 
     // Pending handlers captured at onMessage/onConnectionChange time so
     // adoptIncomingClient() can install them on each new server child.
