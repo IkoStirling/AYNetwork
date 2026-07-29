@@ -13,6 +13,7 @@
 #include <ayreflect/IReflect.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -115,6 +116,8 @@ public:
 // callId: 64-bit caller-side random; matched by Response / Reject.
 // The pending map keeps a callback slot per callId for the duration of
 // the call (auto-cleaned on Response/Reject or after RpcDefaultTimeoutMs).
+constexpr uint32_t RpcDefaultTimeoutMs = 30000;
+
 class RpcHandler {
 public:
     explicit RpcHandler(INetworkSubSystem* network);
@@ -171,6 +174,10 @@ public:
     bool onRpcResponse(BitStream& body, NetConnection* from);
     bool onRpcReject(BitStream& body, NetConnection* from);
 
+    // R4.1-A: expire outbound pending callbacks whose deadline elapsed.
+    // Called from NetworkSubSystem::update each frame.
+    void tick(float deltaTime);
+
     // ===== Pending call tracking =====
     //
     // Outbound callers can register a callback that fires when the
@@ -178,7 +185,11 @@ public:
     using RpcCallback = std::function<void(bool /*accepted*/, const void* /*returnValueOrNull*/)>;
     void registerPending(uint64_t callId, RpcCallback cb) {
         std::lock_guard<std::mutex> lk(_pendingCallsMutex);
-        _pendingCalls[callId] = std::move(cb);
+        PendingEntry entry;
+        entry.cb = std::move(cb);
+        entry.deadline = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(_pendingTimeoutMs);
+        _pendingCalls[callId] = std::move(entry);
     }
     bool hasPending(uint64_t callId) const {
         std::lock_guard<std::mutex> lk(_pendingCallsMutex);
@@ -197,6 +208,7 @@ public:
     }
     using BroadcastSink = std::function<void(uint8_t channel, const void* data, size_t size)>;
     void setBroadcastSinkForTesting(BroadcastSink sink) { _broadcastSink = std::move(sink); }
+    void setPendingTimeoutMsForTesting(uint32_t ms) { _pendingTimeoutMs = ms; }
 
     // ===== Registry access (for tests + downstream RpcSerializer callers) =====
     //
@@ -224,6 +236,13 @@ private:
 
     NetConnection* findNetConnectionById(uint32_t netId) const;
 
+    void expirePendingCalls();
+
+    struct PendingEntry {
+        RpcCallback cb;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
     INetworkSubSystem* _network = nullptr;
     INetworkExtension* _extension = nullptr;
     ConnectionMode _forcedMode = ConnectionMode::Disconnected;
@@ -234,7 +253,8 @@ private:
     std::unordered_map<uint16_t, void*>                            _objsByHash;
 
     mutable std::mutex                       _pendingCallsMutex;
-    std::unordered_map<uint64_t, RpcCallback> _pendingCalls;
+    std::unordered_map<uint64_t, PendingEntry> _pendingCalls;
+    uint32_t _pendingTimeoutMs = RpcDefaultTimeoutMs;
 };
 
 } // namespace ayt::net

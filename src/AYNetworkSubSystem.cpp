@@ -61,6 +61,7 @@ public:
             if (child) child->update();
         }
         _replicationManager.tick(deltaTime);
+        _rpcHandler.tick(deltaTime);
     }
 
     // P0 audit fix (2026-07-26): ISubSystem requires fixedUpdate(float). Network

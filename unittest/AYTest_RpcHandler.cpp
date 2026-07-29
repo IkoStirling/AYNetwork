@@ -445,6 +445,21 @@ TEST_CASE(RpcKindMismatchRejects) {
     const void* args[1] = { &hp };
     CHECK(!h.callClient(0, "PlayerRpc", "ServerHeal", args, nullptr, 1, callId));
 }
+
+TEST_CASE(PendingCallTimesOut) {
+    ayt::test::setCurrentCase("PendingCallTimesOut");
+    RpcHandler h(nullptr);
+    h.setPendingTimeoutMsForTesting(1);
+    std::atomic<bool> timedOut{false};
+    h.registerPending(0xBEEF, [&](bool accepted, const void*) {
+        if (!accepted) timedOut.store(true);
+    });
+    CHECK(h.hasPending(0xBEEF));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    h.tick(0.016f);
+    CHECK(timedOut.load());
+    CHECK(!h.hasPending(0xBEEF));
+}
 TEST_SUITE_END
 
 // =============================================================================

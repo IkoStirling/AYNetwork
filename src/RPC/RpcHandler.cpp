@@ -18,6 +18,8 @@
 
 #include <cstring>
 #include <cstdio>
+#include <chrono>
+#include <vector>
 
 namespace ayt::net
 {
@@ -336,6 +338,33 @@ NetConnection* RpcHandler::findNetConnectionById(uint32_t netId) const {
     return nullptr;
 }
 
+void RpcHandler::tick(float /*deltaTime*/) {
+    expirePendingCalls();
+}
+
+void RpcHandler::expirePendingCalls() {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<uint64_t> expired;
+    {
+        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+        for (const auto& kv : _pendingCalls) {
+            if (now >= kv.second.deadline) expired.push_back(kv.first);
+        }
+    }
+    for (uint64_t callId : expired) {
+        RpcCallback cb;
+        {
+            std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+            auto it = _pendingCalls.find(callId);
+            if (it == _pendingCalls.end()) continue;
+            if (now < it->second.deadline) continue;
+            cb = std::move(it->second.cb);
+            _pendingCalls.erase(it);
+        }
+        if (cb) cb(false, nullptr);
+    }
+}
+
 bool RpcHandler::callServer(const char* typeName, const char* methodName,
                             const void* const* args, const char* const* argNames,
                             size_t argCount, uint64_t& outCallId) {
@@ -539,7 +568,7 @@ bool RpcHandler::onRpcResponse(BitStream& body, NetConnection* from) {
         std::lock_guard<std::mutex> lk(_pendingCallsMutex);
         auto it = _pendingCalls.find(callId);
         if (it == _pendingCalls.end()) return false;
-        cb = std::move(it->second);
+        cb = std::move(it->second.cb);
         _pendingCalls.erase(it);
     }
     if (cb) cb(true, returnBuf.empty() ? nullptr : returnBuf.data());
@@ -557,7 +586,7 @@ bool RpcHandler::onRpcReject(BitStream& body, NetConnection* from) {
         std::lock_guard<std::mutex> lk(_pendingCallsMutex);
         auto it = _pendingCalls.find(callId);
         if (it == _pendingCalls.end()) return false;
-        cb = std::move(it->second);
+        cb = std::move(it->second.cb);
         _pendingCalls.erase(it);
     }
     (void)reason;

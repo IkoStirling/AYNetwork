@@ -73,4 +73,10 @@ bool EntityReplicationAdapter::registerEntityComponent(ReplicationManager& mgr, 
     return true;
 }
 
+inline bool EntityReplicationAdapter::unregisterEntityComponent(ReplicationManager& mgr, uint32_t netId) {
+    if (netId == 0) return false;
+    mgr.unregisterObject(netId);
+    return true;
+}
+
 } // namespace ayt::net

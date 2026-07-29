@@ -24,6 +24,7 @@ set(SRC_FILES
     AYTest_Replication.cpp
     AYTest_RpcHandler.cpp
     AYTest_SubsystemIntegration.cpp
+    AYTest_EntityReplicationIntegration.cpp
 )
 
 add_executable(${MODULE_NAME} ${SRC_FILES})
@@ -33,7 +34,7 @@ target_compile_definitions(${MODULE_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
 # Link AYNetwork + AYTest framework + AYCore (for AYNetwork.h transitive includes).
 # The PUBLIC link in AYNetwork/CMakeLists.txt propagates AYGameLoop/AYCore include
 # dirs and GNS linkage so we don't need any additional flags here.
-target_link_libraries(${MODULE_NAME} PRIVATE AYNetwork AYTest AYCore)
+target_link_libraries(${MODULE_NAME} PRIVATE AYNetwork AYTest AYCore AYEntity)
 target_include_directories(${MODULE_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
