@@ -342,26 +342,97 @@ void RpcHandler::tick(float /*deltaTime*/) {
     expirePendingCalls();
 }
 
+uint32_t RpcHandler::computeRetryBackoffMs(uint32_t retryCount) const {
+    if (retryCount == 0 || _retryBaseMs == 0) return _retryBaseMs;
+    const uint32_t shift = retryCount - 1;
+    if (shift >= 31) return _retryBaseMs * 0x80000000u;
+    return _retryBaseMs << shift;
+}
+
+bool RpcHandler::emitRequestBody(uint8_t channel, uint16_t envelopeMsgType,
+                                 const std::vector<uint8_t>& body, uint32_t targetNetId) {
+    if (body.empty()) return false;
+    BitStream bs;
+    bs.writeBits(body.data(), body.size() * 8);
+    NetConnection* target = findNetConnectionById(targetNetId);
+    if (!target && targetNetId == 0 && _network) {
+        const std::vector<NetConnection*>& conns = _network->getConnections();
+        if (!conns.empty()) target = conns.front();
+    }
+    return emit(channel, envelopeMsgType, bs, target);
+}
+
+void RpcHandler::registerPendingWithRetry(uint64_t callId, RpcCallback cb,
+                                          uint8_t channel, uint16_t envelopeMsgType,
+                                          const BitStream& requestBody, uint32_t targetNetId) {
+    PendingEntry entry;
+    entry.cb = std::move(cb);
+    entry.retryEnabled = true;
+    entry.retriesLeft = _maxRetries;
+    entry.retry.channel = channel;
+    entry.retry.envelopeMsgType = envelopeMsgType;
+    entry.retry.targetNetId = targetNetId;
+    entry.retry.body.assign(
+        static_cast<const uint8_t*>(requestBody.getData()),
+        static_cast<const uint8_t*>(requestBody.getData()) + requestBody.getSize());
+    entry.phase = PendingPhase::AwaitingResponse;
+    entry.deadline = std::chrono::steady_clock::now() +
+                     std::chrono::milliseconds(_pendingTimeoutMs);
+    std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+    _pendingCalls[callId] = std::move(entry);
+}
+
 void RpcHandler::expirePendingCalls() {
     const auto now = std::chrono::steady_clock::now();
-    std::vector<uint64_t> expired;
+    std::vector<uint64_t> due;
     {
         std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+        due.reserve(_pendingCalls.size());
         for (const auto& kv : _pendingCalls) {
-            if (now >= kv.second.deadline) expired.push_back(kv.first);
+            if (now >= kv.second.deadline) due.push_back(kv.first);
         }
     }
-    for (uint64_t callId : expired) {
-        RpcCallback cb;
+
+    for (uint64_t callId : due) {
+        enum class PendingAction : uint8_t { None, Resend, Fail };
+        PendingAction action = PendingAction::None;
+        PendingRetryPayload resendPayload;
+        RpcCallback failCb;
+
         {
             std::lock_guard<std::mutex> lk(_pendingCallsMutex);
             auto it = _pendingCalls.find(callId);
             if (it == _pendingCalls.end()) continue;
-            if (now < it->second.deadline) continue;
-            cb = std::move(it->second.cb);
-            _pendingCalls.erase(it);
+            PendingEntry& entry = it->second;
+            if (now < entry.deadline) continue;
+
+            if (entry.phase == PendingPhase::Backoff) {
+                if (entry.retryEnabled) {
+                    resendPayload = entry.retry;
+                    action = PendingAction::Resend;
+                }
+                entry.phase = PendingPhase::AwaitingResponse;
+                entry.deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(_pendingTimeoutMs);
+            } else if (entry.retryEnabled && entry.retriesLeft > 0) {
+                entry.retriesLeft--;
+                entry.retryCount++;
+                entry.phase = PendingPhase::Backoff;
+                entry.deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(computeRetryBackoffMs(entry.retryCount));
+            } else {
+                failCb = std::move(entry.cb);
+                _pendingCalls.erase(it);
+                action = PendingAction::Fail;
+            }
         }
-        if (cb) cb(false, nullptr);
+
+        if (action == PendingAction::Resend) {
+            (void)emitRequestBody(resendPayload.channel, resendPayload.envelopeMsgType,
+                                  resendPayload.body, resendPayload.targetNetId);
+        } else if (action == PendingAction::Fail && failCb) {
+            failCb(false, nullptr);
+        }
     }
 }
 
@@ -389,6 +460,32 @@ bool RpcHandler::callServer(const char* typeName, const char* methodName,
     }
     const uint8_t channel = methodInfo->isUnreliable() ? CHANNEL_UNRELIABLE : CHANNEL_RELIABLE;
     return emit(channel, kMsgTypeRpcRequest, body);
+}
+
+bool RpcHandler::callServerWithCallback(const char* typeName, const char* methodName,
+                                        const void* const* args, const char* const* argNames,
+                                        size_t argCount, uint64_t& outCallId, RpcCallback cb) {
+    outCallId = 0;
+    const ayt::reflect::IMethodInfo* methodInfo = nullptr;
+    void* obj = nullptr;
+    uint16_t hash = 0;
+    if (!resolveMethod(typeName, methodName, methodInfo, obj, hash)) return false;
+    if (!methodInfo) return false;
+    if (methodInfo->getRpcKind() != ayt::reflect::RpcKind::Server) return false;
+
+    outCallId = _nextCallId.fetch_add(1, std::memory_order_relaxed);
+    BitStream body;
+    (void)argNames;
+    if (!RpcSerializer::writeRpcArgs(body, nullptr,
+                                     methodInfo,
+                                     ayt::reflect::RpcKind::Server,
+                                     hash, outCallId, args, argCount)) {
+        return false;
+    }
+    const uint8_t channel = methodInfo->isUnreliable() ? CHANNEL_UNRELIABLE : CHANNEL_RELIABLE;
+    if (!emit(channel, kMsgTypeRpcRequest, body)) return false;
+    if (cb) registerPendingWithRetry(outCallId, std::move(cb), channel, kMsgTypeRpcRequest, body, 0);
+    return true;
 }
 
 bool RpcHandler::callClient(uint32_t targetNetId, const char* typeName, const char* methodName,
@@ -422,6 +519,44 @@ bool RpcHandler::callClient(uint32_t targetNetId, const char* typeName, const ch
         return false;
     }
     return emit(channel, kMsgTypeRpcRequest, body, target);
+}
+
+bool RpcHandler::callClientWithCallback(uint32_t targetNetId, const char* typeName, const char* methodName,
+                                        const void* const* args, const char* const* argNames,
+                                        size_t argCount, uint64_t& outCallId, RpcCallback cb) {
+    outCallId = 0;
+    const ayt::reflect::IMethodInfo* methodInfo = nullptr;
+    void* obj = nullptr;
+    uint16_t hash = 0;
+    if (!resolveMethod(typeName, methodName, methodInfo, obj, hash)) return false;
+    if (!methodInfo) return false;
+    if (methodInfo->getRpcKind() != ayt::reflect::RpcKind::Client) return false;
+
+    outCallId = _nextCallId.fetch_add(1, std::memory_order_relaxed);
+    BitStream body;
+    (void)argNames;
+    if (!RpcSerializer::writeRpcArgs(body, nullptr, methodInfo,
+                                     ayt::reflect::RpcKind::Client,
+                                     hash, outCallId, args, argCount)) {
+        return false;
+    }
+    const uint8_t channel = methodInfo->isUnreliable() ? CHANNEL_UNRELIABLE : CHANNEL_RELIABLE;
+    NetConnection* target = findNetConnectionById(targetNetId);
+    if (!target && targetNetId == 0 && _network) {
+        const std::vector<NetConnection*>& conns = _network->getConnections();
+        if (!conns.empty()) target = conns.front();
+    }
+    if (!target) {
+        if (_broadcastSink) {
+            if (!emit(channel, kMsgTypeRpcRequest, body)) return false;
+            if (cb) registerPendingWithRetry(outCallId, std::move(cb), channel, kMsgTypeRpcRequest, body, targetNetId);
+            return true;
+        }
+        return false;
+    }
+    if (!emit(channel, kMsgTypeRpcRequest, body, target)) return false;
+    if (cb) registerPendingWithRetry(outCallId, std::move(cb), channel, kMsgTypeRpcRequest, body, targetNetId);
+    return true;
 }
 
 bool RpcHandler::callMulticast(const char* typeName, const char* methodName,

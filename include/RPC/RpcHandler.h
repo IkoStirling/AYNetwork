@@ -115,11 +115,15 @@ public:
 //
 // callId: 64-bit caller-side random; matched by Response / Reject.
 // The pending map keeps a callback slot per callId for the duration of
-// the call (auto-cleaned on Response/Reject or after RpcDefaultTimeoutMs).
-constexpr uint32_t RpcDefaultTimeoutMs = 30000;
+// the call (auto-cleaned on Response/Reject or after retry exhaustion).
+constexpr uint32_t RpcDefaultTimeoutMs     = 30000;
+constexpr uint32_t RpcDefaultMaxRetries      = 3;
+constexpr uint32_t RpcDefaultRetryBaseMs     = 100;
 
 class RpcHandler {
 public:
+    using RpcCallback = std::function<void(bool /*accepted*/, const void* /*returnValueOrNull*/)>;
+
     explicit RpcHandler(INetworkSubSystem* network);
     ~RpcHandler();
 
@@ -158,9 +162,17 @@ public:
     bool callServer(const char* typeName, const char* methodName,
                     const void* const* args, const char* const* argNames,
                     size_t argCount, uint64_t& outCallId);
+    // R4.1-B: callServer + register pending callback with automatic retry /
+    // exponential backoff on attempt timeout (see setRetryPolicy).
+    bool callServerWithCallback(const char* typeName, const char* methodName,
+                                const void* const* args, const char* const* argNames,
+                                size_t argCount, uint64_t& outCallId, RpcCallback cb);
     bool callClient(uint32_t targetNetId, const char* typeName, const char* methodName,
                     const void* const* args, const char* const* argNames,
                     size_t argCount, uint64_t& outCallId);
+    bool callClientWithCallback(uint32_t targetNetId, const char* typeName, const char* methodName,
+                                const void* const* args, const char* const* argNames,
+                                size_t argCount, uint64_t& outCallId, RpcCallback cb);
     bool callMulticast(const char* typeName, const char* methodName,
                        const void* const* args, const char* const* argNames,
                        size_t argCount, uint64_t& outCallId);
@@ -175,14 +187,14 @@ public:
     bool onRpcReject(BitStream& body, NetConnection* from);
 
     // R4.1-A: expire outbound pending callbacks whose deadline elapsed.
-    // Called from NetworkSubSystem::update each frame.
+    // R4.1-B: also re-send RPC requests with exponential backoff until
+    // maxRetries exhausted.
     void tick(float deltaTime);
 
     // ===== Pending call tracking =====
     //
     // Outbound callers can register a callback that fires when the
     // matching Response or Reject arrives. Auto-cleaned when matched.
-    using RpcCallback = std::function<void(bool /*accepted*/, const void* /*returnValueOrNull*/)>;
     void registerPending(uint64_t callId, RpcCallback cb) {
         std::lock_guard<std::mutex> lk(_pendingCallsMutex);
         PendingEntry entry;
@@ -209,6 +221,13 @@ public:
     using BroadcastSink = std::function<void(uint8_t channel, const void* data, size_t size)>;
     void setBroadcastSinkForTesting(BroadcastSink sink) { _broadcastSink = std::move(sink); }
     void setPendingTimeoutMsForTesting(uint32_t ms) { _pendingTimeoutMs = ms; }
+    void setMaxRetriesForTesting(uint32_t maxRetries) { _maxRetries = maxRetries; }
+    void setRetryBaseMsForTesting(uint32_t ms) { _retryBaseMs = ms; }
+    void setRetryPolicy(uint32_t maxRetries, uint32_t retryBaseMs, uint32_t attemptTimeoutMs) {
+        _maxRetries = maxRetries;
+        _retryBaseMs = retryBaseMs;
+        _pendingTimeoutMs = attemptTimeoutMs;
+    }
 
     // ===== Registry access (for tests + downstream RpcSerializer callers) =====
     //
@@ -237,10 +256,30 @@ private:
     NetConnection* findNetConnectionById(uint32_t netId) const;
 
     void expirePendingCalls();
+    bool emitRequestBody(uint8_t channel, uint16_t envelopeMsgType,
+                         const std::vector<uint8_t>& body, uint32_t targetNetId);
+    void registerPendingWithRetry(uint64_t callId, RpcCallback cb,
+                                  uint8_t channel, uint16_t envelopeMsgType,
+                                  const BitStream& requestBody, uint32_t targetNetId);
+    uint32_t computeRetryBackoffMs(uint32_t retryCount) const;
+
+    enum class PendingPhase : uint8_t { AwaitingResponse, Backoff };
+
+    struct PendingRetryPayload {
+        std::vector<uint8_t> body;
+        uint8_t  channel = CHANNEL_RELIABLE;
+        uint16_t envelopeMsgType = kMsgTypeRpcRequest;
+        uint32_t targetNetId = 0;
+    };
 
     struct PendingEntry {
         RpcCallback cb;
         std::chrono::steady_clock::time_point deadline;
+        PendingPhase phase = PendingPhase::AwaitingResponse;
+        uint32_t retriesLeft = 0;
+        uint32_t retryCount = 0;
+        bool retryEnabled = false;
+        PendingRetryPayload retry;
     };
 
     INetworkSubSystem* _network = nullptr;
@@ -255,6 +294,8 @@ private:
     mutable std::mutex                       _pendingCallsMutex;
     std::unordered_map<uint64_t, PendingEntry> _pendingCalls;
     uint32_t _pendingTimeoutMs = RpcDefaultTimeoutMs;
+    uint32_t _maxRetries = RpcDefaultMaxRetries;
+    uint32_t _retryBaseMs = RpcDefaultRetryBaseMs;
 };
 
 } // namespace ayt::net

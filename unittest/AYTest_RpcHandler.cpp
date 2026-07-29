@@ -460,6 +460,33 @@ TEST_CASE(PendingCallTimesOut) {
     CHECK(timedOut.load());
     CHECK(!h.hasPending(0xBEEF));
 }
+
+TEST_CASE(PendingCallExhaustsRetries) {
+    ayt::test::setCurrentCase("PendingCallExhaustsRetries");
+    RpcHandler h(nullptr);
+    h.setRetryPolicy(/*maxRetries=*/ 2, /*retryBaseMs=*/ 1, /*attemptTimeoutMs=*/ 1);
+    std::atomic<int> emitCount{0};
+    h.setBroadcastSinkForTesting([&](uint8_t, const void*, size_t) {
+        emitCount.fetch_add(1);
+    });
+
+    std::atomic<bool> failed{false};
+    uint64_t callId = 0;
+    int32_t hp = 9;
+    const void* args[1] = { &hp };
+    CHECK(h.callServerWithCallback("PlayerRpc", "ServerHeal", args, nullptr, 1, callId,
+        [&](bool accepted, const void*) {
+            if (!accepted) failed.store(true);
+        }));
+
+    for (int i = 0; i < 64 && !failed.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        h.tick(0.016f);
+    }
+    CHECK(failed.load());
+    CHECK_INT_EQ(emitCount.load(), 3);
+    CHECK(!h.hasPending(callId));
+}
 TEST_SUITE_END
 
 // =============================================================================
@@ -602,6 +629,41 @@ TEST_CASE(ReliableDefaultOverGns) {
     const void* args[1] = { &hp };
     CHECK(s.clientRpc.callServer("PlayerRpc", "ServerHeal", args, nullptr, 1, callId));
     CHECK_INT_EQ(s.lastClientChannel.load(), ayt::net::CHANNEL_RELIABLE);
+}
+
+TEST_CASE(PendingCallRetriesThenSucceeds) {
+    ayt::test::setCurrentCase("PendingCallRetriesThenSucceeds");
+    RpcE2EScaffold s;
+    g_activeReceiver = &s.serverReceiver;
+    CHECK(s.serverRpc.registerMethod("PlayerRpc", "ServerHeal", &s.serverReceiver));
+
+    s.clientRpc.setRetryPolicy(/*maxRetries=*/ 3, /*retryBaseMs=*/ 1, /*attemptTimeoutMs=*/ 1);
+    std::atomic<int> clientSends{0};
+    s.clientRpc.setBroadcastSinkForTesting([&](uint8_t channel, const void* data, size_t size) {
+        s.lastClientChannel.store(channel);
+        const int sendIndex = clientSends.fetch_add(1) + 1;
+        if (sendIndex >= 3) {
+            RpcE2EScaffold::dispatchSealedTo(s.serverRpc, data, size);
+        }
+    });
+
+    std::atomic<bool> succeeded{false};
+    uint64_t callId = 0;
+    int32_t hp = 55;
+    const void* args[1] = { &hp };
+    CHECK(s.clientRpc.callServerWithCallback("PlayerRpc", "ServerHeal", args, nullptr, 1, callId,
+        [&](bool accepted, const void*) {
+            if (accepted) succeeded.store(true);
+        }));
+
+    for (int i = 0; i < 64 && !succeeded.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        s.clientRpc.tick(0.016f);
+    }
+    CHECK(succeeded.load());
+    CHECK_INT_EQ(clientSends.load(), 3);
+    CHECK_INT_EQ(s.serverReceiver.healCalls.load(), 1);
+    CHECK(!s.clientRpc.hasPending(callId));
 }
 
 TEST_CASE(UnreliableServerRpcOverGns) {
