@@ -303,7 +303,8 @@ void RpcHandler::unregisterMethod(const char* typeName, const char* methodName) 
     _objsByHash.erase(h);
 }
 
-bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream& body) {
+bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream& body,
+                      NetConnection* target) {
     if (!_network && !_broadcastSink) return false;
     std::vector<uint8_t> sealed = PacketCodec::encode(
         static_cast<const uint8_t*>(body.getData()), body.getSize(),
@@ -313,11 +314,26 @@ bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream
         _broadcastSink(channel, sealed.data(), sealed.size());
         return true;
     }
-    if (_network) {
-        _network->broadcast(channel, sealed.data(), sealed.size());
+    if (!_network) return false;
+    if (target) {
+        _network->sendTo(target, channel, sealed.data(), sealed.size());
         return true;
     }
-    return false;
+    const ConnectionMode mode = getEffectiveMode();
+    if (mode == ConnectionMode::Client) {
+        _network->send(channel, sealed.data(), sealed.size());
+        return true;
+    }
+    _network->broadcast(channel, sealed.data(), sealed.size());
+    return true;
+}
+
+NetConnection* RpcHandler::findNetConnectionById(uint32_t netId) const {
+    if (!_network || netId == 0) return nullptr;
+    for (NetConnection* conn : _network->getConnections()) {
+        if (conn && conn->getId() == netId) return conn;
+    }
+    return nullptr;
 }
 
 bool RpcHandler::callServer(const char* typeName, const char* methodName,
@@ -356,7 +372,6 @@ bool RpcHandler::callClient(uint32_t targetNetId, const char* typeName, const ch
     if (!resolveMethod(typeName, methodName, methodInfo, obj, hash)) return false;
     if (!methodInfo) return false;
     if (methodInfo->getRpcKind() != ayt::reflect::RpcKind::Client) return false;
-    (void)targetNetId; // R4.0: targetNetId is the future sendTo() arg path
 
     outCallId = _nextCallId.fetch_add(1, std::memory_order_relaxed);
     BitStream body;
@@ -367,7 +382,17 @@ bool RpcHandler::callClient(uint32_t targetNetId, const char* typeName, const ch
         return false;
     }
     const uint8_t channel = methodInfo->isUnreliable() ? CHANNEL_UNRELIABLE : CHANNEL_RELIABLE;
-    return emit(channel, kMsgTypeRpcRequest, body);
+    NetConnection* target = findNetConnectionById(targetNetId);
+    if (!target && targetNetId == 0 && _network) {
+        const std::vector<NetConnection*>& conns = _network->getConnections();
+        if (!conns.empty()) target = conns.front();
+    }
+    if (!target) {
+        // R4.0 test seam: loopback sink exercises Client RPC without a live conn.
+        if (_broadcastSink) return emit(channel, kMsgTypeRpcRequest, body);
+        return false;
+    }
+    return emit(channel, kMsgTypeRpcRequest, body, target);
 }
 
 bool RpcHandler::callMulticast(const char* typeName, const char* methodName,
@@ -413,7 +438,7 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
         RpcSerializer::writeRpcReject(rejectBody,
             (callId != 0 ? callId : 0),
             (methodInfo == nullptr ? RpcRejectReason::UnknownMethod : RpcRejectReason::ParseFail));
-        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
         return false;
     }
 
@@ -422,7 +447,8 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
         // treat as UnknownMethod.
         BitStream rejectBody;
         RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::UnknownMethod);
-        return emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+        return false;
     }
 
     // Authority gate: Server RPCs are handled only on authority endpoints;
@@ -432,14 +458,14 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
         if (mode != ConnectionMode::Server && mode != ConnectionMode::ListenServer) {
             BitStream rejectBody;
             RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::NotAuthority);
-            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
             return false;
         }
     } else if (rpcKind == ayt::reflect::RpcKind::Client) {
         if (mode != ConnectionMode::Client) {
             BitStream rejectBody;
             RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::NotAuthority);
-            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
             return false;
         }
     }
@@ -449,14 +475,16 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
     if (objIt == _objsByHash.end() || objIt->second == nullptr) {
         BitStream rejectBody;
         RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::UnknownMethod);
-        return emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+        return false;
     }
     void* obj = objIt->second;
 
     if (!methodInfo->validate(obj)) {
         BitStream rejectBody;
         RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::ValidatorDeny);
-        return emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+        return false;
     }
 
     // Deserialize the arg bytes into a call-ready args[] table. The
@@ -473,7 +501,8 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
             // Parse fail — argBuf shorter than expected
             BitStream rejectBody;
             RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::ParseFail);
-            return emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+            return false;
         }
         argPtrs[i] = &argBuf[offset];
         offset += argSize;
@@ -490,10 +519,9 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
     } else {
         RpcSerializer::writeRpcResponse(respBody, nullptr, callId, nullptr);
     }
-    emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody);
+    emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, from);
 
     (void)rpcKind;
-    (void)from;
     return true;
 }
 

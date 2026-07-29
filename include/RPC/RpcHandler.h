@@ -216,7 +216,13 @@ private:
                        uint16_t& outHash) const;
 
     // Send helper used by both callXxx paths and outbound Response/Reject.
-    bool emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream& body);
+    // `target`: when non-null, frame goes to that connection (Client RPC /
+    // RPC response-reply). When null, routes by mode: Client → send() uplink;
+    // Server/ListenServer → broadcast().
+    bool emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream& body,
+              NetConnection* target = nullptr);
+
+    NetConnection* findNetConnectionById(uint32_t netId) const;
 
     INetworkSubSystem* _network = nullptr;
     INetworkExtension* _extension = nullptr;

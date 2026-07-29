@@ -23,9 +23,12 @@ set(SRC_FILES
     AYTest_PacketCodec.cpp
     AYTest_Replication.cpp
     AYTest_RpcHandler.cpp
+    AYTest_SubsystemIntegration.cpp
 )
 
 add_executable(${MODULE_NAME} ${SRC_FILES})
+
+target_compile_definitions(${MODULE_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
 
 # Link AYNetwork + AYTest framework + AYCore (for AYNetwork.h transitive includes).
 # The PUBLIC link in AYNetwork/CMakeLists.txt propagates AYGameLoop/AYCore include

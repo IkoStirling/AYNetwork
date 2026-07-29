@@ -304,8 +304,25 @@ public:
     virtual void onRawMessage(NetConnection* conn, uint8_t channel, const void* data, size_t size) {}
 
     // Replication 相关
-    virtual void onPreReplicate(IReplicable* obj, BitStream& stream, std::vector<NetConnection*>& targets) {}
-    virtual void onPostReplicate(IReplicable* obj) {}
+    //
+    // R4.1 (2026-08): onPreReplicate 签名升级。
+    // 旧签名 (IReplicable* obj, BitStream& stream, vector<NetConnection*>& targets)
+    // 是 R1 时代 stub，R4.0 主路径用 (void* obj, const ITypeInfo* type, uint32_t
+    // netId) 反射注册 (IAYNetwork.h:415)，旧签名从未真正调用。R4.1 统一到
+    // 反射路径 (void*, ITypeInfo*, netId)：
+    //   - `obj`  -- 反射注册时的对象指针 (game 直接读字段)
+    //   - `type` -- AYReflect 类型元数据 (ITypeInfo::getField 等可查)
+    //   - `netId`-- stable identifier 用于日志/调试
+    //   - `targets`-- mutable; 扩展可清空 entries 排除特定 conn。ReplicationManager
+    //               已在 fire 前做完 distance cull，所以 extension 看到的 conn
+    //               集合已是"距离内"的子集。
+    // 默认 impl: no-op。
+    virtual void onPreReplicate(void* obj, const ayt::reflect::ITypeInfo* type,
+                                uint32_t netId,
+                                std::vector<NetConnection*>& targets) {}
+    // R4.1: 同步升级签名 (R1 旧签名 no-op default 保留向后兼容)。
+    virtual void onPostReplicate(void* obj, const ayt::reflect::ITypeInfo* type,
+                                 uint32_t netId) {}
 };
 
 // =============================================================================
@@ -488,6 +505,12 @@ public:
     using BroadcastSink = std::function<void(uint8_t channel, const void* data, size_t size)>;
     void setBroadcastSinkForTesting(BroadcastSink sink) { _broadcastSink = std::move(sink); }
 
+    // R4.1-A: client-side EntitySpawn announcements (netId → typeHash) received
+    // from the authority. Game code calls registerObject after allocating the
+    // local object; until then replicate frames for that netId are dropped.
+    bool peekSpawnAnnouncement(uint32_t netId, uint16_t& typeHashOut) const;
+    size_t spawnAnnouncementCount() const { return _spawnAnnouncements.size(); }
+
 private:
     INetworkSubSystem* _network = nullptr;
     INetworkExtension* _extension = nullptr;
@@ -506,7 +529,14 @@ private:
     // Forward-declared below; single map shared by both register paths.
     struct ReflectedEntry;
     std::unordered_map<uint32_t, ReflectedEntry> _objects;
+    std::unordered_map<uint32_t, uint16_t>        _spawnAnnouncements;
 };
+
+#if defined(AYNETWORK_BUILD_TESTS)
+// R4.1-A: heap-allocate a NetworkSubSystem for integration tests (defined in
+// AYNetworkSubSystem.cpp). Caller owns the pointer; delete via INetworkSubSystem*.
+INetworkSubSystem* createNetworkSubSystemForTest();
+#endif
 
 // =============================================================================
 // 便捷宏

@@ -39,12 +39,6 @@ public:
             ::printf("[Network] Failed to init GameNetworkingSockets\n");
             return false;
         }
-        // R1.A (2026-07-27): register the adopt factory so the global GNS
-        // status callback can route incoming connections to a fresh
-        // server-child GnsConnection managed by this subsystem.
-        GnsConnection::setAdoptFactory([this](HSteamNetConnection incoming) -> GnsConnection* {
-            return this->adoptIncomingClient(incoming);
-        });
         ::printf("[Network] Initialized (GNS ready)\n");
         return true;
     }
@@ -105,19 +99,27 @@ public:
         child->adoptIncomingConnection(incoming);
 
         // R1.A: route onData to the registered message handler (if any).
-        if (_pendingRoute) {
-            child->onData(_pendingRoute);
+        GnsConnection* rawChild = child.get();
+        NetConnectionImpl* netPtr = nullptr;
+        {
+            auto netConn = std::make_unique<NetConnectionImpl>(rawChild, ++_nextNetId);
+            netPtr = netConn.get();
+            _netConns.push_back(std::move(netConn));
         }
-        // R1.A: route state changes to the registered connection handler (if any).
+
+        // R4.1: INetworkExtension::onIncomingConnection gate. Returning false
+        // rejects the connection. Fire BEFORE pushing into _serverClients so
+        // the extension's decision is atomic with the accept.
+        if (_extension && !_extension->onIncomingConnection(netPtr)) {
+            rawChild->disconnect("rejected by extension");
+            _netConns.pop_back();
+            return nullptr;
+        }
+
+        child->onData(makeDataHandler(netPtr));
+
         if (_pendingConnHandler) {
-            // Capture raw pointer (child is moved into _serverClients later
-            // in this function; the raw pointer remains valid for the
-            // connection's lifetime since _serverClients outlives the lambda).
-            GnsConnection* rawChild = child.get();
-            child->onStateChange([this, rawChild](GnsConnectionState /*oldS*/, GnsConnectionState newS) {
-                // R1 done: connected means Ready (handshake done) or Connected
-                // (handshake disabled). Reason is captured from the
-                // GnsConnection so the app can react to Kicked/ProtocolMismatch.
+            rawChild->onStateChange([this, rawChild](GnsConnectionState /*oldS*/, GnsConnectionState newS) {
                 bool connected = (newS == GnsConnectionState::Ready) ||
                                  (newS == GnsConnectionState::Connected &&
                                   rawChild->getProtocolVersion() == 0);
@@ -128,28 +130,66 @@ public:
             });
         }
 
-        // R4.1: wrap the child in a NetConnectionImpl so the upper layer
-        // (ReplicationManager tick per-conn path) can route through the
-        // NetConnection interface. The adapter holds a non-owning GnsConnection*
-        // and forwards send/disconnect/etc. The factory contract still returns
-        // GnsConnection* (preserved); the NetConnectionImpl is installed in
-        // _netConns and exposed via getConnections().
-        GnsConnection* rawChild = child.get();
-        auto netConn = std::make_unique<NetConnectionImpl>(rawChild, ++_nextNetId);
-
-        // R4.1: INetworkExtension::onIncomingConnection gate. Returning false
-        // rejects the connection. Fire BEFORE pushing into _serverClients so
-        // the extension's decision is atomic with the accept.
-        if (_extension && !_extension->onIncomingConnection(netConn.get())) {
-            rawChild->disconnect("rejected by extension");
-            return nullptr;
-        }
-
         GnsConnection* raw = child.get();
         _serverClients.push_back(std::move(child));
-        _netConns.push_back(std::move(netConn));
         ::printf("[Network] accepted incoming client (now %zu clients)\n", _serverClients.size());
         return raw;
+    }
+
+    GnsConnection::DataHandler makeDataHandler(NetConnection* from) {
+        return [this, from](const uint8_t* data, size_t len) {
+            dispatchIncoming(from, data, len);
+        };
+    }
+
+    void dispatchIncoming(NetConnection* from, const uint8_t* data, size_t len) {
+        if (!data || len < PacketCodec::kHeaderSize) {
+            if (_messageHandlers[CHANNEL_RELIABLE]) {
+                _messageHandlers[CHANNEL_RELIABLE](from, CHANNEL_RELIABLE, data, len);
+            }
+            return;
+        }
+        auto decoded = PacketCodec::decode(data, len);
+        if (!decoded.ok) {
+            if (_messageHandlers[CHANNEL_RELIABLE]) {
+                _messageHandlers[CHANNEL_RELIABLE](from, CHANNEL_RELIABLE, data, len);
+            }
+            return;
+        }
+        const uint8_t channel = decoded.header.channel;
+        BitStream bodyStream(decoded.body.data(), decoded.body.size());
+        switch (decoded.header.msgType) {
+            case kMsgTypeRpcRequest:
+                bodyStream.resetForRead();
+                _rpcHandler.onRpcRequest(bodyStream, from);
+                return;
+            case kMsgTypeRpcResponse:
+                bodyStream.resetForRead();
+                _rpcHandler.onRpcResponse(bodyStream, from);
+                return;
+            case kMsgTypeRpcReject:
+                bodyStream.resetForRead();
+                _rpcHandler.onRpcReject(bodyStream, from);
+                return;
+            case kMsgTypeReplication:
+            case kMsgTypeDelta:
+            case kMsgTypeEntitySpawn:
+            case kMsgTypeEntityDespawn:
+                bodyStream.resetForRead();
+                _replicationManager.onReceive(bodyStream, from);
+                return;
+            default:
+                if (_messageHandlers[channel]) {
+                    _messageHandlers[channel](from, channel, data, len);
+                }
+                return;
+        }
+    }
+
+    void installInboundRoutes() {
+        if (_clientConn && _clientNetConn) {
+            _clientConn->onData(makeDataHandler(_clientNetConn.get()));
+        }
     }
 
     // ===== 连接管理 =====
@@ -157,10 +197,24 @@ public:
         if (_clientConn) {
             _clientConn->disconnect("superseded by connect()");
             _clientConn.reset();
+            _clientNetConn.reset();
         }
         _clientConn = std::make_unique<GnsConnection>();
         _clientConn->initClient(address, port);
+        _clientNetConn = std::make_unique<NetConnectionImpl>(_clientConn.get(), ++_nextNetId);
         _mode = ConnectionMode::Client;
+        installInboundRoutes();
+        if (_connectionHandler) {
+            _clientConn->onStateChange([this](GnsConnectionState /*oldS*/, GnsConnectionState newS) {
+                bool connected = (newS == GnsConnectionState::Ready) ||
+                                 (newS == GnsConnectionState::Connected &&
+                                  _clientConn->getProtocolVersion() == 0);
+                DisconnectReason reason = connected
+                    ? DisconnectReason::Unknown
+                    : _clientConn->getLastDisconnectReason();
+                _connectionHandler(_clientNetConn.get(), connected, reason);
+            });
+        }
     }
 
     void listen(uint16_t port) override {
@@ -182,6 +236,12 @@ public:
 
         _serverConn = std::make_unique<GnsConnection>();
         _serverConn->initServer(port);
+        // R4.1-A: adopt factory is registered only while listening so multiple
+        // subsystem instances (e.g. integration tests) can initialize GNS
+        // without clobbering the server's incoming-connection handler.
+        GnsConnection::setAdoptFactory([this](HSteamNetConnection incoming) -> GnsConnection* {
+            return this->adoptIncomingClient(incoming);
+        });
         // R4.1: listen() means "host is also a player" — design §6.6
         // distinguishes Server (dedicated) vs ListenServer (host). R4.0
         // collapsed these; R4.1 fixes the typo so ReplicationManager's
@@ -194,8 +254,10 @@ public:
         if (_clientConn) {
             _clientConn->disconnect("client disconnect");
             _clientConn.reset();
+            _clientNetConn.reset();
         }
         if (_serverConn) {
+            GnsConnection::setAdoptFactory(nullptr);
             _serverConn->disconnect("server shutdown");
             _serverConn.reset();
         }
@@ -254,73 +316,17 @@ public:
     }
 
     void broadcastExcept(NetConnection* exclude, uint8_t channel, const void* data, size_t size) override {
-        // R1.A: same loop, with one exclusion. exclude is a NetConnection*
-        // but R1.A doesn't have a NetConnection wrapper yet — compare by raw
-        // GnsConnection* via user_data if set. For now we accept nullptr or
-        // identity-match by raw pointer of the embedded GnsConnection (the
-        // mapping is established in R3).
-        for (auto& child : _serverClients) {
-            if (!child || !child->isConnected()) continue;
-            if (exclude && static_cast<void*>(exclude) == static_cast<void*>(child.get())) continue;
-            child->send(channel, data, size);
+        for (auto& netConn : _netConns) {
+            if (!netConn || !netConn->isConnected()) continue;
+            if (exclude && netConn.get() == exclude) continue;
+            netConn->send(channel, data, size);
         }
     }
 
     // ===== 消息接收 =====
     void onMessage(uint8_t channel, MessageHandler handler) override {
         _messageHandlers[channel] = handler;
-        // R1.A wiring: route every GnsConnection's onData into the registered
-        // handler. The handler signature is (NetConnection*, channel, data, len)
-        // — we pass nullptr for the NetConnection* in R1.A (R3 will wire up
-        // proper wrappers).
-        //
-        // R4.0 (2026-07-29): pre-route by envelope PacketHeader.msgType before
-        // the channel handler fires. Rpc envelope kinds (0x0010..0x0012) go to
-        // _rpcHandler; replication envelope kinds (0x0001..0x0004) go to
-        // _replicationManager; everything else drops to the per-channel
-        // app-side MessageHandler. This pre-routing eliminates the need to
-        // teach every channel handler about RPC vs replication.
-        auto route = [this, channel](const uint8_t* data, size_t len) {
-            // Peek at the PacketHeader.msgType without consuming the body.
-            // PacketCodec::decode returns {header, body, ok} and is the
-            // single source of truth for the wire envelope.
-            if (!data || len < PacketCodec::kHeaderSize) {
-                if (_messageHandlers[channel]) _messageHandlers[channel](nullptr, channel, data, len);
-                return;
-            }
-            auto decoded = PacketCodec::decode(data, len);
-            if (!decoded.ok) {
-                if (_messageHandlers[channel]) _messageHandlers[channel](nullptr, channel, data, len);
-                return;
-            }
-            switch (decoded.header.msgType) {
-                case kMsgTypeRpcRequest: {
-                    BitStream bodyStream(decoded.body.data(), decoded.body.size());
-                    _rpcHandler.onRpcRequest(bodyStream, /*from=*/nullptr);
-                    return;
-                }
-                case kMsgTypeRpcResponse: {
-                    BitStream bodyStream(decoded.body.data(), decoded.body.size());
-                    _rpcHandler.onRpcResponse(bodyStream, /*from=*/nullptr);
-                    return;
-                }
-                case kMsgTypeRpcReject: {
-                    BitStream bodyStream(decoded.body.data(), decoded.body.size());
-                    _rpcHandler.onRpcReject(bodyStream, /*from=*/nullptr);
-                    return;
-                }
-                default:
-                    if (_messageHandlers[channel]) {
-                        _messageHandlers[channel](nullptr, channel, data, len);
-                    }
-                    return;
-            }
-        };
-        if (_clientConn) {
-            _clientConn->onData(route);
-        }
-        // Server children installed at adopt time — see adoptIncomingClient().
-        _pendingRoute = route;
+        installInboundRoutes();
     }
 
     // ===== 连接状态 =====
@@ -373,7 +379,7 @@ public:
 
     // ===== 查询 =====
     NetConnection* getConnection() const override {
-        return _connection;
+        return _clientNetConn.get();
     }
 
     uint32_t getHostId() const override {
@@ -411,6 +417,7 @@ private:
     // R1.A: subsystem owns one client conn (or none), one server parent
     // (listen socket, or none), and a list of server children (accepted clients).
     std::unique_ptr<GnsConnection> _clientConn;
+    std::unique_ptr<NetConnectionImpl> _clientNetConn;
     std::unique_ptr<GnsConnection> _serverConn;
     std::vector<std::unique_ptr<GnsConnection>> _serverClients;
 
@@ -421,11 +428,8 @@ private:
     std::vector<std::unique_ptr<NetConnectionImpl>> _netConns;
     uint32_t _nextNetId = 0;
 
-    // Pending handlers captured at onMessage/onConnectionChange time so
-    // adoptIncomingClient() can install them on each new server child.
-    GnsConnection::DataHandler _pendingRoute;
-    // R1 done: carries DisconnectReason so server children surface the
-    // wire-level reason (Kicked / ProtocolMismatch / etc.) to the app.
+    // Pending handler captured at onConnectionChange time so adoptIncomingClient()
+    // can install it on each new server child.
     std::function<void(bool, DisconnectReason)> _pendingConnHandler;
 
     ReplicationManager _replicationManager{this};
@@ -436,5 +440,11 @@ private:
 
 // 注册宏
 REGISTER_SUBSYSTEM(NetworkSubSystem, {}, 100);
+
+#if defined(AYNETWORK_BUILD_TESTS)
+INetworkSubSystem* createNetworkSubSystemForTest() {
+    return new NetworkSubSystem();
+}
+#endif
 
 } // namespace ayt::net

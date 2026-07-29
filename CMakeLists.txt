@@ -85,6 +85,7 @@ option(AYNETWORK_ENABLE_WS "Enable WebSocket support" ON)
 # 单元测试
 option(AYNETWORK_BUILD_TESTS "Build AYNetwork unit tests" ON)
 if(AYNETWORK_BUILD_TESTS)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
     add_subdirectory(unittest)
 endif()
 

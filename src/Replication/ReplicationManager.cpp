@@ -97,6 +97,7 @@ void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo
     e._initialized = false;
 
     _objects[netId] = e;
+    _spawnAnnouncements.erase(netId);
 
     // R3.0: server authority also broadcasts an EntitySpawn announcement so
     // the client can allocate a matching slot. On a client (no active
@@ -109,7 +110,7 @@ void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo
             static_cast<uint16_t>(type->getId() & 0xFFFFu));
         std::vector<uint8_t> sealed = PacketCodec::encode(
             static_cast<const uint8_t*>(body.getData()), body.getSize(),
-            kMsgTypeReplication, kSchemaVersion,
+            kMsgTypeEntitySpawn, kSchemaVersion,
             CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
             /*compress=*/ false);
         if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
@@ -169,7 +170,7 @@ void ReplicationManager::registerObject(IReplicable* obj, uint32_t netId) {
         ReflectSerializer::writeEntitySpawn(body, netId, /*typeHash=*/ 0);
         std::vector<uint8_t> sealed = PacketCodec::encode(
             static_cast<const uint8_t*>(body.getData()), body.getSize(),
-            kMsgTypeReplication, kSchemaVersion,
+            kMsgTypeEntitySpawn, kSchemaVersion,
             CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
             /*compress=*/ false);
         if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
@@ -233,6 +234,11 @@ void ReplicationManager::tick(float /*deltaTime*/) {
         // EntitySpawn for them — full Snapshot frames require AYReflect metadata.
         if (!e.type) continue;
 
+        // R4.1: FrameKind 提到循环顶部 (避免在 if-block 内定义然后下面引用
+        // 超出 scope 编译错)。None = 稳态不广播；Full/Delta = 需要 emit。
+        enum class FrameKind { None, Full, Delta };
+        FrameKind frameKind = FrameKind::None;
+
         // Compute current CRC32C for each NetReplicate field. We always walk
         // every field even in steady state because we need the hash to compare
         // against _fieldHashes.
@@ -258,41 +264,57 @@ void ReplicationManager::tick(float /*deltaTime*/) {
         //   - No dirty fields (steady state) → emit nothing
         //   - Some dirty fields → emit Delta (R3.1 path, UNRELIABLE)
         //   - forceReplicate → set _initialized=false → next tick goes Full
+        //
+        // R4.1: 提取到 FrameKind enum 以便 tick 末尾按是否 emit 决定是否
+        // 触发 onPostReplicate。Full 路径里先不直接 emit（把序列化 + emit
+        // 提到外层统一处理），但保留 set/unset _initialized 语义。
+        // (frameKind + FrameKind 已在循环顶部定义)
+        BitStream body;
         if (!e._initialized) {
-            BitStream body;
-            body.writeUInt16(kMsgTypeReplication); // inner msgType discriminator
+            body.writeUInt16(kMsgTypeReplication);
             if (ReflectSerializer::serializeObject(e.type, e.obj, netId, body)) {
-                std::vector<uint8_t> sealed = PacketCodec::encode(
-                    static_cast<const uint8_t*>(body.getData()), body.getSize(),
-                    kMsgTypeReplication, kSchemaVersion,
-                    CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
-                    /*compress=*/ false);
-                if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
-                else                _network->broadcast(CHANNEL_RELIABLE, sealed.data(), sealed.size());
-                // Update hash baseline to current values so subsequent ticks
-                // only emit Delta for fields that change AGAIN.
-                e._fieldHashes = currentHashes;
+                frameKind = FrameKind::Full;
             }
             e._initialized = true;
         }
         else if (!dirtyIndices.empty()) {
-            BitStream body;
-            body.writeUInt16(kMsgTypeDelta); // inner msgType discriminator
+            body.writeUInt16(kMsgTypeDelta);
             if (ReflectSerializer::serializeDirtyFields(e.type, e.obj, netId, dirtyIndices, body)) {
-                std::vector<uint8_t> sealed = PacketCodec::encode(
-                    static_cast<const uint8_t*>(body.getData()), body.getSize(),
-                    kMsgTypeDelta, kSchemaVersion,
-                    CHANNEL_UNRELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
-                    /*compress=*/ false);
-                if (_broadcastSink) _broadcastSink(CHANNEL_UNRELIABLE, sealed.data(), sealed.size());
-                else                _network->broadcast(CHANNEL_UNRELIABLE, sealed.data(), sealed.size());
-                // Update only the dirty indices — leave unchanged ones alone
-                // so a false-positive dirty in the same tick is still detected
-                // next tick (defensive against CRC32C collisions).
+                frameKind = FrameKind::Delta;
+            }
+        }
+        // else: steady state — frameKind stays None.
+
+        // R4.1: emit + onPreReplicate 真实调用 (R4.0 路径未做 per-conn
+        // filtering 也未 fire extension)。当前 commit 只接通 post-fire
+        // (per-obj 一次) + 走 R4.0 单 broadcast 路径；per-conn filtering
+        // 留 commit 5 (NetObjectLocation + distance cull)。
+        if (frameKind != FrameKind::None) {
+            const uint8_t channel = (frameKind == FrameKind::Full) ? CHANNEL_RELIABLE : CHANNEL_UNRELIABLE;
+            const uint16_t envMsgType = (frameKind == FrameKind::Full) ? kMsgTypeReplication : kMsgTypeDelta;
+            std::vector<uint8_t> sealed = PacketCodec::encode(
+                static_cast<const uint8_t*>(body.getData()), body.getSize(),
+                envMsgType, kSchemaVersion,
+                channel, /*flags=*/ 0, /*timestampMs=*/ 0,
+                /*compress=*/ false);
+            if (_broadcastSink) _broadcastSink(channel, sealed.data(), sealed.size());
+            else                _network->broadcast(channel, sealed.data(), sealed.size());
+
+            // Update hash baseline to current values so subsequent ticks
+            // only emit Delta for fields that change AGAIN.
+            if (frameKind == FrameKind::Full) {
+                e._fieldHashes = currentHashes;
+            } else {
                 for (uint32_t k : dirtyIndices) e._fieldHashes[k] = currentHashes[k];
             }
         }
-        // else: steady state — emit nothing.
+
+        // R4.1: fire onPostReplicate per replicated object AFTER emit (no
+        // failure detection — emit is fire-and-forget to GNS). Default
+        // impl is no-op. Extension can log/inspect the (obj, type, netId).
+        if (_extension && (frameKind != FrameKind::None)) {
+            _extension->onPostReplicate(e.obj, e.type, netId);
+        }
     }
 }
 
@@ -307,19 +329,6 @@ void ReplicationManager::tick(float /*deltaTime*/) {
 // msgType][payload] prefix.
 // =============================================================================
 bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
-    if (!_network) return false;
-
-    // Authority gate: if we're the server, drop client→server replication
-    // frames. We rely on the *envelope* kMsgTypeReplication having already
-    // been filtered; here we only see application bodies that contain our
-    // own inner types. Since real-game clients do NOT emit replication frames
-    // (R3.0 R1 stub says shouldReplicate() = true but R3.0 servers reject),
-    // this is mostly a defense-in-depth check.
-    //
-    // We can't tell client-from-server inside the body, so the actual gate is
-    // in tick(): clients never call broadcast on replication frames. The
-    // server-side tick is the only place replicate frames are emitted.
-
     // Need at least 2 bytes for inner msgType
     if (stream.getBitPosition() + 16 > stream.getBitCount()) return false;
 
@@ -347,16 +356,11 @@ bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
         case kMsgTypeEntitySpawn: {
             uint32_t netId; uint16_t typeHash;
             if (!ReflectSerializer::readEntitySpawn(stream, netId, typeHash)) return false;
-            // R3.0 server-side handling: EntitySpawn from a client is invalid
-            // (clients don't spawn authoritative objects). Drop.
-            // On the client side, we just record the (netId, typeHash) so a
-            // later replicate frame can resolve. Until the user calls
-            // registerObject locally with matching netId, replicate frames
-            // are dropped (findType(netId)==nullptr).
-            //
-            // Real-game integration: AYEntity's NetworkComponent stub holds
-            // getNetId; the ECS bridge (EntityReplicationAdapter) wires this.
-            (void)netId; (void)typeHash;
+            if (isAuthority()) {
+                // Clients must not spawn authoritative objects on the server.
+                return false;
+            }
+            _spawnAnnouncements[netId] = typeHash;
             return true;
         }
         case kMsgTypeEntityDespawn: {
@@ -429,6 +433,13 @@ void ReplicationManager::setExtension(INetworkExtension* ext) {
 bool ReplicationManager::isAuthority() const {
     const auto m = getEffectiveMode();
     return m == ConnectionMode::Server || m == ConnectionMode::ListenServer;
+}
+
+bool ReplicationManager::peekSpawnAnnouncement(uint32_t netId, uint16_t& typeHashOut) const {
+    auto it = _spawnAnnouncements.find(netId);
+    if (it == _spawnAnnouncements.end()) return false;
+    typeHashOut = it->second;
+    return true;
 }
 
 } // namespace ayt::net
