@@ -456,7 +456,15 @@ bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
             }
             void* obj = findObject(hdr.netId);
             if (!obj) return false;
-            return ReflectSerializer::deserializeObject(type, obj, stream, hdr.fieldCount);
+            ReflectSerializer::FieldAppliedFn onFieldApplied;
+            if (_extension) {
+                onFieldApplied = [this, obj, type, netId = hdr.netId](const ayt::reflect::IFieldInfo* field) {
+                    if (!field) return;
+                    if (!field->hasAttribute(ayt::reflect::FieldAttribute::RepNotify)) return;
+                    _extension->onRepNotify(obj, type, netId, field->getName());
+                };
+            }
+            return ReflectSerializer::deserializeObject(type, obj, stream, hdr.fieldCount, onFieldApplied);
         }
         case kMsgTypeEntitySpawn: {
             uint32_t netId; uint16_t typeHash;

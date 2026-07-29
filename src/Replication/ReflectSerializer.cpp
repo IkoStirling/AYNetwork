@@ -263,7 +263,9 @@ bool ReflectSerializer::serializeObject(const ayt::reflect::ITypeInfo* type, con
     return true;
 }
 
-bool ReflectSerializer::deserializeObject(const ayt::reflect::ITypeInfo* type, void* obj, BitStream& s, uint8_t expectedFieldCount) {
+bool ReflectSerializer::deserializeObject(const ayt::reflect::ITypeInfo* type, void* obj, BitStream& s,
+                                          uint8_t expectedFieldCount,
+                                          FieldAppliedFn onFieldApplied) {
     if (!type || !obj) return false;
 
     const uint32_t total = type->getFieldCount();
@@ -289,6 +291,8 @@ bool ReflectSerializer::deserializeObject(const ayt::reflect::ITypeInfo* type, v
         // R3.2: readWireValue handles 12..15 nested types recursively.
         // For 0..11 it delegates to readFieldValue.
         if (!readWireValue(s, wid, field->getType(), field->get(obj))) return false;
+
+        if (onFieldApplied) onFieldApplied(field);
     }
     return true;
 }

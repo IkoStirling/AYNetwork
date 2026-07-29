@@ -339,6 +339,13 @@ public:
     // R4.1: 同步升级签名 (R1 旧签名 no-op default 保留向后兼容)。
     virtual void onPostReplicate(void* obj, const ayt::reflect::ITypeInfo* type,
                                  uint32_t netId) {}
+    // R4.1-B: per-field callback after a NetReplicate field is applied on receive.
+    // Fires only for fields tagged FieldAttribute::RepNotify. `fieldName` is the
+    // stable IFieldInfo::getName() string.
+    virtual void onRepNotify(void* obj, const ayt::reflect::ITypeInfo* type,
+                             uint32_t netId, const char* fieldName) {
+        (void)obj; (void)type; (void)netId; (void)fieldName;
+    }
 };
 
 // =============================================================================

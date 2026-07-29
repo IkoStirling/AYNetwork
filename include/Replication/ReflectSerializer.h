@@ -40,6 +40,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 
 namespace ayt::reflect { class ITypeInfo; }
 
@@ -101,6 +102,11 @@ public:
     static bool readWireValue(BitStream& s, WireTypeId wid,
                               const ayt::reflect::ITypeInfo* type, void* fieldPtr);
 
+    // R4.1-B: optional per-field callback after a field record is applied.
+    // Used by ReplicationManager to fire INetworkExtension::onRepNotify for
+    // fields tagged FieldAttribute::RepNotify.
+    using FieldAppliedFn = std::function<void(const ayt::reflect::IFieldInfo* field)>;
+
     // Inverse of serializeObject. Reads `expectedFieldCount` field records
     // (from the frame header fieldCount byte) and writes values back into
     // `obj`. Returns false on:
@@ -115,7 +121,9 @@ public:
     // R3.1 note: this path is also used by kMsgTypeDelta. Wire format is
     // identical to kMsgTypeReplication so a single deserializeObject
     // implementation covers both.
-    static bool deserializeObject(const ayt::reflect::ITypeInfo* type, void* obj, BitStream& s, uint8_t expectedFieldCount);
+    static bool deserializeObject(const ayt::reflect::ITypeInfo* type, void* obj, BitStream& s,
+                                  uint8_t expectedFieldCount,
+                                  FieldAppliedFn onFieldApplied = nullptr);
 
     // ---- Body frame helpers (called by ReplicationManager) ----
 
