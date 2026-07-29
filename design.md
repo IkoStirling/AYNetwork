@@ -1,6 +1,7 @@
 # AYNetwork Design
 
-> **文档状态（2026-07-27）**：传输库 **锁定 GameNetworkingSockets（GNS）**（§14）。R1 部分落地（`GnsConnection` + loopback echo 单测）；子系统多连接 / 复制 / Authority / RPC **未完成**。工业可用度仍低（见 §12）。  
+> **文档状态（2026-07-29）**：传输库 **锁定 GameNetworkingSockets（GNS）**（§14）。R1–R2 协议层 ✅；R3.0–R3.2 复制层 ✅（493 baseline）；R4.0 RPC 核心 ✅（566/566 PASS）。**R4.1 已收束为两阶段**：**R4.1-A（集成层 / P0，进行中）** → **R4.1-B（Interest + RepNotify + polish，冻结至 A ship）**。当前最大断层：Handler/Manager 单测扎实，**Subsystem 全链路 + 按连接投递** 未闭环（见 §10 R4.1-A）。工业可用度见 §12。
+> **2026-07-29 R4.1 范围收束补丁**：拆分 R4.1-A/B；冻结散落 4.1 开发；修正 §10 demux 表述与代码一致；§12 评分同步 R4.0 ship 后现状。
 > **2026-07-27 设计审计补丁**：消除 KCP/GNS 叙事矛盾；锁定 Protocol↔GNS 职责；新增 **§6.6 Authority 最小模型**；§4 改为 GNS 传输；§16 Changelog。
 
 ## 1. 概述
@@ -45,16 +46,16 @@ Foundation Layers
 
 ### 2.1 目标特性矩阵（2026-07-26 审计后）
 
-| 特性 | AYNetwork（2026-07-27） | Unreal | Unity | O3DE | 优先级 |
+| 特性 | AYNetwork（2026-07-29） | Unreal | Unity | O3DE | 优先级 |
 |------|:----------------------:|:------:|:------:|:----:|:------:|
-| UDP 传输 | ⚠ GNS 已接，子系统未闭环 | ✅ | ✅ | ✅ | P0 |
+| UDP 传输 | ✅ GNS + 子系统多连接 pump | ✅ | ✅ | ✅ | P0 |
 | **传输库选型** | ✅ **GNS 锁定**（§14） | 自研 | Unity Transport | AzNetworking | P0 done |
 | 可靠层 | ✅ GNS 内置（**禁用 KCP**） | ✅ | ✅ | ✅ | P0 |
-| 状态同步 | ❌ stub | ✅ | ✅ | ✅ | P0 |
-| RPC 调用 | ❌ 规格待 R4 专章 | ✅ | ✅ | ✅ | P1 |
-| 增量同步 | ❌ 未设计细节 | ✅ | ⚠️ | ✅ | P2 |
-| Interest Management | ❌ 未设计 | ✅ | ⚠️ | ✅ | P3 |
-| Authority 模型 | ⚠ **§6.6 已锁定最小规格**，未实现 | ✅ | ✅ | ✅ | P0 |
+| 状态同步 | ✅ R3 Full/Delta + 嵌套类型；⚠ Subsystem demux 待 R4.1-A | ✅ | ✅ | ✅ | P0 |
+| RPC 调用 | ✅ R4.0 Handler 层；⚠ sendTo 接线待 R4.1-A | ✅ | ✅ | ✅ | P0 |
+| 增量同步 | ✅ R3.1 Delta (CRC32C dirty) | ✅ | ⚠️ | ✅ | P2 done |
+| Interest Management | ❌ **R4.1-B 冻结** | ✅ | ⚠️ | ✅ | P3 |
+| Authority 模型 | ⚠ Server/ListenServer gate 部分落地；Dedicated API 待 R4.1-A | ✅ | ✅ | ✅ | P0 |
 | 加密（DTLS/AES） | ✅ 由 GNS 提供（应用层不重复） | ✅ | ✅ | ✅ | P0 |
 
 ### 2.2 核心差异
@@ -611,58 +612,95 @@ AYNetwork
 | `IMethodInfo::validate(const void*)` server-side reject hook | ✅ | per-method 替代 FieldAttribute bit (用户决策改 method-domain) |
 | callId 64-bit + pendingCalls mutex map | ✅ | Response/Reject 自动 fire callback; auto-cleaned on match |
 | Authority gate 按 RpcKind | ✅ | Server RPC 仅在 Server/ListenServer 端处理；Client RPC 仅在 Client 端处理；mis-directed frame → RpcReject reason=NotAuthority |
-| `GnsConnection::_rawSend` 4-channel switch | ✅ | CHANNEL_RELIABLE → Reliable；CHANNEL_UNRELIABLE → Unreliable；CHANNEL_FRAGMENTED → Reliable\|NoNagle；CHANNEL_ACK → Reliable (R4.1 stub) |
+| `GnsConnection::_rawSend` 4-channel switch | ✅ | CHANNEL_RELIABLE → Reliable；CHANNEL_UNRELIABLE → Unreliable；CHANNEL_FRAGMENTED → Reliable\|NoNagle；CHANNEL_ACK → Reliable (R4.1-B stub) |
 | ReplicationManager envelope fix | ✅ | `unregisterObject` 用 `kMsgTypeEntityDespawn` envelope (替代 R3.2 typo `kMsgTypeReplication`) — wire 对称 |
-| `AYNetworkSubSystem::update` 入口 demux | ✅ | PacketCodec::decode 走 envelope.msgType: 0x0010/0x0011/0x0012 → `_rpcHandler.onRpcXxx`；0x0001..0x0004 → 既有 `_replicationManager.onReceive`；其它 → 既有 per-channel MessageHandler |
+| `AYNetworkSubSystem::update` RPC demux | ✅ | 0x0010/0x0011/0x0012 → `_rpcHandler.onRpcXxx` |
+| `AYNetworkSubSystem::update` Replication demux | ⚠ **R4.1-A** | **代码现状**：0x0001..0x0004 仍落入 default → per-channel `MessageHandler`，**未**进 `_replicationManager.onReceive`；design 曾误标 ✅，以本行为准 |
 | `INetworkSubSystem::getRpcHandler()` | ✅ | 单一 RpcHandler 引用，AYNetworkSubSystem ctor 持有 |
-| `Interest Management (Relevancy + distance culling)` | ❌ | **R4.1 work** — 用户 explicit 押后 |
-| Per-field RepNotify callback (Unreal `OnRep_X`) | ❌ | **R4.1 work** |
-| Multicast RPC for unregistered types / wildcard | ❌ | **R4.1+ work** |
+| `RpcHandler::emit` → `sendTo` / `broadcast` 分流 | ⚠ **R4.1-A** | R4.0：`callClient(targetNetId)` 忽略 target；Replication `tick()` 仍 broadcast-only |
+| Handler 传入真实 `NetConnection* from` | ⚠ **R4.1-A** | 现 Subsystem route lambda 传 `nullptr` |
+| `Interest Management (Relevancy + distance culling)` | ❌ | **R4.1-B 冻结** — R4.1-A ship 前 **禁止** 新开 Interest 代码 |
+| Per-field RepNotify callback (Unreal `OnRep_X`) | ❌ | **R4.1-B 冻结** |
+| Multicast RPC for unregistered types / wildcard | ❌ | **R4.1-B+ 冻结** |
 
-### Phase 5：Interest Management（**未开始**）
+### Phase R4.1-A：**集成层（P0）— 进行中，唯一活跃 R4.1 主线**
 
-**目标**：Relevancy 谓词 + 距离裁剪（R4.1）
+**目标**：把 R4.0 零件 + 已落地的 R4.1 plumbing **串成一条可跑的真实链路**（Subsystem + GNS，不用 test sink）。验收：**2–4 人 LAN demo 可玩**（spawn → replicate 字段变化 → RPC 离散事件）。
 
-**当前实现度**：**0 设计细节 + 0 实现**。R4.1 起。
+**开发纪律（2026-07-29 起生效）**：
+- **冻结**：Interest Management、RepNotify、Async RPC、wildcard multicast、Response 自动 lz4、CHANNEL_ACK 管线 — 全部归入 **R4.1-B**，R4.1-A ship 前不得新开实现。
+- **禁止**：并行添加新的 `INetworkExtension` 钩子或 scattered R4.1 API；已有 plumbing（`NetConnectionImpl` / `sendTo` / `getConnections`）**只接线、不扩展**。
+- **测试要求**：必须新增 ≥1 条 **Subsystem 级 E2E**（1 server + 2 client，走 `INetworkSubSystem`，禁止 `setBroadcastSinkForTesting` 作为主路径）。
+
+| 子项 | 状态 | 备注 |
+|------|------|------|
+| `NetConnectionImpl` (GnsConnection 适配) | ✅ 已 land | commit `a729672` |
+| `getConnections` / `sendTo` / `kickConnection` | ✅ 已 land | commit `ed56867` |
+| `listen()` → `ListenServer` + Replication `isAuthority()` | ✅ 已 land | commit `19d702a` |
+| Subsystem Replication demux (0x0001..0x0004) | ⏳ **待做** | `onMessage` switch 补 case → `_replicationManager.onReceive` |
+| `RpcHandler::emit` 按目标分流 | ⏳ **待做** | `callClient` → `sendTo`；Server/Multicast → broadcast |
+| 传入真实 `NetConnection* from` | ⏳ **待做** | route lambda + adopt 路径绑定 `NetConnectionImpl` |
+| 修复 `broadcastExcept` 指针比较 | ⏳ **待做** | `NetConnection*` vs `GnsConnection*` 类型混用 |
+| Client `EntitySpawn` 最小可用 | ⏳ **待做** | 收到 spawn 后能 register/bind netId |
+| Subsystem E2E 测试 (1s+2c) | ⏳ **待做** | 覆盖 replicate + RPC，无 test sink |
+| 最小 AYEntity demo 接入 | ⏳ **待做** | `EntityReplicationAdapter` 或等价物进 Play 场景 |
+| RPC pending **超时清理** | ⏳ **待做** | `RpcDefaultTimeoutMs` 设计已提，实现归 R4.1-A |
+
+**R4.1-A ship 判据**：上述 ⏳ 项全 ✅ + 566 baseline 零回归 + 新增 Subsystem E2E 绿。
+
+### Phase R4.1-B：**Interest + RepNotify + RPC polish — 冻结至 R4.1-A ship**
+
+**目标**：联机品质提升（带宽控制、字段变更回调、弱网策略）。**R4.1-A 未 ship 前不得开始实现。**
+
+1. Interest Management：`Relevancy` 谓词 + 距离裁剪 + `INetworkExtension::onPreReplicate(targets)` 真调用
+2. Per-field RepNotify callback (Unreal `OnRep_X`) — `FieldAttribute::RepNotify`
+3. RPC timeout / retry / exponential backoff
+4. RpcHandler async invoke (RPC > 16 ms) — thread pool + future response
+5. Multicast RPC for unregistered types / wildcard
+6. `kMsgTypeRpcResponse` 自动 lz4 compress
+7. `CHANNEL_ACK` 显式 ACK 管线（替代 R4.0 Reliable stub）
+
+### Phase 5：Lag comp / Prediction（**R5，未开始**）
+
+> 原「Phase 5 Interest Management」条目已合并进 **R4.1-B**，避免与 §13 Roadmap 编号冲突。
 ---
 
-## 11. 与 AYEntity 集成（待重写）
+## 11. 与 AYEntity 集成（R4.1-A 待接通）
 
-> 当前 §11 写的是"ReplicationManager 注册 Entity"，但 `ReplicationManager`
-> 实际 API 是 `registerObject(IReplicable*, uint32_t)` — 注册的是 `IReplicable`
-> 接口对象，不是 `Entity*`。且 AYEntity 已经存在
+> R3 复制 API 已 ship（`registerObject(void*, ITypeInfo*, netId)` + `EntityReplicationAdapter.h`），但 **Subsystem 全链路未闭环**（§10 R4.1-A）。AYEntity 侧已有
 > [`AYNetworkComponent`](../../AYRuntime/AYEntity/include/components/AYNetworkComponent.h)
-> 但**没有被 AYNetwork 消费**。两边 API 对不上。
-> 重写待 Phase R3 完成。
+> 但**未被 AYNetwork Subsystem 消费**。R4.1-A ship 项之一：最小 demo scene 证明 Editor Play / 多实例 replicate + RPC。
 
 ---
 
-## 12. 与工业级引擎对标（更新于 2026-07-26 审计）
+## 12. 与工业级引擎对标（更新于 2026-07-29）
 
-| 特性 | AYNetwork 2026-07-27 | Unreal 5 | Unity NetCode | O3DE | 工业级门槛 |
+| 特性 | AYNetwork 2026-07-29 | Unreal 5 | Unity NetCode | O3DE | 工业级门槛 |
 |------|:-------------------:|:--------:|:-------------:|:----:|:----------:|
-| UDP/可靠传输 | ⚠ GNS 部分 | ✅ | ✅ | ✅ | ✅ |
-| Authority 模型 | ⚠ 规格 §6.6 / 未实现 | ✅ | ✅ | ✅ | ✅ |
-| Interest Management | ❌ | ✅ | ✅ | ✅ | ✅（MMO 必备） |
+| UDP/可靠传输 | ✅ GNS + 多连接 | ✅ | ✅ | ✅ | ✅ |
+| Authority 模型 | ⚠ Server/ListenServer 部分；Dedicated 待 R4.1-A | ✅ | ✅ | ✅ | ✅ |
+| Interest Management | ❌ R4.1-B 冻结 | ✅ | ✅ | ✅ | ✅（MMO 必备） |
 | Replication Graph | ❌ | ✅ | ✅ | ✅ | ✅ |
-| RPC（Reliable/Unreliable） | ❌ | ✅ | ✅ | ✅ | ✅ |
-| Connection state machine | ⚠ | ✅ | ✅ | ✅ | ✅ |
-| Packet fragmentation | ⚠ | ✅ | ✅ | ✅ | ✅ |
-| Heartbeat / RTT / Stats | ⚠ GNS 有 / 未暴露齐 | ✅ | ✅ | ✅ | ✅ |
-| Snapshot + Delta 同步 | ❌ | ✅ | ✅ | ✅ | ✅ |
+| RPC（Reliable/Unreliable） | ✅ Handler 层；⚠ Subsystem 接线 R4.1-A | ✅ | ✅ | ✅ | ✅ |
+| Connection state machine | ✅ 握手 + Ready | ✅ | ✅ | ✅ | ✅ |
+| Packet fragmentation | ✅ R2 PacketAssembler | ✅ | ✅ | ✅ | ✅ |
+| Heartbeat / RTT / Stats | ⚠ GNS 有 / App 未暴露齐 | ✅ | ✅ | ✅ | ✅ |
+| Snapshot + Delta 同步 | ✅ R3 Full/Delta；⚠ demux R4.1-A | ✅ | ✅ | ✅ | ✅ |
 | 加密（DTLS / AES-GCM） | ✅ GNS | ✅ | ✅ | ✅ | ✅ |
-| 压缩 | ❌ | ✅ | ✅ | ✅ | ⚠ |
-| Lag compensation | ❌ | ✅ | ✅ | ✅ | ✅（FPS/MOBA） |
-| Server 端反作弊校验 | ❌ | ✅ | ✅ | ✅ | ✅ |
-| Replay / Demo | ❌ | ✅ | ❌ | ❌ | ⚠ |
+| 压缩 | ⚠ lz4 encode；auto-compress 待 R4.1-B | ✅ | ✅ | ✅ | ⚠ |
+| Lag compensation | ❌ R5 | ✅ | ✅ | ✅ | ✅（FPS/MOBA） |
+| Server 端反作弊校验 | ⚠ RPC validator only | ✅ | ✅ | ✅ | ✅ |
+| Replay / Demo | ❌ R5/R6 | ✅ | ❌ | ❌ | ⚠ |
 
-**综合评分（2026-07-27 设计审计后）**：
-- 设计清晰度：**75/100**（GNS/Authority/协议切分已钉；RPC 专章仍薄）
-- 实现完整度：**~25/100**（传输骨架抬升；复制/RPC 仍空）
-- 工业可用度：**~10/100**（不可上线联机玩法）
-- 距可用门槛：仍约 **14–20 周**（§13 R1–R4 主路径）
+**综合评分（2026-07-29，R4.0 ship 后）**：
+- 设计清晰度：**85/100**（R4.0/R4.1-A/B 分层已钉；§10 demux 与代码对齐）
+- 实现完整度：**~45/100**（传输+协议+复制+RPC Handler 扎实；**集成层断层**）
+- 工业可用度：**~20/100**（LAN 原型零件齐全；**不可直接做可玩联机** until R4.1-A）
+- 距可用门槛（R4.1-A）：约 **2–4 周**（集成 + E2E + demo）
+- 距生产级（R4.1-B + R5 + R6）：仍约 **12–16 周**
 
-**分阶段可 ship**：现在 **No** → R1 子系统 echo+多连接 = LAN 玩具 → R3 = 小型状态同步原型 → R4 = 接近可玩小规模联机。跨 NAT / 商店级另需中继与身份策略（§14.6）。
+**分阶段可 ship**：
+- R1 ✅ LAN 玩具 → R3 ✅ 状态同步原型（单测/loopback）→ R4.0 ✅ RPC 零件库 → **R4.1-A ⏳ 可玩小规模联机 demo** → R4.1-B 带宽/回调 → R5 体验 → R6 工程化。跨 NAT / 商店级另需中继（§14.6）。
 ---
 
 ## 13. 实施路线图（Roadmap，2026-07-26 重置）
@@ -722,12 +760,14 @@ AYNetwork
 
 **R3.1 = 378/378 PASS, 2026-07-28 ship** (R3.0 baseline 226 + R3.1 +21 case, 6 pure + 15 e2e 端到端; 2026-07-28 cc9c1da 二次修正 `CHECK_INT_EQ(bs.readUInt16(), ...)` macro 三次求值坑，3 case 从 FAIL 转 PASS)
 
-### Phase R4（3 周）：RPC + Interest Management
+### Phase R4（3 周）：RPC — **R4.0 ship ✅；R4.1 收束为 A/B 两阶段**
 
-1. RPC 系统：`Server` / `Client` / `NetMulticast` 三类型，参数序列化复用 AYReflect
-2. Validation hook（server-side 拒绝非法 RPC）
-3. Interest Management 基础 — `Relevancy` 谓词 + 距离裁剪
-4. `INetworkExtension` 的 `onPreReplicate(targets)` 真调用
+> **2026-07-29 范围收束**：原「Phase R4.1 待开始」整块（Interest + RepNotify + polish）**拆分为 R4.1-A（集成/P0，唯一活跃）与 R4.1-B（冻结）**。详见 §10 Phase R4.1-A / R4.1-B。
+
+1. RPC 系统：`Server` / `Client` / `NetMulticast` 三类型，参数序列化复用 AYReflect — ✅ R4.0
+2. Validation hook（server-side 拒绝非法 RPC）— ✅ R4.0
+3. Interest Management 基础 — ⏸ **R4.1-B 冻结**
+4. `INetworkExtension::onPreReplicate(targets)` 真调用 — ⏸ **R4.1-B 冻结**
 
 ### Phase R4.0 — RPC 三类型 + 4 通道 + Validator（**2026-07-29 ship**）
 
@@ -738,18 +778,33 @@ AYNetwork
 5. ✅ `RpcHandler` 全套 API：registerMethod (per-method hash binding) / callServer/Client/Multicast (outbound) / onRpcRequest/Response/Reject (inbound dispatch) / callId 64-bit pending map (auto-cleanup)
 6. ✅ Wire 兼容：schemaVersion=1 不 bump；R3.x receiver 收到 envelope 0x0010..0x0012 静默 drop (default envelope kind 不识别)
 7. ✅ 73 测试 (R3.2 493 → 566 baseline + 73 R4.0): pure dispatch / 4 channel / validator reject / authority gate / R3.0-R3.2 zero regression
-8. ⏸ Interest Management (`Relevancy` + distance culling) — **R4.1 work**, 用户 explicit 押后
-9. ⏸ Per-field RepNotify (Unreal `OnRep_X`) — **R4.1 work**, 同 RPC 思路
-10. ⏸ Multicast RPC for unregistered types / wildcard — **R4.1+ work**
+8. ⏸ Interest Management — **移至 R4.1-B，R4.1-A ship 前冻结**
+9. ⏸ Per-field RepNotify — **移至 R4.1-B，冻结**
+10. ⏸ Multicast RPC wildcard — **移至 R4.1-B+，冻结**
 
-### Phase R4.1（**待开始**）— RPC polish + Interest + RepNotify
+### Phase R4.1-A — 集成层（P0，**进行中，唯一活跃 R4.1 主线**）
 
-1. Interest Management：`Relevancy` 谓词 + 距离裁剪 + `INetworkExtension::onPreReplicate(targets)` 真调用
-2. Per-field RepNotify callback (Unreal `OnRep_X`) — 用户标 `FieldAttribute::RepNotify` 后 server→client 端 invoke 回调
-3. RPC timeout / retry / exponential backoff（高优先级 race 防护）
-4. RpcHandler async invoke (RPC takes > 16 ms) — thread pool + future-based response
-5. Multicast RPC for unregistered types / wildcard
-6. `kMsgTypeRpcResponse` 自动 lz4 compress（`PacketFlag::Compressed` 已 ship 多年）
+> 完整 checklist 见 §10 Phase R4.1-A。已 land：`NetConnectionImpl` / `sendTo` / `ListenServer`（commits `a729672`–`19d702a`）。**禁止** 并行开发 Interest / RepNotify / Async RPC。
+
+1. ⏳ Subsystem Replication demux (0x0001..0x0004 → `_replicationManager`)
+2. ⏳ `RpcHandler::emit` → `sendTo` / `broadcast` 分流
+3. ⏳ 真实 `NetConnection* from` 传入 handlers
+4. ⏳ 修复 `broadcastExcept`
+5. ⏳ Client EntitySpawn 最小可用
+6. ⏳ Subsystem E2E (1 server + 2 client，无 test sink)
+7. ⏳ 最小 AYEntity demo + RPC pending 超时
+
+**Ship 判据**：§10 R4.1-A 表内全部 ⏳ → ✅ + 566 baseline 零回归。
+
+### Phase R4.1-B — Interest + RepNotify + RPC polish（**冻结至 R4.1-A ship**）
+
+1. Interest Management + `onPreReplicate(targets)`
+2. Per-field RepNotify (`FieldAttribute::RepNotify`)
+3. RPC timeout / retry / exponential backoff
+4. Async RPC (thread pool)
+5. Wildcard multicast RPC
+6. Response auto lz4 compress
+7. CHANNEL_ACK 显式管线
 
 ### Phase R5（可选）：Lag comp / Replay / Snapshot interp
 
@@ -872,9 +927,11 @@ Platform Layer                ← AYPlatform 已有 Thread/Mutex
 
 ---
 
-## 15. 立即可改的清单（最小动作清单，2026-07-26）
+## 15. 立即可改的清单（**已由 R4.1-A 取代**，2026-07-29）
 
-按修复 ROI 排序：
+> 下列为 2026-07-26 审计遗留 P0 杂项；**当前唯一优先级清单见 §10 Phase R4.1-A**。勿并行处理。
+
+按修复 ROI 排序（历史存档）：
 
 | # | 文件 | 改动 | 估计工时 |
 |---|------|------|---------|
@@ -903,6 +960,8 @@ Platform Layer                ← AYPlatform 已有 Thread/Mutex
 | 2026-07-27 | **R3.1 Delta Update ship** — design §13 R3.1 9 项全 ✅ + dirty-tracking 落地，复制带宽下降到 5~20% (LAN 稳态)：<br>• 新增 `kMsgTypeDelta = 0x0004` wire msgType slot；body = 与 Full Snapshot 同 8B header + N field records，receiver 端 `deserializeObject` 路径共用<br>• `ReflectSerializer::hashFieldValue(WireTypeId, void*)` 复用 `PacketCodec::computeCrc32c` (Castagnoli, 0x1EDC6F41) 做 per-field baseline；12 WireTypeId switch + std::string 特殊 case<br>• `ReflectSerializer::serializeDirtyFields(type, obj, netId, denseIndices, BitStream&)` 新增 entry point；emit 仅指定 dense index 的字段，frame header fieldCount = denseIndices.size()<br>• `ReplicationManager::ReflectedEntry` 扩展 R3.1 dirty-tracking state：`_fieldHashes[denseIdx]` (CRC32C baseline) + `_netFieldSparseIndex[denseIdx]` (dense→sparse 映射) + `_initialized` (one-shot gate，register 时 false，第一次 tick 走 Full 后设 true)<br>• `ReplicationManager::tick` 重写 R3.1 dirty-tracking 三态：未初始化→Full Snapshot (RELIABLE)；无 dirty→不广播；部分 dirty→Delta (UNRELIABLE)。已 emit 字段的 hash 立即更新 (避免漏发)<br>• `ReplicationManager::forceReplicate(netId)` 真实现：置 `_initialized = false`，下次 tick 必走 Full Snapshot；适用于 client 重连 / teleport / 用户显式触发<br>• `ReplicationManager::getDirtyFieldCount(netId)` debug API：返回 pending dirty 字段数；0 = 稳态无广播；SIZE_MAX = 未注册或 legacy IReplicable<br>• `ReplicationManager::onReceive` 加 `kMsgTypeDelta` case，复用 `deserializeObject` (wire 格式兼容)；Authority gate 一致保持<br>• `IReplicable::replicate(BitStream&) / onReplicate(const BitStream&)` **真正删除**（全树 grep 验证 0 用户实现后）<br>• 新增 `unittest/AYTest_Replication.cpp` 21 case：<br>　pure 6：HashStableForUnchangedField / HashChangesForDifferentValues / HashAcrossAllWireTypes (12 WireTypeId) / SerializeDirtyFieldsOnlyIncludesRequested / SerializeDirtyFieldsEmptyIndicesProducesNoFrame / DeltaFrameHeaderFormatMatchesFullSnapshot<br>　e2e 15：InitialTickSendsFullSnapshotNotDelta / SteadyStateNoFieldChangeSendsNothing / SingleFieldChangeSendsDeltaWithOneRecord / MultiFieldChangeSendsDeltaWithNRecords / DeltaDoesNotIncludeUnchangedFields / DeltaOnUnreliableChannel / SpawnFrameStaysReliable / RepeatedChangeSameValueNoDelta / ForceReplicateResendsFullSnapshot / ForceReplicateAfterDeltaResendsFull / MultipleObjectsEachTrackedIndependently / DeltaFrameAuthorityGate / DeltaWireSmallerThanFull (Δ < 1/3 Full) / DeltaFrameHeaderSizeMinimal / GetDirtyFieldCountReportsPending<br>**R3.1 = 378/378 PASS (R3.0 baseline 226 + R3.1 +21 case), test exit=0; 2026-07-28 cc9c1da 修正 CHECK_INT_EQ macro 三次求值坑 (case 17 DeltaDoesNotIncludeUnchangedFields 旧版本假报 PASS 实则 deserializeObject 失败)** |
 | 2026-07-28 | **R3.2 嵌套字段 ship** — design §13 R3.2 6 项全 ✅ + WireTypeId 12..15 落地，inventory vector / nested struct / equipment map 等用例端到端通：<br>• **`AYReflect`** 扩展：新增 `MapTypeInfo<V>` 模板 + `MapTypeInfoBase` 非虚拟基类（提供 `putEntry` 接口供 receiver-side insert）；新增 `registerArrayType<T,N>` / `registerVectorType<T>` / `registerMapType<V>` 自由函数（v3.2 v1 必须显式调用注册 array/vector/map 类型 — findType<T>() 不自动 instantiate）；explicit template instantiation 避免 AYNetwork_Test 链接失败<br>• **`IAYNetwork.h`**: `WireTypeId` 扩 12..15 — `NestedStruct=12` / `FixedArray=13` / `DynamicArray=14` / `StringMap=15`<br>• **`ReflectSerializer.cpp`**: `resolveWireTypeId` 加嵌套类型检测（IContainerTypeInfo → 13/14；name prefix `"std::map<std::string,"` → 15；其余 → 12 NestedStruct）；新增递归 `writeWireValue` / `readWireValue` 顶层 switch；新增 `hashFieldValueEx(WireTypeId, ITypeInfo*, void*)` 走嵌套 hash（per-design "整个字段粒度"）；`serializeObject` / `serializeDirtyFields` 切换到 `writeWireValue` 调用；readFieldValue default 分支保留 (`return false`) → R3.1 receiver 静默 drop frame<br>• **`ReplicationManager.cpp`**: `tick()` / `getDirtyFieldCount` 切换到 `hashFieldValueEx` 让 dirty-tracking 跨嵌套字段生效（任一内层元素变 → 整个 nested 字段 hash 变 → Delta frame）；其它不变<br>• **Wire format** (R3.2 新增)：NestedStruct = `[u16 nestedHash][u8 fieldCount][records...]`；FixedArray = `[u8 elemWid][u8 N][elems...]`；DynamicArray = `[u8 elemWid][u32 N][elems...]`；StringMap = `[u8 valueWid][u32 entryCount][per-entry: u16 keyLen key bytes value bytes]`；所有嵌套格式递归 (nested struct 内 element 仍是 struct / array / map 时继续展开)<br>• **向后兼容**: 新 WireTypeId 12..15 走 default readFieldValue → `return false` → receiver 静默 drop frame → server 下次 tick 发 Full 重传；schemaVersion=1 不 bump,渐进升级路径干净<br>• **新增 `unittest/AYTest_Replication.cpp` 15 case**: <br>　pure 6：NestedStructRoundTrip / NestedStructRejectedByR31Receiver / FixedArrayRoundTrip / DynamicArrayRoundTrip / StringMapRoundTrip / MixedNestedTypesRoundTrip (复合 4 类型)<br>　e2e 6：NestedStructInitialFullAndDelta / FixedArrayElementChange / DynamicArraySizeChange / StringMapKeyAdd / NestedStructHashDetectsInnerChange (whole-field dirty 验证) / R31ReceiverDropsR32Frame<br>　regression 3：R30PrimitivesStillWork / R31DeltaStillTriggersForPrimitive (MixedOuter 实测) / NestedStructInInitialTickDoesNotPolluteR31Path<br>**R3.2 = 493/493 PASS (R3.1 baseline 378 + R3.2 +15 case = 393 case；493 = check 行总数), test exit=0** |
 | 2026-07-29 | **R4.0 RPC 三类型 + 4 通道 + Validator ship** — design §13 R4.0 10 项全 ✅ + IAYNetwork 第 4 大 wire msgType 命名空间 + `IMethodInfo` RPC metadata:<br>• **Wire envelope namespace**: `kMsgTypeRpcRequest=0x0010` / `kMsgTypeRpcResponse=0x0011` / `kMsgTypeRpcReject=0x0012` (0x0005..0x000F reserved R3.3 back-compat)；schemaVersion=1 不 bump,R3.x receiver 静默 drop 同 R3.2 nested WireTypeId 12..15<br>• **AYReflect 扩展** (`include/ayreflect/IReflect.h`): `IMethodInfo` 加 5 虚函数 (RpcKind/isUnreliable/hasValidator/validate/getParamName)，`enum class RpcKind { None/Server/Client/Multicast }`；default impl most benign 保持 AYScript logia `logia/AYMethodInfoImpl.h` source-compat (Test_Reflect.cpp:600-603 注释确认)<br>• **RpcHandler** (新 `include/RPC/RpcHandler.h` + `src/RPC/RpcHandler.cpp`): `registerMethod` per-method hash binding (FNV-1a-16 of methodName)；`callServer/Client/Multicast` 出站 caller 端不要求本地 obj 绑定（**Bug fix**: resolveMethod 出站语义允许 _objsByHash miss）；`onRpcRequest/Response/Reject` inbound 入口 `body.resetForRead()`（**Bug fix**: 写完 BitStream 不归零位指针导致 readRpcArgs 静默 fail）；authority gate 按 RpcKind 区分（Server RPC 仅在 Server/ListenServer 端处理；Client RPC 仅在 Client 端处理；Multicast 全端）<br>• **RpcSerializer thin wrapper** (在 RpcHandler.cpp 内)：writeRpcArgs / readRpcArgs / writeRpcResponse / readRpcResponse / writeRpcReject / readRpcReject — 复用 R3.2 `writeWireValue/readWireValue` 16 WireTypeId dispatch (No new ITypeInfo/CRC/fragment logic — 全复用 R3.2 16-id 引擎)<br>• **callId 64-bit pending map**: std::atomic fetch_add + std::mutex map; 客户端 outbound register pending callback, Response/Reject 自动 fire + cleanup<br>• **`GnsConnection::_rawSend` 4-channel switch**: `CHANNEL_RELIABLE` → `k_nSteamNetworkingSend_Reliable`；`CHANNEL_UNRELIABLE` → `k_nSteamNetworkingSend_Unreliable`；`CHANNEL_FRAGMENTED` → `Reliable \| NoNagle` (Nagle 防止合并多帧包；PacketCodec 仍走 PacketAssembler R2)；`CHANNEL_ACK` → `Reliable` (R4.1 stub；ACK pipeline 留 R4.1+)<br>• **`ReplicationManager::unregisterObject` envelope fix**: R3.2 typo `kMsgTypeReplication` envelope 包 Despawn body → R4.0 修成 `kMsgTypeEntityDespawn` (mirror Spawn path),wire 对称<br>• **`AYNetworkSubSystem::update` demux**: PacketCodec::decode envelope.msgType: 0x0010..0x0012 → `_rpcHandler.onRpcXxx`；0x0001..0x0004 → 既有 `_replicationManager.onReceive`；其它 → per-channel MessageHandler；pre-route 消除 channel handler 关注 RPC vs replication 区分<br>• **`INetworkSubSystem::getRpcHandler()` 新 API**: 单一 RpcHandler 引用,AYNetworkSubSystem ctor 持有 (mirror `_replicationManager{this}`)<br>• **新 `unittest/AYTest_RpcHandler.cpp` 18 case** (10 pure + 5 e2e 纯 loopback + 3 regression)：<br>　pure 10：RegisterAndResolveMethod / WriteReadArgsRoundTrip / WriteReadResponseRoundTrip / WriteReadRejectBodyRoundTrip / ValidatorRejectsCall / UnknownMethodReturnsFalse / ParseFailOnTruncatedBody / MultiplePendingCallsDisambiguated / UnreliableOverridePerRpc / RpcKindMismatchRejects<br>　e2e 5：ServerRpcHappyPath / ValidatorRejectsAcrossGns / ReliableDefaultOverGns / UnreliableServerRpcOverGns / AuthorityGateRejectsRpc (纯 loopback 同步断言: emit → PacketCodec::decode → peer handler,去 GnsConnection heap-corruption 路径 — R3.2 E2E pattern 复用)<br>　regression 3：R30PrimitivesStillReplicate / R32NestedWireTypesAreUnaffected (16-id dispatch 不破坏) / RpcMsgTypeEnvelopeIsDistinct<br>• **关键 Bug fix 链 (用户 review 后修正, 不是 .obj/链接器问题)**:<br>　1. `resolveMethod` 出站 caller 端不应要求本地 obj (client callServer 不需要 receiver's obj binding)<br>　2. `onRpcRequest/Response/Reject` 入口 `body.resetForRead()` (写完 BitStream 后位指针非零,readRpcArgs 静默 fail)<br>　3. E2E 纯 loopback: emit → PacketCodec::decode → peer handler, 不走 GnsConnection (Disconnected 状态丢包 + heap 破坏)<br>　4. Authority gate 按 RpcKind 区分 (Server RPC 仅 Server/ListenServer 端; Client RPC 仅 Client 端; Multicast 全端)<br>　5. E2E 同步断言 (RPC 路径本身是同步, GNS update() pump 不需要)<br>　6. Channel 断言看对 atomic (client 发 RPC 看 lastClientChannel; server 发 Client RPC 看 lastServerChannel)<br>　7. ClientDamage 在 client 端 registerMethod (Client RPC server→client, client 端 invoke)<br>**R4.0 = 566/566 PASS (R3.2 baseline 493 + R4.0 +73 case/check), test exit=0; 2026-07-29 ship** |
+
+| 2026-07-29 | **R4.1 范围收束 + R4.1-A/B 分层** — 停掉散落 4.1 开发，统一集成主线：<br>• **拆分**：R4.1-A（集成层/P0，唯一活跃） vs R4.1-B（Interest + RepNotify + RPC polish，**冻结至 A ship**）<br>• **修正 §10 表述**：Replication demux（0x0001..0x0004 → `_replicationManager`）**未实现**（现落 default MessageHandler）；RPC demux ✅；与 `AYNetworkSubSystem.cpp` 代码对齐<br>• **R4.1-A 已 land 部分**：`NetConnectionImpl` (`a729672`) / `sendTo`+`getConnections`+`kickConnection` (`ed56867`) / `listen()`→ListenServer+Replication authority (`19d702a`)<br>• **R4.1-A 待做**：Replication demux / RpcHandler sendTo 分流 / 真实 `from` conn / broadcastExcept 修复 / EntitySpawn / Subsystem E2E / AYEntity demo / RPC pending 超时<br>• **冻结项**：Interest、RepNotify、Async RPC、wildcard multicast、Response lz4、CHANNEL_ACK — 全部 R4.1-B<br>• **§12 评分同步**：实现完整度 ~25→~45；工业可用 ~10→~20；可用门槛 ~2–4 周（R4.1-A）<br>• **§11/§2.1/§13** 同步 R4.0 ship 后现状 |
 
 ---
 
