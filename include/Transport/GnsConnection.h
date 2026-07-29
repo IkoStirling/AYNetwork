@@ -28,6 +28,7 @@
 #include <AYCore.h>
 #include <IAYNetwork.h>                // R1 done: DisconnectReason / HandshakeMsgType / kProtocolVersion
 #include <PacketAssembler.h>           // R2: receive-side reassembly
+#include <Protocol/AckPipeline.h>      // R4.1-B: CHANNEL_ACK pipeline
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -116,6 +117,10 @@ public:
     // ===== Send / Close =====
     // channel: 0..3 (CHANNEL_RELIABLE/UNRELIABLE/FRAGMENTED/ACK)
     int  send(uint8_t channel, const void* data, size_t len);
+    // R4.1-B: seal with RequiresAck + seq prefix; optional callback when
+    // the peer echoes kMsgTypeAppAck on CHANNEL_ACK.
+    int  sendRequireAck(uint16_t msgType, uint8_t channel, const void* data, size_t len,
+                        AckTracker::Callback onAck = nullptr);
     void disconnect(const char* reason = nullptr);
 
     // ===== State / info =====
@@ -171,6 +176,9 @@ public:
     // Otherwise forwards to the user data handler.
     void onRawData(const uint8_t* data, size_t len);
 
+    // Test seams for AckPipeline integration.
+    size_t pendingAckCountForTesting() const { return _ackTracker.pendingCount(); }
+
 private:
     void setState(GnsConnectionState newState);
 
@@ -200,6 +208,7 @@ private:
     // _assembler.consume() and the optional result is dispatched.
     PacketAssembler _assembler;
     uint32_t _nextFragmentId = 0;
+    AckTracker _ackTracker;
 
     // R2: convenience for fragments that exceed MTU. ~1200 bytes fits
     // comfortably under typical internet MTUs (1500 minus IP+UDP+GNS

@@ -148,6 +148,8 @@ struct NetVec3 {
 constexpr uint16_t kMsgTypeRpcRequest   = 0x0010;
 constexpr uint16_t kMsgTypeRpcResponse  = 0x0011;
 constexpr uint16_t kMsgTypeRpcReject    = 0x0012;
+// R4.1-B: application-level ACK echo for RequiresAck frames (CHANNEL_ACK).
+constexpr uint16_t kMsgTypeAppAck       = 0x0013;
 
 // R2: schema version stamped into every PacketHeader. Bump on breaking
 // wire-format changes (rare; major version bumps imply a parallel header

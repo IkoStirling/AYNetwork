@@ -12,6 +12,7 @@ set(SRC_FILES
     src/Transport/UdpSocket.cpp
     src/Protocol/PacketAssembler.cpp
     src/Protocol/PacketCodec.cpp
+    src/Protocol/AckPipeline.cpp
     src/Replication/ReplicationManager.cpp
     src/Replication/ReplicationSystem.cpp
     src/Replication/ReflectSerializer.cpp

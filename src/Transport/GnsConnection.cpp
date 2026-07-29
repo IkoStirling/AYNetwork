@@ -307,6 +307,8 @@ void GnsConnection::update() {
     if (!s_gns) return;
     if (_state == GnsConnectionState::Disconnected) return;
 
+    _ackTracker.expire();
+
     // RunCallbacks triggers any pending status-change callbacks. Calling this
     // every frame is the canonical GNS pattern — it's cheap (just drains a
     // queue).
@@ -387,6 +389,25 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
     return lastResult;
 }
 
+int GnsConnection::sendRequireAck(uint16_t msgType, uint8_t channel,
+                                  const void* data, size_t len,
+                                  AckTracker::Callback onAck) {
+    if (!s_gns || _conn == k_HSteamNetConnection_Invalid) return -1;
+    if (_state != GnsConnectionState::Connected &&
+        _state != GnsConnectionState::Handshaking &&
+        _state != GnsConnectionState::Ready) {
+        return -1;
+    }
+    const uint32_t seq = _ackTracker.allocateSeq();
+    auto wire = AckPipeline::sealAckable(
+        static_cast<const uint8_t*>(data), len,
+        msgType, channel, seq, nowMs(), /*compress=*/ false);
+    if (onAck) {
+        _ackTracker.registerPending(seq, std::move(onAck));
+    }
+    return _rawSend(wire.data(), static_cast<uint32_t>(wire.size()), channel);
+}
+
 // R2: low-level GNS send. R4.0 (2026-07-29) expands the channel -> GNS
 // send-flag map to all 4 channels declared in IAYNetwork.h:39-42.
 //
@@ -421,9 +442,9 @@ int GnsConnection::_rawSend(const uint8_t* data, uint32_t len, uint8_t channel) 
                   | k_nSteamNetworkingSend_NoNagle;
             break;
         case CHANNEL_ACK:
-            // R4.1: replace with explicit ACK pipeline + per-packet
-            // identity echo. For now ack frames ride CHANNEL_RELIABLE.
-            flags = k_nSteamNetworkingSend_Reliable;
+            // R4.1-B: small ack-only frames — reliable but no nagle delay.
+            flags = k_nSteamNetworkingSend_Reliable
+                  | k_nSteamNetworkingSend_NoNagle;
             break;
         case CHANNEL_RELIABLE:
         default:
@@ -756,6 +777,24 @@ void GnsConnection::onRawData(const uint8_t* data, size_t len) {
     // format unchanged — only the envelope changed). Only valid during
     // Handshaking or Connected (server-side: just-accepted children fire
     // Connected state on GNS, then expect HELLO from the client).
+    if (hdr.msgType == kMsgTypeAppAck) {
+        uint32_t ackSeq = 0;
+        if (AckPipeline::parseAckBody(decoded.body.data(), decoded.body.size(), ackSeq)) {
+            _ackTracker.onAck(ackSeq);
+        }
+        return;
+    }
+
+    if (hasFlag(hdr.flags, PacketFlag::RequiresAck)) {
+        uint32_t ackSeq = 0;
+        if (AckPipeline::unwrapAckableBody(decoded.body, ackSeq)) {
+            auto ackWire = AckPipeline::sealAck(ackSeq, nowMs());
+            (void)_rawSend(ackWire.data(), static_cast<uint32_t>(ackWire.size()), CHANNEL_ACK);
+        } else {
+            return;
+        }
+    }
+
     if (hdr.msgType == kMsgTypeHandshake) {
         if (_state == GnsConnectionState::Handshaking ||
             _state == GnsConnectionState::Connected) {

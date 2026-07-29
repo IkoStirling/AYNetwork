@@ -102,6 +102,7 @@ enum class PacketFlag : uint8_t {
     None       = 0,
     Fragmented = 1 << 0,
     Compressed = 1 << 1,
+    RequiresAck = 1 << 2, // R4.1-B: receiver must echo seq on CHANNEL_ACK
 };
 
 inline PacketFlag operator|(PacketFlag a, PacketFlag b) {

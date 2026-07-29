@@ -27,6 +27,7 @@ set(SRC_FILES
     AYTest_EntityReplicationIntegration.cpp
     AYTest_InterestManagement.cpp
     AYTest_RepNotify.cpp
+    AYTest_AckPipeline.cpp
 )
 
 add_executable(${MODULE_NAME} ${SRC_FILES})
