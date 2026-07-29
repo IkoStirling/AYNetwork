@@ -782,7 +782,7 @@ AYNetwork
 
 ### Phase R4.1-A — 集成层（P0，**✅ ship 2026-07-29**）
 
-> 完整 checklist 见 §10 Phase R4.1-A。commits `ecddcdd`（集成 demux/E2E）+ `TBD`（pending 超时 + Entity adapter E2E）。
+> 完整 checklist 见 §10 Phase R4.1-A。commits `ecddcdd`（集成 demux/E2E）+ `349a176`（pending 超时 + Entity adapter E2E）。
 
 1. ✅ Subsystem Replication demux (0x0001..0x0004 → `_replicationManager`)
 2. ✅ `RpcHandler::emit` → `sendTo` / `broadcast` 分流
