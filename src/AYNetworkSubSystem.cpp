@@ -121,12 +121,29 @@ public:
 
         child->onData(makeDataHandler(netPtr));
 
-        if (_pendingConnHandler) {
-            rawChild->onStateChange([this, rawChild](GnsConnectionState /*oldS*/, GnsConnectionState newS) {
-                bool connected = (newS == GnsConnectionState::Ready) ||
-                                 (newS == GnsConnectionState::Connected &&
-                                  rawChild->getProtocolVersion() == 0);
-                DisconnectReason reason = connected
+        if (_connectionHandler) {
+            rawChild->onStateChange([this, rawChild, netPtr](GnsConnectionState /*oldS*/,
+                                                             GnsConnectionState newS) {
+                const bool connected = (newS == GnsConnectionState::Ready)
+                    || (newS == GnsConnectionState::Connected
+                        && rawChild->getProtocolVersion() == 0);
+                const DisconnectReason reason = connected
+                    ? DisconnectReason::Unknown
+                    : rawChild->getLastDisconnectReason();
+                _connectionHandler(netPtr, connected, reason);
+            });
+            // If handshake finished before the handler was installed, synthesize
+            // the connected callback so late-join rebroadcast is not missed.
+            if (rawChild->isConnected()) {
+                _connectionHandler(netPtr, true, DisconnectReason::Unknown);
+            }
+        } else if (_pendingConnHandler) {
+            rawChild->onStateChange([this, rawChild](GnsConnectionState /*oldS*/,
+                                                     GnsConnectionState newS) {
+                const bool connected = (newS == GnsConnectionState::Ready)
+                    || (newS == GnsConnectionState::Connected
+                        && rawChild->getProtocolVersion() == 0);
+                const DisconnectReason reason = connected
                     ? DisconnectReason::Unknown
                     : rawChild->getLastDisconnectReason();
                 _pendingConnHandler(connected, reason);

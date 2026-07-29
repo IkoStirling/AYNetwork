@@ -504,6 +504,45 @@ void ReplicationManager::forceReplicate(uint32_t netId) {
     it->second._initialized = false;
 }
 
+bool ReplicationManager::rebroadcastEntitySpawn(uint32_t netId, NetConnection* targetConn) {
+    auto it = _objects.find(netId);
+    if (it == _objects.end() || !it->second.type) {
+        return false;
+    }
+    if (!isAuthority() || (!_network && !_broadcastSink)) {
+        return false;
+    }
+
+    const ReflectedEntry& e = it->second;
+    BitStream body;
+    body.writeUInt16(kMsgTypeEntitySpawn);
+    ReflectSerializer::writeEntitySpawn(body, netId,
+        static_cast<uint16_t>(e.type->getId() & 0xFFFFu));
+    std::vector<uint8_t> sealed = PacketCodec::encode(
+        static_cast<const uint8_t*>(body.getData()), body.getSize(),
+        kMsgTypeEntitySpawn, kSchemaVersion,
+        CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
+        /*compress=*/ false);
+
+    bool delivered = false;
+    if (targetConn && targetConn->isConnected()) {
+        if (_broadcastSink) {
+            _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
+            delivered = true;
+        } else if (_network) {
+            _network->sendTo(targetConn, CHANNEL_RELIABLE, sealed.data(), sealed.size());
+            delivered = true;
+        }
+    } else {
+        delivered = sendSealedToTargets(e.obj, e.type, netId, e._location, e._hasLocation,
+                                        CHANNEL_RELIABLE, sealed.data(), sealed.size());
+    }
+    if (delivered) {
+        forceReplicate(netId);
+    }
+    return delivered;
+}
+
 // =============================================================================
 // getDirtyFieldCount — debug / test helper. Returns the count of NetReplicate
 // fields currently considered dirty. 0 = steady state (no frame on next tick).

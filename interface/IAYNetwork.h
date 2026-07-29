@@ -536,6 +536,12 @@ public:
     bool peekSpawnAnnouncement(uint32_t netId, uint16_t& typeHashOut) const;
     size_t spawnAnnouncementCount() const { return _spawnAnnouncements.size(); }
 
+    // Authority-only: resend EntitySpawn for an already-registered netId.
+    // When targetConn is non-null, the spawn goes only to that connection
+    // (late joiner). Otherwise all connected clients receive the announcement.
+    // Also schedules a full snapshot on the next tick() via forceReplicate.
+    bool rebroadcastEntitySpawn(uint32_t netId, NetConnection* targetConn = nullptr);
+
     // ---- R4.1-B Interest Management ----
     // interestRadius <= 0 disables distance culling (broadcast / all conns).
     // Viewer position: NetConnection::setUserData(NetVec3*).
