@@ -127,6 +127,14 @@ constexpr uint16_t kMsgTypeEntityDespawn = 0x0003;  // server → clients: unreg
 // difference is which fields are included (only dirty ones, not all).
 constexpr uint16_t kMsgTypeDelta        = 0x0004;  // server → clients: dirty-fields-only delta update (R3.1)
 
+// R4.1-B: minimal 3-vector for interest / distance culling. Stored on
+// NetConnection::setUserData (viewer) and via ReplicationManager::setObjectLocation.
+struct NetVec3 {
+    float x = 0.f;
+    float y = 0.f;
+    float z = 0.f;
+};
+
 // R4.0 (2026-07-29): RPC msgType namespace. 0x0005..0x000F reserved for
 // future R3.3 back-compat shadow; 0x0010..0x0012 carry the RPC
 // request / response / reject triplet. wire schemaVersion=1 unchanged
@@ -320,6 +328,14 @@ public:
     virtual void onPreReplicate(void* obj, const ayt::reflect::ITypeInfo* type,
                                 uint32_t netId,
                                 std::vector<NetConnection*>& targets) {}
+    // R4.1-B: per-viewer relevancy gate applied before distance cull and
+    // onPreReplicate. Return false to exclude `viewer` from `targets`.
+    virtual bool isRelevant(NetConnection* viewer, void* obj,
+                            const ayt::reflect::ITypeInfo* type,
+                            uint32_t netId) {
+        (void)viewer; (void)obj; (void)type; (void)netId;
+        return true;
+    }
     // R4.1: 同步升级签名 (R1 旧签名 no-op default 保留向后兼容)。
     virtual void onPostReplicate(void* obj, const ayt::reflect::ITypeInfo* type,
                                  uint32_t netId) {}
@@ -511,6 +527,15 @@ public:
     bool peekSpawnAnnouncement(uint32_t netId, uint16_t& typeHashOut) const;
     size_t spawnAnnouncementCount() const { return _spawnAnnouncements.size(); }
 
+    // ---- R4.1-B Interest Management ----
+    // interestRadius <= 0 disables distance culling (broadcast / all conns).
+    // Viewer position: NetConnection::setUserData(NetVec3*).
+    // Object position: setObjectLocation(netId, loc) each tick or on move.
+    void setInterestRadius(float interestRadius);
+    float getInterestRadius() const { return _interestRadius; }
+    void setObjectLocation(uint32_t netId, NetVec3 location);
+    bool getObjectLocation(uint32_t netId, NetVec3& out) const;
+
 private:
     INetworkSubSystem* _network = nullptr;
     INetworkExtension* _extension = nullptr;
@@ -520,11 +545,18 @@ private:
     // of those. Used by tick/spawn/despawn/register.
     bool isAuthority() const;
 
-    // Test-only seam: when != Disconnected, overrides _network->getMode().
-    // Lets unit tests exercise the server-authority broadcast path without
-    // wiring a full INetworkSubSystem.
+    std::vector<NetConnection*> buildInterestTargets(
+        void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId,
+        NetVec3 objLoc, bool hasObjLoc) const;
+    bool sendSealedToTargets(void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId,
+                             NetVec3 objLoc, bool hasObjLoc,
+                             uint8_t channel, const void* data, size_t size);
+
+    // Test-only seam fields (see public setModeForTesting / setBroadcastSinkForTesting).
     ConnectionMode _forcedMode = ConnectionMode::Disconnected;
     BroadcastSink  _broadcastSink = nullptr;
+    float _interestRadius = 0.f;
+    float _interestRadiusSq = 0.f;
 
     // Forward-declared below; single map shared by both register paths.
     struct ReflectedEntry;

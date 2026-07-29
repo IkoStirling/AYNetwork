@@ -25,6 +25,7 @@ set(SRC_FILES
     AYTest_RpcHandler.cpp
     AYTest_SubsystemIntegration.cpp
     AYTest_EntityReplicationIntegration.cpp
+    AYTest_InterestManagement.cpp
 )
 
 add_executable(${MODULE_NAME} ${SRC_FILES})

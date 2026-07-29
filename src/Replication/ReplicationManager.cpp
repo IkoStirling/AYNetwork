@@ -38,6 +38,10 @@ struct ReplicationManager::ReflectedEntry {
     std::vector<uint32_t> _fieldHashes;            // dense-indexed CRC32C cache
     std::vector<uint32_t> _netFieldSparseIndex;   // dense → type->getField() sparse
     bool                  _initialized = false;   // false until first Full Snapshot emitted
+
+    // ---- R4.1-B interest ----
+    NetVec3 _location{};
+    bool    _hasLocation = false;
 };
 
 // =============================================================================
@@ -79,7 +83,121 @@ void buildNetFieldMap(const ayt::reflect::ITypeInfo* type,
     }
 }
 
+float distanceSq(const NetVec3& a, const NetVec3& b) {
+    const float dx = a.x - b.x;
+    const float dy = a.y - b.y;
+    const float dz = a.z - b.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
 } // anonymous namespace
+
+void ReplicationManager::setInterestRadius(float interestRadius) {
+    _interestRadius = interestRadius;
+    _interestRadiusSq = (interestRadius > 0.f) ? (interestRadius * interestRadius) : 0.f;
+}
+
+void ReplicationManager::setObjectLocation(uint32_t netId, NetVec3 location) {
+    auto it = _objects.find(netId);
+    if (it == _objects.end()) return;
+    it->second._location = location;
+    it->second._hasLocation = true;
+}
+
+bool ReplicationManager::getObjectLocation(uint32_t netId, NetVec3& out) const {
+    auto it = _objects.find(netId);
+    if (it == _objects.end() || !it->second._hasLocation) return false;
+    out = it->second._location;
+    return true;
+}
+
+namespace {
+
+std::vector<NetConnection*> collectConnectedTargets(INetworkSubSystem* network) {
+    std::vector<NetConnection*> targets;
+    if (!network) return targets;
+    for (NetConnection* conn : network->getConnections()) {
+        if (conn && conn->isConnected()) targets.push_back(conn);
+    }
+    return targets;
+}
+
+} // anonymous namespace
+
+std::vector<NetConnection*> ReplicationManager::buildInterestTargets(
+    void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId,
+    NetVec3 objLoc, bool hasObjLoc) const {
+    std::vector<NetConnection*> targets = collectConnectedTargets(_network);
+    if (targets.empty()) return targets;
+
+    if (_interestRadiusSq > 0.f && hasObjLoc) {
+        std::vector<NetConnection*> inRange;
+        inRange.reserve(targets.size());
+        for (NetConnection* conn : targets) {
+            auto* viewerPos = static_cast<NetVec3*>(conn->getUserData());
+            if (!viewerPos) {
+                inRange.push_back(conn);
+                continue;
+            }
+            if (distanceSq(*viewerPos, objLoc) <= _interestRadiusSq) {
+                inRange.push_back(conn);
+            }
+        }
+        targets = std::move(inRange);
+    }
+
+    if (_extension) {
+        std::vector<NetConnection*> relevant;
+        relevant.reserve(targets.size());
+        for (NetConnection* conn : targets) {
+            if (_extension->isRelevant(conn, obj, type, netId)) {
+                relevant.push_back(conn);
+            }
+        }
+        targets = std::move(relevant);
+    }
+    return targets;
+}
+
+bool ReplicationManager::sendSealedToTargets(
+    void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId,
+    NetVec3 objLoc, bool hasObjLoc,
+    uint8_t channel, const void* data, size_t size) {
+    std::vector<NetConnection*> targets =
+        buildInterestTargets(obj, type, netId, objLoc, hasObjLoc);
+    if (_extension && obj && type) {
+        _extension->onPreReplicate(obj, type, netId, targets);
+    }
+    // R3.x test seam: broadcast sink tests have no INetworkSubSystem connections.
+    if (targets.empty() && _broadcastSink) {
+        _broadcastSink(channel, data, size);
+        return true;
+    }
+    if (targets.empty()) return false;
+
+    if (_broadcastSink) {
+        if (_interestRadiusSq <= 0.f && targets.size() == collectConnectedTargets(_network).size()) {
+            _broadcastSink(channel, data, size);
+            return true;
+        }
+        for (NetConnection* conn : targets) {
+            (void)conn;
+            _broadcastSink(channel, data, size);
+        }
+        return true;
+    }
+    if (!_network) return false;
+
+    const size_t allCount = collectConnectedTargets(_network).size();
+    if (_interestRadiusSq <= 0.f && targets.size() == allCount) {
+        _network->broadcast(channel, data, size);
+        return true;
+    }
+    for (NetConnection* conn : targets) {
+        _network->sendTo(conn, channel, data, size);
+    }
+    return true;
+}
 
 void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId) {
     if (!obj || !type || netId == 0) return;
@@ -113,36 +231,32 @@ void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo
             kMsgTypeEntitySpawn, kSchemaVersion,
             CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
             /*compress=*/ false);
-        if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
-        else                _network->broadcast(CHANNEL_RELIABLE, sealed.data(), sealed.size());
+        sendSealedToTargets(obj, type, netId,
+                            _objects[netId]._location, _objects[netId]._hasLocation,
+                            CHANNEL_RELIABLE, sealed.data(), sealed.size());
     }
 }
 
 void ReplicationManager::unregisterObject(uint32_t netId) {
     auto it = _objects.find(netId);
     if (it == _objects.end()) return;
+    void* obj = it->second.obj;
+    const ayt::reflect::ITypeInfo* type = it->second.type;
+    NetVec3 loc = it->second._location;
+    const bool hasLoc = it->second._hasLocation;
     _objects.erase(it);
 
     if (isAuthority() && (_network || _broadcastSink)) {
         BitStream body;
         body.writeUInt16(kMsgTypeEntityDespawn);
         ReflectSerializer::writeEntityDespawn(body, netId);
-        // R4.0 (2026-07-29) envelope fix: the wire envelope msgType
-        // now matches the body's inner msgType (kMsgTypeEntityDespawn).
-        // R3.2 used kMsgTypeReplication here — onReceive worked
-        // because all replication frames (Full / Delta / Spawn / Despawn)
-        // route through the same ReplicationManager::onReceive path
-        // which reads the *inner* msgType and dispatches, but the
-        // mismatch made routing in AYNetworkSubSystem::update
-        // ambiguous (the envelope vs the inner could disagree).
-        // After R4.0 a 0x0003 envelope routes back here reliably.
         std::vector<uint8_t> sealed = PacketCodec::encode(
             static_cast<const uint8_t*>(body.getData()), body.getSize(),
             kMsgTypeEntityDespawn, kSchemaVersion,
             CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
             /*compress=*/ false);
-        if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
-        else                _network->broadcast(CHANNEL_RELIABLE, sealed.data(), sealed.size());
+        sendSealedToTargets(obj, type, netId, loc, hasLoc,
+                            CHANNEL_RELIABLE, sealed.data(), sealed.size());
     }
 }
 
@@ -275,7 +389,6 @@ void ReplicationManager::tick(float /*deltaTime*/) {
             if (ReflectSerializer::serializeObject(e.type, e.obj, netId, body)) {
                 frameKind = FrameKind::Full;
             }
-            e._initialized = true;
         }
         else if (!dirtyIndices.empty()) {
             body.writeUInt16(kMsgTypeDelta);
@@ -283,12 +396,7 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                 frameKind = FrameKind::Delta;
             }
         }
-        // else: steady state — frameKind stays None.
 
-        // R4.1: emit + onPreReplicate 真实调用 (R4.0 路径未做 per-conn
-        // filtering 也未 fire extension)。当前 commit 只接通 post-fire
-        // (per-obj 一次) + 走 R4.0 单 broadcast 路径；per-conn filtering
-        // 留 commit 5 (NetObjectLocation + distance cull)。
         if (frameKind != FrameKind::None) {
             const uint8_t channel = (frameKind == FrameKind::Full) ? CHANNEL_RELIABLE : CHANNEL_UNRELIABLE;
             const uint16_t envMsgType = (frameKind == FrameKind::Full) ? kMsgTypeReplication : kMsgTypeDelta;
@@ -297,23 +405,20 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                 envMsgType, kSchemaVersion,
                 channel, /*flags=*/ 0, /*timestampMs=*/ 0,
                 /*compress=*/ false);
-            if (_broadcastSink) _broadcastSink(channel, sealed.data(), sealed.size());
-            else                _network->broadcast(channel, sealed.data(), sealed.size());
-
-            // Update hash baseline to current values so subsequent ticks
-            // only emit Delta for fields that change AGAIN.
-            if (frameKind == FrameKind::Full) {
-                e._fieldHashes = currentHashes;
-            } else {
-                for (uint32_t k : dirtyIndices) e._fieldHashes[k] = currentHashes[k];
+            const bool delivered = sendSealedToTargets(
+                e.obj, e.type, netId, e._location, e._hasLocation,
+                channel, sealed.data(), sealed.size());
+            if (delivered) {
+                if (frameKind == FrameKind::Full) {
+                    e._initialized = true;
+                    e._fieldHashes = currentHashes;
+                } else {
+                    for (uint32_t k : dirtyIndices) e._fieldHashes[k] = currentHashes[k];
+                }
+                if (_extension) {
+                    _extension->onPostReplicate(e.obj, e.type, netId);
+                }
             }
-        }
-
-        // R4.1: fire onPostReplicate per replicated object AFTER emit (no
-        // failure detection — emit is fire-and-forget to GNS). Default
-        // impl is no-op. Extension can log/inspect the (obj, type, netId).
-        if (_extension && (frameKind != FrameKind::None)) {
-            _extension->onPostReplicate(e.obj, e.type, netId);
         }
     }
 }

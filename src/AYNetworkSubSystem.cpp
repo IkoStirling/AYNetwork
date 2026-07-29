@@ -390,6 +390,7 @@ public:
     // ===== 扩展点 =====
     void setExtension(INetworkExtension* ext) override {
         _extension = ext;
+        _replicationManager.setExtension(ext);
     }
 
     // ===== Replication =====

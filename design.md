@@ -54,7 +54,7 @@ Foundation Layers
 | 状态同步 | ✅ R3 Full/Delta + Subsystem demux (R4.1-A) | ✅ | ✅ | ✅ | P0 |
 | RPC 调用 | ✅ R4.0 Handler + Subsystem sendTo (R4.1-A) | ✅ | ✅ | ✅ | P0 |
 | 增量同步 | ✅ R3.1 Delta (CRC32C dirty) | ✅ | ⚠️ | ✅ | P2 done |
-| Interest Management | ❌ **R4.1-B 冻结** | ✅ | ⚠️ | ✅ | P3 |
+| Interest Management | ⚠ R4.1-B 进行中 | ✅ | ⚠️ | ✅ | P3 |
 | Authority 模型 | ✅ Server/ListenServer gate + Subsystem 接线 (R4.1-A) | ✅ | ✅ | ✅ | P0 |
 | 加密（DTLS/AES） | ✅ 由 GNS 提供（应用层不重复） | ✅ | ✅ | ✅ | P0 |
 
@@ -619,7 +619,7 @@ AYNetwork
 | `INetworkSubSystem::getRpcHandler()` | ✅ | 单一 RpcHandler 引用，AYNetworkSubSystem ctor 持有 |
 | `RpcHandler::emit` → `sendTo` / `broadcast` 分流 | ✅ R4.1-A | `callClient` → `sendTo`；Client → `send()`；Server → `broadcast()` |
 | Handler 传入真实 `NetConnection* from` | ✅ R4.1-A | per-conn `NetConnectionImpl` on adopt + client connect |
-| `Interest Management (Relevancy + distance culling)` | ❌ | **R4.1-B** — R4.1-A 已 ship，Interest 归 B 主线 |
+| `Interest Management (Relevancy + distance culling)` | ✅ R4.1-B | `NetVec3` + `setInterestRadius` + `isRelevant` + per-conn `sendTo` |
 | Per-field RepNotify callback (Unreal `OnRep_X`) | ❌ | **R4.1-B 冻结** |
 | Multicast RPC for unregistered types / wildcard | ❌ | **R4.1-B+ 冻结** |
 
