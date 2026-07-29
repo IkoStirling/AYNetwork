@@ -1,6 +1,6 @@
 // AYTest_RpcHandler.cpp - R4.0 RPC dispatcher + 4-channel + Validator tests
 //
-// R4.0 (2026-07-29): 18 cases total (10 pure + 5 e2e + 3 regression).
+// R4.0 (2026-07-29): 22 cases total (12 pure + 7 e2e + 3 regression).
 // Reuses the R3.2 fixture pattern (TypeInfoImpl<T> + addMethod for
 // RPC metadata). Adds a hand-rolled RpcMethodInfoImpl<R(Args...)>
 // template so test fixtures can register Server/Client/Multicast
@@ -508,10 +508,55 @@ TEST_CASE(PendingCallExhaustsRetries) {
     CHECK_INT_EQ(emitCount.load(), 3);
     CHECK(!h.hasPending(callId));
 }
+
+TEST_CASE(RegisterWildcardMulticastRejectsUnknownType) {
+    ayt::test::setCurrentCase("RegisterWildcardMulticastRejectsUnknownType");
+    RpcHandler h(nullptr);
+    static PlayerRpcReceiver recv;
+    CHECK(!h.registerWildcardMulticast("NoSuchRpcType", &recv));
+}
+
+TEST_CASE(WildcardMulticastInboundWithoutRegisterMethod) {
+    ayt::test::setCurrentCase("WildcardMulticastInboundWithoutRegisterMethod");
+    RpcHandler h(nullptr);
+    h.setModeForTesting(ayt::net::ConnectionMode::Client);
+    static PlayerRpcReceiver recv;
+    g_activeReceiver = &recv;
+    CHECK(h.registerWildcardMulticast("PlayerRpc", &recv));
+    CHECK(h.methodsByHash().empty());
+
+    auto& reg = ayt::reflect::TypeRegistryImpl::instance();
+    auto* typeInfo = reg.findType("PlayerRpc");
+    CHECK(typeInfo != nullptr);
+    auto* methodInfo = typeInfo->findMethod("MulticastAnnounce");
+    CHECK(methodInfo != nullptr);
+
+    const char* nm = "MulticastAnnounce";
+    uint32_t h32 = 0x811C9DC5u;
+    for (const char* p = nm; *p; ++p) { h32 ^= static_cast<uint8_t>(*p); h32 *= 16777619u; }
+    const uint16_t methodHash = static_cast<uint16_t>(h32 & 0xFFFFu);
+
+    std::atomic<int> outboundFrames{0};
+    h.setBroadcastSinkForTesting([&](uint8_t, const void*, size_t) {
+        outboundFrames.fetch_add(1);
+    });
+
+    int32_t score = 123;
+    const void* args[1] = { &score };
+    const uint64_t callId = 0xABCDEF01ull;
+    BitStream body;
+    CHECK(RpcSerializer::writeRpcArgs(body, nullptr, methodInfo,
+                                      ayt::reflect::RpcKind::Multicast,
+                                      methodHash, callId, args, 1));
+    CHECK(h.onRpcRequest(body, nullptr));
+    CHECK_INT_EQ(recv.announceCalls.load(), 1);
+    CHECK_INT_EQ(recv.lastAnnounceScore.load(), 123);
+    CHECK_INT_EQ(outboundFrames.load(), 0);
+}
 TEST_SUITE_END
 
 // =============================================================================
-// E2E cases — 5 of them. Use the R3.2 E2EScaffold pattern, then add a
+// E2E cases — 7 of them. Use the R3.2 E2EScaffold pattern, then add a
 // simple stub INetworkSubSystem so the RpcHandler doesn't need a real one.
 // =============================================================================
 
@@ -727,6 +772,46 @@ TEST_CASE(UnreliableServerRpcOverGns) {
     const void* args[1] = { &amount };
     CHECK(s.serverRpc.callClient(0, "PlayerRpc", "ClientDamage", args, nullptr, 1, callId));
     CHECK_INT_EQ(s.lastServerChannel.load(), ayt::net::CHANNEL_UNRELIABLE);
+}
+
+TEST_CASE(WildcardMulticastOverGns) {
+    ayt::test::setCurrentCase("WildcardMulticastOverGns");
+    RpcE2EScaffold s;
+    g_activeReceiver = &s.clientReceiver;
+    CHECK(s.clientRpc.registerWildcardMulticast("PlayerRpc", &s.clientReceiver));
+
+    uint64_t callId = 0;
+    int32_t score = 42;
+    const void* args[1] = { &score };
+    CHECK(s.serverRpc.callMulticast("PlayerRpc", "MulticastAnnounce", args, nullptr, 1, callId));
+    CHECK_INT_EQ(s.clientReceiver.announceCalls.load(), 1);
+    CHECK_INT_EQ(s.clientReceiver.lastAnnounceScore.load(), 42);
+}
+
+TEST_CASE(WildcardMulticastNoResponseOnWire) {
+    ayt::test::setCurrentCase("WildcardMulticastNoResponseOnWire");
+    RpcE2EScaffold s;
+    g_activeReceiver = &s.clientReceiver;
+    CHECK(s.clientRpc.registerWildcardMulticast("PlayerRpc", &s.clientReceiver));
+
+    std::atomic<int> clientOutResponse{0};
+    s.clientRpc.setBroadcastSinkForTesting([&](uint8_t channel, const void* data, size_t size) {
+        auto decoded = ayt::net::PacketCodec::decode(
+            static_cast<const uint8_t*>(data), size);
+        if (decoded.ok && decoded.header.msgType == kMsgTypeRpcResponse) {
+            clientOutResponse.fetch_add(1);
+        }
+        RpcE2EScaffold::dispatchSealedTo(s.serverRpc, data, size);
+        s.lastClientChannel.store(channel);
+        s.clientRequestCount.fetch_add(1);
+    });
+
+    uint64_t callId = 0;
+    int32_t score = 7;
+    const void* args[1] = { &score };
+    CHECK(s.serverRpc.callMulticast("PlayerRpc", "MulticastAnnounce", args, nullptr, 1, callId));
+    CHECK_INT_EQ(s.clientReceiver.announceCalls.load(), 1);
+    CHECK_INT_EQ(clientOutResponse.load(), 0);
 }
 
 TEST_CASE(AuthorityGateRejectsRpc) {

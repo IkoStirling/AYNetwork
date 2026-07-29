@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -69,13 +70,17 @@ public:
     // into a freshly allocated `argBuf` buffer (caller frees after
     // invoking). Returns false on truncated / unknown-method / wire-
     // type-resolve failure.
+    // `fallbackLookup`: optional resolver when `methodHash` is absent from
+    // `methodsByHash` (R4.1-B wildcard Multicast).
+    using RpcMethodLookupFn = std::function<const ayt::reflect::IMethodInfo*(uint16_t methodHash)>;
     static bool readRpcArgs(BitStream& s,
                             const std::unordered_map<uint16_t, const ayt::reflect::IMethodInfo*>& methodsByHash,
                             ayt::reflect::RpcKind& rpcKindOut,
                             uint16_t& methodHashOut,
                             uint64_t& callIdOut,
                             const ayt::reflect::IMethodInfo*& methodInfoOut,
-                            std::vector<uint8_t>& argBufOut);
+                            std::vector<uint8_t>& argBufOut,
+                            RpcMethodLookupFn fallbackLookup = nullptr);
 
     // ===== Response body =====
     // Wire: [u64 callId][u8 hasReturn][u8 returnWid][return bytes]
@@ -145,6 +150,11 @@ public:
     // RpcKind is None, or `obj` is null.
     bool registerMethod(const char* typeName, const char* methodName, void* obj);
     void unregisterMethod(const char* typeName, const char* methodName);
+    // R4.1-B: bind a type-wide Multicast receiver without per-method
+    // registerMethod. Incoming Multicast RPCs resolve methods via
+    // TypeRegistry metadata + wildcard obj.
+    bool registerWildcardMulticast(const char* typeName, void* obj);
+    void unregisterWildcardMulticast(const char* typeName);
 
     // ===== Outbound call sites =====
     //
@@ -263,6 +273,13 @@ private:
     void drainAsyncRpcCompletions();
     void sendRpcResponse(uint64_t callId, NetConnection* from,
                          const ayt::reflect::IMethodInfo* methodInfo, const void* retPtr);
+    void emitRpcRejectIfTracked(ayt::reflect::RpcKind rpcKind, uint64_t callId,
+                                RpcRejectReason reason, NetConnection* from);
+    const ayt::reflect::IMethodInfo* findWildcardMulticastMethod(uint16_t methodHash,
+                                                                 void*& outObj) const;
+    bool resolveInboundBinding(uint16_t methodHash,
+                               const ayt::reflect::IMethodInfo*& outInfo,
+                               void*& outObj) const;
     bool buildArgPtrTable(const ayt::reflect::IMethodInfo* methodInfo,
                           const std::vector<uint8_t>& argBuf,
                           std::vector<const void*>& argPtrsOut) const;
@@ -300,6 +317,7 @@ private:
     std::atomic<uint64_t> _nextCallId{1};
     std::unordered_map<uint16_t, const ayt::reflect::IMethodInfo*> _methodsByHash;
     std::unordered_map<uint16_t, void*>                            _objsByHash;
+    std::unordered_map<std::string, void*>                         _wildcardMulticastObjs;
 
     mutable std::mutex                       _pendingCallsMutex;
     std::unordered_map<uint64_t, PendingEntry> _pendingCalls;

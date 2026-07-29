@@ -59,6 +59,7 @@ public:
         std::vector<uint8_t> argBuf;
         uint64_t callId = 0;
         NetConnection* from = nullptr;
+        bool isMulticast = false;
     };
 
     struct Completion {
@@ -67,6 +68,7 @@ public:
         const ayt::reflect::ITypeInfo* returnType = nullptr;
         std::vector<uint8_t> returnBuf;
         bool hasReturn = false;
+        bool isMulticast = false;
     };
 
     void start(size_t workerCount) {
@@ -144,6 +146,7 @@ private:
             Completion completion;
             completion.callId = job.callId;
             completion.from = job.from;
+            completion.isMulticast = job.isMulticast;
             if (!job.methodInfo || !job.obj) {
                 completion.hasReturn = false;
             } else {
@@ -236,7 +239,8 @@ bool RpcSerializer::readRpcArgs(BitStream& s,
                                 uint16_t& methodHashOut,
                                 uint64_t& callIdOut,
                                 const ayt::reflect::IMethodInfo*& methodInfoOut,
-                                std::vector<uint8_t>& argBufOut) {
+                                std::vector<uint8_t>& argBufOut,
+                                RpcMethodLookupFn fallbackLookup) {
     rpcKindOut   = ayt::reflect::RpcKind::None;
     methodHashOut = 0;
     callIdOut    = 0;
@@ -258,8 +262,13 @@ bool RpcSerializer::readRpcArgs(BitStream& s,
     (void)s.readUInt8(); // reserved
 
     auto it = methodsByHash.find(methodHashOut);
-    if (it == methodsByHash.end()) { methodInfoOut = nullptr; return false; }
-    methodInfoOut = it->second;
+    if (it != methodsByHash.end()) {
+        methodInfoOut = it->second;
+    } else if (fallbackLookup) {
+        methodInfoOut = fallbackLookup(methodHashOut);
+    } else {
+        methodInfoOut = nullptr;
+    }
     if (!methodInfoOut) return false;
     if (methodInfoOut->getParamCount() != argCount) return false;
 
@@ -438,9 +447,68 @@ bool RpcHandler::registerMethod(const char* typeName, const char* methodName, vo
 
 void RpcHandler::unregisterMethod(const char* typeName, const char* methodName) {
     if (!typeName || !methodName) return;
+    (void)typeName;
     const uint16_t h = fnv1a16(methodName);
     _methodsByHash.erase(h);
     _objsByHash.erase(h);
+}
+
+bool RpcHandler::registerWildcardMulticast(const char* typeName, void* obj) {
+    if (!typeName || !obj) return false;
+    auto& reg = ayt::reflect::TypeRegistryImpl::instance();
+    if (!reg.findType(typeName)) return false;
+    _wildcardMulticastObjs[typeName] = obj;
+    return true;
+}
+
+void RpcHandler::unregisterWildcardMulticast(const char* typeName) {
+    if (!typeName) return;
+    _wildcardMulticastObjs.erase(typeName);
+}
+
+const ayt::reflect::IMethodInfo* RpcHandler::findWildcardMulticastMethod(uint16_t methodHash,
+                                                                         void*& outObj) const {
+    outObj = nullptr;
+    auto& reg = ayt::reflect::TypeRegistryImpl::instance();
+    for (const auto& kv : _wildcardMulticastObjs) {
+        ayt::reflect::ITypeInfo* typeInfo = reg.findType(kv.first.c_str());
+        if (!typeInfo) continue;
+        const uint32_t methodCount = static_cast<uint32_t>(typeInfo->getMethodCount());
+        for (uint32_t i = 0; i < methodCount; ++i) {
+            const ayt::reflect::IMethodInfo* method = typeInfo->getMethod(i);
+            if (!method) continue;
+            if (method->getRpcKind() != ayt::reflect::RpcKind::Multicast) continue;
+            if (fnv1a16(method->getName()) != methodHash) continue;
+            outObj = kv.second;
+            return method;
+        }
+    }
+    return nullptr;
+}
+
+bool RpcHandler::resolveInboundBinding(uint16_t methodHash,
+                                       const ayt::reflect::IMethodInfo*& outInfo,
+                                       void*& outObj) const {
+    outInfo = nullptr;
+    outObj = nullptr;
+    const auto methodIt = _methodsByHash.find(methodHash);
+    if (methodIt != _methodsByHash.end()) {
+        outInfo = methodIt->second;
+        const auto objIt = _objsByHash.find(methodHash);
+        if (objIt == _objsByHash.end() || objIt->second == nullptr) return false;
+        outObj = objIt->second;
+        return true;
+    }
+    outInfo = findWildcardMulticastMethod(methodHash, outObj);
+    return outInfo != nullptr && outObj != nullptr;
+}
+
+void RpcHandler::emitRpcRejectIfTracked(ayt::reflect::RpcKind rpcKind, uint64_t callId,
+                                        RpcRejectReason reason, NetConnection* from) {
+    if (rpcKind == ayt::reflect::RpcKind::Multicast) return;
+    BitStream rejectBody;
+    RpcSerializer::writeRpcReject(rejectBody, callId, reason);
+    (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
 }
 
 bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream& body,
@@ -515,6 +583,7 @@ void RpcHandler::drainAsyncRpcCompletions() {
     if (!_asyncPool) return;
     RpcAsyncPool::Completion completion;
     while (_asyncPool->tryPopCompletion(completion)) {
+        if (completion.isMulticast) continue;
         if (completion.hasReturn && completion.returnType && !completion.returnBuf.empty()) {
             BitStream respBody;
             RpcSerializer::writeRpcResponse(respBody, completion.returnType, completion.callId,
@@ -769,9 +838,6 @@ bool RpcHandler::callMulticast(const char* typeName, const char* methodName,
 }
 
 bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
-    // Callers may hand us a stream still positioned after writes (pure
-    // unit tests build request bodies inline). Inbound handlers always
-    // read from the start of the RpcCallFrame payload.
     body.resetForRead();
 
     ayt::reflect::RpcKind rpcKind;
@@ -780,81 +846,60 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
     const ayt::reflect::IMethodInfo* methodInfo = nullptr;
     std::vector<uint8_t> argBuf;
 
+    const auto wildcardLookup = [this](uint16_t hash) -> const ayt::reflect::IMethodInfo* {
+        void* obj = nullptr;
+        return findWildcardMulticastMethod(hash, obj);
+    };
+
     if (!RpcSerializer::readRpcArgs(body, _methodsByHash,
                                     rpcKind, methodHash, callId,
-                                    methodInfo, argBuf)) {
-        // Unknown method or parse fail → reject (best-effort) and report failure.
-        BitStream rejectBody;
-        RpcSerializer::writeRpcReject(rejectBody,
-            (callId != 0 ? callId : 0),
-            (methodInfo == nullptr ? RpcRejectReason::UnknownMethod : RpcRejectReason::ParseFail));
-        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+                                    methodInfo, argBuf, wildcardLookup)) {
+        const RpcRejectReason reason =
+            (methodInfo == nullptr ? RpcRejectReason::UnknownMethod : RpcRejectReason::ParseFail);
+        emitRpcRejectIfTracked(rpcKind, callId != 0 ? callId : 0, reason, from);
         return false;
     }
 
     if (!methodInfo) {
-        // readRpcArgs returned true-ish layout but no method binding —
-        // treat as UnknownMethod.
-        BitStream rejectBody;
-        RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::UnknownMethod);
-        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+        emitRpcRejectIfTracked(rpcKind, callId, RpcRejectReason::UnknownMethod, from);
         return false;
     }
 
-    // Authority gate: Server RPCs are handled only on authority endpoints;
-    // Client RPCs only on client endpoints. Mis-directed frames are rejected.
     const ConnectionMode mode = getEffectiveMode();
     if (rpcKind == ayt::reflect::RpcKind::Server) {
         if (mode != ConnectionMode::Server && mode != ConnectionMode::ListenServer) {
-            BitStream rejectBody;
-            RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::NotAuthority);
-            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+            emitRpcRejectIfTracked(rpcKind, callId, RpcRejectReason::NotAuthority, from);
             return false;
         }
     } else if (rpcKind == ayt::reflect::RpcKind::Client) {
         if (mode != ConnectionMode::Client) {
-            BitStream rejectBody;
-            RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::NotAuthority);
-            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+            emitRpcRejectIfTracked(rpcKind, callId, RpcRejectReason::NotAuthority, from);
             return false;
         }
     }
 
-    // Bind the receiver instance for the (methodHash) binding.
-    auto objIt = _objsByHash.find(methodHash);
-    if (objIt == _objsByHash.end() || objIt->second == nullptr) {
-        BitStream rejectBody;
-        RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::UnknownMethod);
-        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+    void* obj = nullptr;
+    if (!resolveInboundBinding(methodHash, methodInfo, obj)) {
+        emitRpcRejectIfTracked(rpcKind, callId, RpcRejectReason::UnknownMethod, from);
         return false;
     }
-    void* obj = objIt->second;
 
     if (!methodInfo->validate(obj)) {
-        BitStream rejectBody;
-        RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::ValidatorDeny);
-        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+        emitRpcRejectIfTracked(rpcKind, callId, RpcRejectReason::ValidatorDeny, from);
         return false;
     }
 
-    // Deserialize the arg bytes into a call-ready args[] table. The
-    // per-position layout in argBuf is determined by the order written
-    // by RpcSerializer::writeRpcArgs — argBuf[0..argSize0) is arg 0,
-    // argBuf[argSize0..argSize0+argSize1) is arg 1, etc.
-    const size_t argCount = methodInfo->getParamCount();
-    std::vector<const void*> argPtrs(argCount);
+    std::vector<const void*> argPtrs;
     if (!buildArgPtrTable(methodInfo, argBuf, argPtrs)) {
-        BitStream rejectBody;
-        RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::ParseFail);
-        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+        emitRpcRejectIfTracked(rpcKind, callId, RpcRejectReason::ParseFail, from);
         return false;
     }
+
+    const bool isMulticast = (rpcKind == ayt::reflect::RpcKind::Multicast);
 
     if (methodInfo->isAsync()) {
         if (!_asyncPool) {
-            BitStream rejectBody;
-            RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::UnknownMethod);
-            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody, from);
+            emitRpcRejectIfTracked(rpcKind, callId, RpcRejectReason::UnknownMethod, from);
             return false;
         }
         RpcAsyncPool::Job job;
@@ -863,14 +908,15 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
         job.argBuf = std::move(argBuf);
         job.callId = callId;
         job.from = from;
+        job.isMulticast = isMulticast;
         _asyncPool->submit(std::move(job));
         return true;
     }
 
     const void* retPtr = methodInfo->invoke(obj, argPtrs.data());
-    sendRpcResponse(callId, from, methodInfo, retPtr);
-
-    (void)rpcKind;
+    if (!isMulticast) {
+        sendRpcResponse(callId, from, methodInfo, retPtr);
+    }
     return true;
 }
 
