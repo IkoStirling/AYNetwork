@@ -1,0 +1,541 @@
+// RpcHandler.cpp - R4.0 RPC dispatcher implementation
+//
+// R4.0 (2026-07-29): Routes envelope msgType 0x0010/0x0011/0x0012
+// between AYNetworkSubSystem and AYReflect-decorated methods on
+// registered instances. Parameter (de)serialization reuses the R3.2
+// writeWireValue / readWireValue recursive 16-WireTypeId dispatch.
+//
+// See design.md §13 R4 checklist and design.md §10 Phase 4.
+
+#include <RPC/RpcHandler.h>
+
+#include <Replication/ReflectSerializer.h>
+#include <Protocol/PacketCodec.h>
+#include <Transport/GnsConnection.h>
+
+#include <ayreflect/IReflect.h>
+#include <ayreflect/ReflectRegistry.h>
+
+#include <cstring>
+#include <cstdio>
+
+namespace ayt::net
+{
+
+namespace {
+
+// FNV-1a 32-bit hash of a C-string. Returns the low 16 bits so the
+// resulting slot fits in the wire's two-byte methodHash / fieldNameHash
+// discriminator. Reuses the same hash as ReflectSerializer::hashFieldName
+// (R3.0) — collisions are tolerable since Reflection annotations are
+// closed and small.
+inline uint16_t fnv1a16(const char* s) {
+    if (!s) return 0;
+    uint32_t h = 0x811C9DC5u;
+    while (*s) {
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 16777619u;
+    }
+    return static_cast<uint16_t>(h & 0xFFFFu);
+}
+
+} // anonymous namespace
+
+// =============================================================================
+// RpcSerializer implementation
+// =============================================================================
+
+bool RpcSerializer::writeRpcArgs(BitStream& s,
+                                 const ayt::reflect::ITypeInfo* /*returnType*/,
+                                 const ayt::reflect::IMethodInfo* methodInfo,
+                                 ayt::reflect::RpcKind rpcKind,
+                                 uint16_t methodHash,
+                                 uint64_t callId,
+                                 const void* const* args,
+                                 size_t argCount) {
+    if (!methodInfo) return false;
+    const size_t methodParamCount = methodInfo->getParamCount();
+    if (methodParamCount != argCount) return false;
+
+    // RpcCallFrame header
+    s.writeUInt8(static_cast<uint8_t>(rpcKind));
+    s.writeUInt16(methodHash);
+    // callId written as 8 little-endian bytes (BitStream has no u64 helper).
+    for (int i = 0; i < 8; ++i) s.writeUInt8(static_cast<uint8_t>(callId >> (i * 8)));
+    s.writeUInt8(static_cast<uint8_t>(argCount));
+    s.writeUInt8(0); // reserved
+
+    for (size_t i = 0; i < argCount; ++i) {
+        const char* argName = methodInfo->getParamName(i);
+        uint16_t    nameHash = fnv1a16(argName ? argName : "");
+        // Fallback: when argName is empty (default IMethodInfo impl),
+        // hash positional index so the slot is still unique across args.
+        if (nameHash == 0) {
+            nameHash = static_cast<uint16_t>(fnv1a16("arg") ^ static_cast<uint16_t>(i));
+        }
+        s.writeUInt16(nameHash);
+
+        const ayt::reflect::ITypeInfo* argType = methodInfo->getParamType(i);
+        WireTypeId wid;
+        if (!ReflectSerializer::resolveWireTypeId(argType, wid)) {
+            // Unknown arg type — can't serialize, but frame already started.
+            // Wrap an error into the byte stream: pad with explicit garbage
+            // wid=255 (WireTypeId cast to uint8_t) so the receiver's
+            // deserialize fails. R4.0 receivers see a parse fail and drop.
+            s.writeUInt8(255);
+            return false;
+        }
+        s.writeUInt8(static_cast<uint8_t>(wid));
+        if (!ReflectSerializer::writeWireValue(s, wid, argType, args ? args[i] : nullptr)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool RpcSerializer::readRpcArgs(BitStream& s,
+                                const std::unordered_map<uint16_t, const ayt::reflect::IMethodInfo*>& methodsByHash,
+                                ayt::reflect::RpcKind& rpcKindOut,
+                                uint16_t& methodHashOut,
+                                uint64_t& callIdOut,
+                                const ayt::reflect::IMethodInfo*& methodInfoOut,
+                                std::vector<uint8_t>& argBufOut) {
+    rpcKindOut   = ayt::reflect::RpcKind::None;
+    methodHashOut = 0;
+    callIdOut    = 0;
+    methodInfoOut = nullptr;
+    argBufOut.clear();
+
+    // RpcCallFrame header
+    if (s.getBitPosition() + 8 > s.getBitCount()) return false;
+    rpcKindOut   = static_cast<ayt::reflect::RpcKind>(s.readUInt8());
+    if (s.getBitPosition() + 16 > s.getBitCount()) return false;
+    methodHashOut = s.readUInt16();
+    if (s.getBitPosition() + 64 > s.getBitCount()) return false;
+    callIdOut = 0;
+    for (int i = 0; i < 8; ++i) {
+        callIdOut |= (static_cast<uint64_t>(s.readUInt8()) << (i * 8));
+    }
+    if (s.getBitPosition() + 16 > s.getBitCount()) return false;
+    const uint8_t argCount = s.readUInt8();
+    (void)s.readUInt8(); // reserved
+
+    auto it = methodsByHash.find(methodHashOut);
+    if (it == methodsByHash.end()) { methodInfoOut = nullptr; return false; }
+    methodInfoOut = it->second;
+    if (!methodInfoOut) return false;
+    if (methodInfoOut->getParamCount() != argCount) return false;
+
+    // Reuse R3.2 readWireValue for each arg. The arg buffer is a
+    // contiguous blob where each arg occupies `getParamType(i)->getSize()`
+    // bytes (size known up-front because R3.0/3.1 fields are
+    // trivially-copyable types; struct args arrived in R3.2 with size
+    // returned from ITypeInfo). Allocation strategy: sum sizes,
+    // allocate once, then point each `args[i]` slot at the
+    // appropriate offset.
+    //
+    // For R4.0 simplicity we instead allocate one buffer per arg and
+    // concatenate — the args[] table that's handed to invoke() then
+    // points into the heap-allocated argBuf vector.
+    argBufOut.clear();
+    argBufOut.reserve(256); // typical small RPC
+    std::vector<const void*> argPtrs;
+    argPtrs.reserve(argCount);
+    for (size_t i = 0; i < argCount; ++i) {
+        if (s.getBitPosition() + 16 > s.getBitCount()) return false;
+        (void)s.readUInt16(); // argNameHash — accepted blindly; the
+                              // receiver already trusts the registered
+                              // methods' IMethodInfo* signature to
+                              // disambiguate which position the value
+                              // lands in.
+        if (s.getBitPosition() + 8 > s.getBitCount()) return false;
+        const uint8_t widByte = s.readUInt8();
+        WireTypeId wid = static_cast<WireTypeId>(widByte);
+        const ayt::reflect::ITypeInfo* argType = methodInfoOut->getParamType(i);
+        if (widByte == 255) return false; // sender signaled parse fail
+        // readWireValue mutates `&argBufOut[slotStart]`. We grow the
+        // buffer and align writes to the type's size.
+        const size_t argSize = argType ? argType->getSize() : 0;
+        const size_t slotStart = argBufOut.size();
+        argBufOut.resize(slotStart + argSize + sizeof(uint64_t) /*alignment pad*/);
+        if (!ReflectSerializer::readWireValue(s, wid, argType, &argBufOut[slotStart])) {
+            return false;
+        }
+        argPtrs.push_back(&argBufOut[slotStart]);
+    }
+    return true;
+}
+
+bool RpcSerializer::writeRpcResponse(BitStream& s,
+                                     const ayt::reflect::ITypeInfo* returnType,
+                                     uint64_t callId,
+                                     const void* returnValue) {
+    for (int i = 0; i < 8; ++i) s.writeUInt8(static_cast<uint8_t>(callId >> (i * 8)));
+    const bool hasReturn = (returnType != nullptr && returnValue != nullptr);
+    s.writeUInt8(hasReturn ? 1 : 0);
+    if (!hasReturn) return true;
+    WireTypeId wid;
+    if (!ReflectSerializer::resolveWireTypeId(returnType, wid)) return false;
+    s.writeUInt8(static_cast<uint8_t>(wid));
+    return ReflectSerializer::writeWireValue(s, wid, returnType, returnValue);
+}
+
+bool RpcSerializer::readRpcResponse(BitStream& s,
+                                    uint64_t& callIdOut,
+                                    bool& hasReturnOut,
+                                    WireTypeId& returnWidOut,
+                                    std::vector<uint8_t>& returnBufOut) {
+    callIdOut    = 0;
+    hasReturnOut = false;
+    returnWidOut = WireTypeId::Bool;
+    returnBufOut.clear();
+
+    if (s.getBitPosition() + 8 > s.getBitCount()) return false;
+    callIdOut = 0;
+    for (int i = 0; i < 8; ++i) {
+        callIdOut |= (static_cast<uint64_t>(s.readUInt8()) << (i * 8));
+    }
+    if (s.getBitPosition() + 8 > s.getBitCount()) return false;
+    hasReturnOut = (s.readUInt8() != 0);
+    if (!hasReturnOut) return true;
+    if (s.getBitPosition() + 8 > s.getBitCount()) return false;
+    returnWidOut = static_cast<WireTypeId>(s.readUInt8());
+    // Allocate space for the return value — caller already knows the type
+    // via the registered IMethodInfo::getReturnType(). We can't know the
+    // size here without the registry; embed returnBufOut sizing in the
+    // caller. For R4.0 simplicity we read into a placeholder — caller
+    // uses the unwrapped bytes directly.
+    returnBufOut.resize(256);
+    return ReflectSerializer::readWireValue(s, returnWidOut, nullptr /*fallback*/, &returnBufOut[0]);
+}
+
+bool RpcSerializer::writeRpcReject(BitStream& s, uint64_t callId, RpcRejectReason reason) {
+    for (int i = 0; i < 8; ++i) s.writeUInt8(static_cast<uint8_t>(callId >> (i * 8)));
+    s.writeUInt8(static_cast<uint8_t>(reason));
+    return true;
+}
+
+bool RpcSerializer::readRpcReject(BitStream& s, uint64_t& callIdOut, RpcRejectReason& reasonOut) {
+    callIdOut = 0;
+    reasonOut = RpcRejectReason::UnknownMethod;
+    if (s.getBitPosition() + 16 > s.getBitCount()) return false;
+    callIdOut = 0;
+    for (int i = 0; i < 8; ++i) {
+        callIdOut |= (static_cast<uint64_t>(s.readUInt8()) << (i * 8));
+    }
+    if (s.getBitPosition() + 8 > s.getBitCount()) return false;
+    reasonOut = static_cast<RpcRejectReason>(s.readUInt8());
+    return true;
+}
+
+// =============================================================================
+// RpcHandler implementation
+// =============================================================================
+
+RpcHandler::RpcHandler(INetworkSubSystem* network)
+    : _network(network)
+{
+}
+
+RpcHandler::~RpcHandler() {
+    // Locked access for the destructor: trivial since the handler's owner
+    // (AYNetworkSubSystem) is single-threaded by design. Pending callbacks
+    // are dropped; clients must drain their own state before destroying
+    // the subsystem.
+    _pendingCalls.clear();
+}
+
+bool RpcHandler::resolveMethod(const char* typeName, const char* methodName,
+                               const ayt::reflect::IMethodInfo*& outInfo,
+                               void*& outObj,
+                               uint16_t& outHash) const {
+    outInfo = nullptr;
+    outObj  = nullptr;
+    outHash = 0;
+    if (!typeName || !methodName) return false;
+
+    // Locate the ITypeInfo* by string name in the global registry.
+    auto& reg = ayt::reflect::TypeRegistryImpl::instance();
+    auto* typeInfo = reg.findType(typeName);
+    if (!typeInfo) return false;
+    auto* methodInfo = typeInfo->findMethod(methodName);
+    if (!methodInfo) return false;
+    if (methodInfo->getRpcKind() == ayt::reflect::RpcKind::None) return false;
+
+    const uint16_t h = fnv1a16(methodName);
+    outInfo = methodInfo;
+    outHash = h;
+    // Outbound callServer/callClient/callMulticast only need registry
+    // metadata to serialize args — the receiver's registerMethod() binds
+    // the handler object. Requiring a local _objsByHash entry on the caller
+    // made client→server RPC impossible (E2E ServerRpcHappyPath).
+    auto it = _objsByHash.find(h);
+    outObj = (it != _objsByHash.end()) ? it->second : nullptr;
+    return true;
+}
+
+bool RpcHandler::registerMethod(const char* typeName, const char* methodName, void* obj) {
+    if (!typeName || !methodName || !obj) return false;
+
+    auto& reg = ayt::reflect::TypeRegistryImpl::instance();
+    auto* typeInfo = reg.findType(typeName);
+    if (!typeInfo) return false;
+    auto* methodInfo = typeInfo->findMethod(methodName);
+    if (!methodInfo) return false;
+    if (methodInfo->getRpcKind() == ayt::reflect::RpcKind::None) return false;
+
+    const uint16_t h = fnv1a16(methodName);
+    if (_methodsByHash.find(h) != _methodsByHash.end()) {
+        // Duplicate registration — leave the existing binding (callers
+        // must call unregisterMethod first). Returning false surfaces the
+        // misuse loudly in tests.
+        return false;
+    }
+    _methodsByHash[h] = methodInfo;
+    _objsByHash[h]    = obj;
+    return true;
+}
+
+void RpcHandler::unregisterMethod(const char* typeName, const char* methodName) {
+    if (!typeName || !methodName) return;
+    const uint16_t h = fnv1a16(methodName);
+    _methodsByHash.erase(h);
+    _objsByHash.erase(h);
+}
+
+bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream& body) {
+    if (!_network && !_broadcastSink) return false;
+    std::vector<uint8_t> sealed = PacketCodec::encode(
+        static_cast<const uint8_t*>(body.getData()), body.getSize(),
+        envelopeMsgType, kSchemaVersion,
+        channel, /*flags=*/ 0, /*timestampMs=*/ 0, /*compress=*/ false);
+    if (_broadcastSink) {
+        _broadcastSink(channel, sealed.data(), sealed.size());
+        return true;
+    }
+    if (_network) {
+        _network->broadcast(channel, sealed.data(), sealed.size());
+        return true;
+    }
+    return false;
+}
+
+bool RpcHandler::callServer(const char* typeName, const char* methodName,
+                            const void* const* args, const char* const* argNames,
+                            size_t argCount, uint64_t& outCallId) {
+    outCallId = 0;
+    const ayt::reflect::IMethodInfo* methodInfo = nullptr;
+    void* obj = nullptr;
+    uint16_t hash = 0;
+    if (!resolveMethod(typeName, methodName, methodInfo, obj, hash)) return false;
+    if (!methodInfo) return false;
+    if (methodInfo->getRpcKind() != ayt::reflect::RpcKind::Server) return false;
+
+    outCallId = _nextCallId.fetch_add(1, std::memory_order_relaxed);
+    BitStream body;
+    (void)argNames; // R4.0: rely on IMethodInfo::getParamName; argNames
+                    // is a future extension point for ad-hoc naming
+                    // that conflicts with methodInfo metadata.
+    if (!RpcSerializer::writeRpcArgs(body, nullptr,
+                                     methodInfo,
+                                     ayt::reflect::RpcKind::Server,
+                                     hash, outCallId, args, argCount)) {
+        return false;
+    }
+    const uint8_t channel = methodInfo->isUnreliable() ? CHANNEL_UNRELIABLE : CHANNEL_RELIABLE;
+    return emit(channel, kMsgTypeRpcRequest, body);
+}
+
+bool RpcHandler::callClient(uint32_t targetNetId, const char* typeName, const char* methodName,
+                            const void* const* args, const char* const* argNames,
+                            size_t argCount, uint64_t& outCallId) {
+    outCallId = 0;
+    const ayt::reflect::IMethodInfo* methodInfo = nullptr;
+    void* obj = nullptr;
+    uint16_t hash = 0;
+    if (!resolveMethod(typeName, methodName, methodInfo, obj, hash)) return false;
+    if (!methodInfo) return false;
+    if (methodInfo->getRpcKind() != ayt::reflect::RpcKind::Client) return false;
+    (void)targetNetId; // R4.0: targetNetId is the future sendTo() arg path
+
+    outCallId = _nextCallId.fetch_add(1, std::memory_order_relaxed);
+    BitStream body;
+    (void)argNames;
+    if (!RpcSerializer::writeRpcArgs(body, nullptr, methodInfo,
+                                     ayt::reflect::RpcKind::Client,
+                                     hash, outCallId, args, argCount)) {
+        return false;
+    }
+    const uint8_t channel = methodInfo->isUnreliable() ? CHANNEL_UNRELIABLE : CHANNEL_RELIABLE;
+    return emit(channel, kMsgTypeRpcRequest, body);
+}
+
+bool RpcHandler::callMulticast(const char* typeName, const char* methodName,
+                               const void* const* args, const char* const* argNames,
+                               size_t argCount, uint64_t& outCallId) {
+    outCallId = 0;
+    const ayt::reflect::IMethodInfo* methodInfo = nullptr;
+    void* obj = nullptr;
+    uint16_t hash = 0;
+    if (!resolveMethod(typeName, methodName, methodInfo, obj, hash)) return false;
+    if (!methodInfo) return false;
+    if (methodInfo->getRpcKind() != ayt::reflect::RpcKind::Multicast) return false;
+
+    outCallId = _nextCallId.fetch_add(1, std::memory_order_relaxed);
+    BitStream body;
+    (void)argNames;
+    if (!RpcSerializer::writeRpcArgs(body, nullptr, methodInfo,
+                                     ayt::reflect::RpcKind::Multicast,
+                                     hash, outCallId, args, argCount)) {
+        return false;
+    }
+    const uint8_t channel = methodInfo->isUnreliable() ? CHANNEL_UNRELIABLE : CHANNEL_RELIABLE;
+    return emit(channel, kMsgTypeRpcRequest, body);
+}
+
+bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
+    // Callers may hand us a stream still positioned after writes (pure
+    // unit tests build request bodies inline). Inbound handlers always
+    // read from the start of the RpcCallFrame payload.
+    body.resetForRead();
+
+    ayt::reflect::RpcKind rpcKind;
+    uint16_t methodHash;
+    uint64_t callId;
+    const ayt::reflect::IMethodInfo* methodInfo = nullptr;
+    std::vector<uint8_t> argBuf;
+
+    if (!RpcSerializer::readRpcArgs(body, _methodsByHash,
+                                    rpcKind, methodHash, callId,
+                                    methodInfo, argBuf)) {
+        // Unknown method or parse fail → reject (best-effort) and report failure.
+        BitStream rejectBody;
+        RpcSerializer::writeRpcReject(rejectBody,
+            (callId != 0 ? callId : 0),
+            (methodInfo == nullptr ? RpcRejectReason::UnknownMethod : RpcRejectReason::ParseFail));
+        (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+        return false;
+    }
+
+    if (!methodInfo) {
+        // readRpcArgs returned true-ish layout but no method binding —
+        // treat as UnknownMethod.
+        BitStream rejectBody;
+        RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::UnknownMethod);
+        return emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+    }
+
+    // Authority gate: Server RPCs are handled only on authority endpoints;
+    // Client RPCs only on client endpoints. Mis-directed frames are rejected.
+    const ConnectionMode mode = getEffectiveMode();
+    if (rpcKind == ayt::reflect::RpcKind::Server) {
+        if (mode != ConnectionMode::Server && mode != ConnectionMode::ListenServer) {
+            BitStream rejectBody;
+            RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::NotAuthority);
+            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+            return false;
+        }
+    } else if (rpcKind == ayt::reflect::RpcKind::Client) {
+        if (mode != ConnectionMode::Client) {
+            BitStream rejectBody;
+            RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::NotAuthority);
+            (void)emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+            return false;
+        }
+    }
+
+    // Bind the receiver instance for the (methodHash) binding.
+    auto objIt = _objsByHash.find(methodHash);
+    if (objIt == _objsByHash.end() || objIt->second == nullptr) {
+        BitStream rejectBody;
+        RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::UnknownMethod);
+        return emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+    }
+    void* obj = objIt->second;
+
+    if (!methodInfo->validate(obj)) {
+        BitStream rejectBody;
+        RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::ValidatorDeny);
+        return emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+    }
+
+    // Deserialize the arg bytes into a call-ready args[] table. The
+    // per-position layout in argBuf is determined by the order written
+    // by RpcSerializer::writeRpcArgs — argBuf[0..argSize0) is arg 0,
+    // argBuf[argSize0..argSize0+argSize1) is arg 1, etc.
+    const size_t argCount = methodInfo->getParamCount();
+    std::vector<const void*> argPtrs(argCount);
+    size_t offset = 0;
+    for (size_t i = 0; i < argCount; ++i) {
+        const ayt::reflect::ITypeInfo* argType = methodInfo->getParamType(i);
+        const size_t argSize = argType ? argType->getSize() : 0;
+        if (offset + argSize > argBuf.size()) {
+            // Parse fail — argBuf shorter than expected
+            BitStream rejectBody;
+            RpcSerializer::writeRpcReject(rejectBody, callId, RpcRejectReason::ParseFail);
+            return emit(CHANNEL_RELIABLE, kMsgTypeRpcReject, rejectBody);
+        }
+        argPtrs[i] = &argBuf[offset];
+        offset += argSize;
+    }
+
+    // Invoke. invoke() returns nullptr for void methods or a const void*
+    // into a thread-local buffer for primitive returns.
+    const void* retPtr = methodInfo->invoke(obj, argPtrs.data());
+
+    // Send Response (only if the method has a non-void return type).
+    BitStream respBody;
+    if (methodInfo->getReturnType() != nullptr) {
+        RpcSerializer::writeRpcResponse(respBody, methodInfo->getReturnType(), callId, retPtr);
+    } else {
+        RpcSerializer::writeRpcResponse(respBody, nullptr, callId, nullptr);
+    }
+    emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody);
+
+    (void)rpcKind;
+    (void)from;
+    return true;
+}
+
+bool RpcHandler::onRpcResponse(BitStream& body, NetConnection* from) {
+    body.resetForRead();
+    uint64_t callId;
+    bool hasReturn;
+    WireTypeId returnWid;
+    std::vector<uint8_t> returnBuf;
+    if (!RpcSerializer::readRpcResponse(body, callId, hasReturn, returnWid, returnBuf)) {
+        return false;
+    }
+    RpcCallback cb;
+    {
+        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+        auto it = _pendingCalls.find(callId);
+        if (it == _pendingCalls.end()) return false;
+        cb = std::move(it->second);
+        _pendingCalls.erase(it);
+    }
+    if (cb) cb(true, returnBuf.empty() ? nullptr : returnBuf.data());
+    (void)from;
+    return true;
+}
+
+bool RpcHandler::onRpcReject(BitStream& body, NetConnection* from) {
+    body.resetForRead();
+    uint64_t callId;
+    RpcRejectReason reason;
+    if (!RpcSerializer::readRpcReject(body, callId, reason)) return false;
+    RpcCallback cb;
+    {
+        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+        auto it = _pendingCalls.find(callId);
+        if (it == _pendingCalls.end()) return false;
+        cb = std::move(it->second);
+        _pendingCalls.erase(it);
+    }
+    (void)reason;
+    if (cb) cb(false, nullptr);
+    (void)from;
+    return true;
+}
+
+} // namespace ayt::net

@@ -387,12 +387,49 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
     return lastResult;
 }
 
-// R2: low-level GNS send. Maps channel -> GNS send flags. R4 will expand
-// to all 4 channels; R2 only distinguishes Reliable vs Unreliable.
+// R2: low-level GNS send. R4.0 (2026-07-29) expands the channel -> GNS
+// send-flag map to all 4 channels declared in IAYNetwork.h:39-42.
+//
+//   CHANNEL_RELIABLE   = 0  -> k_nSteamNetworkingSend_Reliable
+//                            (default — RPC default + Replication Full)
+//
+//   CHANNEL_UNRELIABLE = 1  -> k_nSteamNetworkingSend_Unreliable
+//                            (high-freq RPC + Replication Delta)
+//
+//   CHANNEL_FRAGMENTED = 2  -> k_nSteamNetworkingSend_Reliable
+//                            | k_nSteamNetworkingSend_NoNagle
+//                            (Nagle coalescing defeats multi-frame
+//                            payloads; Reliable+NoNagle keeps GNS
+//                            ordering without batching. PacketCodec
+//                            does the actual split via PacketAssembler.)
+//
+//   CHANNEL_ACK        = 3  -> k_nSteamNetworkingSend_Reliable
+//                            (R4.0 no-op marker; R4.1 will route
+//                            ACKs through a reserved short-payload
+//                            slot in GnsConnection.
+//
+// MSVC strict enum: do NOT do arithmetic on the GNS send-flag
+// constants — assign to `int flags` first then bitwise-OR.
 int GnsConnection::_rawSend(const uint8_t* data, uint32_t len, uint8_t channel) {
-    int flags = (channel == CHANNEL_UNRELIABLE)
-        ? k_nSteamNetworkingSend_Unreliable
-        : k_nSteamNetworkingSend_Reliable;   // 0, 2, 3 also Reliable until R4
+    int flags;
+    switch (channel) {
+        case CHANNEL_UNRELIABLE:
+            flags = k_nSteamNetworkingSend_Unreliable;
+            break;
+        case CHANNEL_FRAGMENTED:
+            flags = k_nSteamNetworkingSend_Reliable
+                  | k_nSteamNetworkingSend_NoNagle;
+            break;
+        case CHANNEL_ACK:
+            // R4.1: replace with explicit ACK pipeline + per-packet
+            // identity echo. For now ack frames ride CHANNEL_RELIABLE.
+            flags = k_nSteamNetworkingSend_Reliable;
+            break;
+        case CHANNEL_RELIABLE:
+        default:
+            flags = k_nSteamNetworkingSend_Reliable;
+            break;
+    }
     EResult r = s_gns->SendMessageToConnection(_conn, data, len, flags, nullptr);
     return (r == k_EResultOK) ? 0 : -1;
 }

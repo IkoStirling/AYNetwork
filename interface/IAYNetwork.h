@@ -32,6 +32,13 @@ class ReplicationManager;
 // themselves. AYNetwork's CMakeLists PUBLIC-links AYReflect so the include
 // path is available to consumers without extra setup.
 
+// R4.0 (2026-07-29): forward-declare RpcHandler — referenced by
+// INetworkSubSystem::getRpcHandler(). Same rule: consumers that need
+// the full type include <RPC/RpcHandler.h>. AYNetwork's CMakeLists
+// compiles RpcHandler.cpp into the same library so the link is
+// automatic.
+class RpcHandler;
+
 
 // =============================================================================
 // 常量
@@ -119,6 +126,20 @@ constexpr uint16_t kMsgTypeEntityDespawn = 0x0003;  // server → clients: unreg
 // doesn't need to distinguish; deserialization uses the same path. The only
 // difference is which fields are included (only dirty ones, not all).
 constexpr uint16_t kMsgTypeDelta        = 0x0004;  // server → clients: dirty-fields-only delta update (R3.1)
+
+// R4.0 (2026-07-29): RPC msgType namespace. 0x0005..0x000F reserved for
+// future R3.3 back-compat shadow; 0x0010..0x0012 carry the RPC
+// request / response / reject triplet. wire schemaVersion=1 unchanged
+// (R3.x receiver hits onPacketBody demux mismatch and silently drops
+// the frame — same drop semantics as R3.2 WireTypeId 12..15 nested).
+//
+// Direction in production:
+//   kMsgTypeRpcRequest  — caller → server (Server RPC) OR caller → 1 client (Client RPC) OR server → all clients (Multicast)
+//   kMsgTypeRpcResponse — RPC server → original caller (return value or void)
+//   kMsgTypeRpcReject   — RPC server → caller (validator deny / unknown method / parse fail)
+constexpr uint16_t kMsgTypeRpcRequest   = 0x0010;
+constexpr uint16_t kMsgTypeRpcResponse  = 0x0011;
+constexpr uint16_t kMsgTypeRpcReject    = 0x0012;
 
 // R2: schema version stamped into every PacketHeader. Bump on breaking
 // wire-format changes (rare; major version bumps imply a parallel header
@@ -211,6 +232,16 @@ public:
 
     // ===== Replication =====
     virtual ReplicationManager* getReplicationManager() = 0;
+
+    // ===== R4.0 RPC =====
+    // Owns the dispatcher for envelope msgType 0x0010..0x0012. Wired into
+    // AYNetworkSubSystem::update — when a sealed frame's
+    // PacketHeader.msgType matches a kMsgTypeRpc* slot, the subsystem hands
+    // the body to this RpcHandler instead of the ReplicationManager.
+    // Always non-null after R4.0 (subsystem ctors construct the
+    // RpcHandler in lock-step with the ReplicationManager). Returns the
+    // same instance for the lifetime of the subsystem.
+    virtual RpcHandler* getRpcHandler() = 0;
 };
 
 // =============================================================================

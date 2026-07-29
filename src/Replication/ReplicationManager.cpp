@@ -126,9 +126,18 @@ void ReplicationManager::unregisterObject(uint32_t netId) {
         BitStream body;
         body.writeUInt16(kMsgTypeEntityDespawn);
         ReflectSerializer::writeEntityDespawn(body, netId);
+        // R4.0 (2026-07-29) envelope fix: the wire envelope msgType
+        // now matches the body's inner msgType (kMsgTypeEntityDespawn).
+        // R3.2 used kMsgTypeReplication here — onReceive worked
+        // because all replication frames (Full / Delta / Spawn / Despawn)
+        // route through the same ReplicationManager::onReceive path
+        // which reads the *inner* msgType and dispatches, but the
+        // mismatch made routing in AYNetworkSubSystem::update
+        // ambiguous (the envelope vs the inner could disagree).
+        // After R4.0 a 0x0003 envelope routes back here reliably.
         std::vector<uint8_t> sealed = PacketCodec::encode(
             static_cast<const uint8_t*>(body.getData()), body.getSize(),
-            kMsgTypeReplication, kSchemaVersion,
+            kMsgTypeEntityDespawn, kSchemaVersion,
             CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
             /*compress=*/ false);
         if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());

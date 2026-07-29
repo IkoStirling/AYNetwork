@@ -15,6 +15,7 @@ set(SRC_FILES
     src/Replication/ReplicationManager.cpp
     src/Replication/ReplicationSystem.cpp
     src/Replication/ReflectSerializer.cpp
+    src/RPC/RpcHandler.cpp
 )
 
 # R1 (2026-07-26): wire up GameNetworkingSockets via vcpkg. See design.md §14.
@@ -70,6 +71,7 @@ target_include_directories(${MODULE_NAME} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Protocol
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Replication
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/RPC
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Transport
     ${CMAKE_CURRENT_SOURCE_DIR}/interface
     ${CMAKE_CURRENT_SOURCE_DIR}

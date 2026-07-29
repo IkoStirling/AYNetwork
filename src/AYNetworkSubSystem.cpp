@@ -3,6 +3,8 @@
 #include <AYNetwork.h>
 #include <AYGameLoop.h>
 #include <GnsConnection.h>
+#include <PacketCodec.h>
+#include <RPC/RpcHandler.h>
 // R1.A (2026-07-27): pull in EResult + AcceptConnection signature. The
 // GnsConnection.cpp TU-private includes are sufficient because s_gns is a
 // fully-typed pointer in this TU — we just need the constants.
@@ -232,9 +234,47 @@ public:
         // handler. The handler signature is (NetConnection*, channel, data, len)
         // — we pass nullptr for the NetConnection* in R1.A (R3 will wire up
         // proper wrappers).
+        //
+        // R4.0 (2026-07-29): pre-route by envelope PacketHeader.msgType before
+        // the channel handler fires. Rpc envelope kinds (0x0010..0x0012) go to
+        // _rpcHandler; replication envelope kinds (0x0001..0x0004) go to
+        // _replicationManager; everything else drops to the per-channel
+        // app-side MessageHandler. This pre-routing eliminates the need to
+        // teach every channel handler about RPC vs replication.
         auto route = [this, channel](const uint8_t* data, size_t len) {
-            if (_messageHandlers[channel]) {
-                _messageHandlers[channel](nullptr, channel, data, len);
+            // Peek at the PacketHeader.msgType without consuming the body.
+            // PacketCodec::decode returns {header, body, ok} and is the
+            // single source of truth for the wire envelope.
+            if (!data || len < PacketCodec::kHeaderSize) {
+                if (_messageHandlers[channel]) _messageHandlers[channel](nullptr, channel, data, len);
+                return;
+            }
+            auto decoded = PacketCodec::decode(data, len);
+            if (!decoded.ok) {
+                if (_messageHandlers[channel]) _messageHandlers[channel](nullptr, channel, data, len);
+                return;
+            }
+            switch (decoded.header.msgType) {
+                case kMsgTypeRpcRequest: {
+                    BitStream bodyStream(decoded.body.data(), decoded.body.size());
+                    _rpcHandler.onRpcRequest(bodyStream, /*from=*/nullptr);
+                    return;
+                }
+                case kMsgTypeRpcResponse: {
+                    BitStream bodyStream(decoded.body.data(), decoded.body.size());
+                    _rpcHandler.onRpcResponse(bodyStream, /*from=*/nullptr);
+                    return;
+                }
+                case kMsgTypeRpcReject: {
+                    BitStream bodyStream(decoded.body.data(), decoded.body.size());
+                    _rpcHandler.onRpcReject(bodyStream, /*from=*/nullptr);
+                    return;
+                }
+                default:
+                    if (_messageHandlers[channel]) {
+                        _messageHandlers[channel](nullptr, channel, data, len);
+                    }
+                    return;
             }
         };
         if (_clientConn) {
@@ -300,6 +340,11 @@ public:
         return &_replicationManager;
     }
 
+    // ===== R4.0 RPC =====
+    RpcHandler* getRpcHandler() override {
+        return &_rpcHandler;
+    }
+
 private:
     ConnectionMode _mode = ConnectionMode::Disconnected;
     bool _connected = false;
@@ -327,6 +372,9 @@ private:
     std::function<void(bool, DisconnectReason)> _pendingConnHandler;
 
     ReplicationManager _replicationManager{this};
+    // R4.0 (2026-07-29): mirrors _replicationManager ownership. Routed by
+    // onMessage via PacketHeader.msgType envelope kind.
+    RpcHandler _rpcHandler{this};
 };
 
 // 注册宏
