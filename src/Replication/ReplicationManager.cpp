@@ -102,7 +102,7 @@ void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo
     // the client can allocate a matching slot. On a client (no active
     // connections or no server mode), this is a no-op — local registration
     // only.
-    if (getEffectiveMode() == ConnectionMode::Server && (_network || _broadcastSink)) {
+    if (isAuthority() && (_network || _broadcastSink)) {
         BitStream body;
         body.writeUInt16(kMsgTypeEntitySpawn);
         ReflectSerializer::writeEntitySpawn(body, netId,
@@ -122,7 +122,7 @@ void ReplicationManager::unregisterObject(uint32_t netId) {
     if (it == _objects.end()) return;
     _objects.erase(it);
 
-    if (getEffectiveMode() == ConnectionMode::Server && (_network || _broadcastSink)) {
+    if (isAuthority() && (_network || _broadcastSink)) {
         BitStream body;
         body.writeUInt16(kMsgTypeEntityDespawn);
         ReflectSerializer::writeEntityDespawn(body, netId);
@@ -163,7 +163,7 @@ void ReplicationManager::registerObject(IReplicable* obj, uint32_t netId) {
     // R3.0 — the user is expected to migrate to AYReflect-marked fields.
     // We still send EntitySpawn so the client can allocate a slot keyed by
     // netId, but with typeHash=0 (client treats this as "untyped").
-    if (getEffectiveMode() == ConnectionMode::Server && (_network || _broadcastSink)) {
+    if (isAuthority() && (_network || _broadcastSink)) {
         BitStream body;
         body.writeUInt16(kMsgTypeEntitySpawn);
         ReflectSerializer::writeEntitySpawn(body, netId, /*typeHash=*/ 0);
@@ -214,7 +214,9 @@ void ReplicationManager::tick(float /*deltaTime*/) {
 
     // Authority gate: only the server emits frames. Clients do nothing on
     // tick — they only deserialize frames received via onReceive.
-    if (getEffectiveMode() != ConnectionMode::Server) return;
+    // R4.1: gate accepts Server (dedicated) AND ListenServer (host) via
+    // isAuthority() helper.
+    if (!isAuthority()) return;
 
     // Snapshot the keys to allow register/unregister during iteration without
     // invalidating iterators (we don't, but defensive).
@@ -414,6 +416,19 @@ size_t ReplicationManager::getDirtyFieldCount(uint32_t netId) const {
 
 void ReplicationManager::setExtension(INetworkExtension* ext) {
     _extension = ext;
+}
+
+// =============================================================================
+// isAuthority — R4.1 helper. Server (dedicated) AND ListenServer (host) are
+// both server-authoritative for replication (design §6.6 v1). R4.0 hard-coded
+// `mode == ConnectionMode::Server` everywhere, which silently dropped
+// ListenServer tick/spawn/despawn because AYNetworkSubSystem::listen() set
+// Server (it should have set ListenServer — also fixed in R4.1). R4.1
+// canonicalizes the check into this helper so all 4 gates stay in lockstep.
+// =============================================================================
+bool ReplicationManager::isAuthority() const {
+    const auto m = getEffectiveMode();
+    return m == ConnectionMode::Server || m == ConnectionMode::ListenServer;
 }
 
 } // namespace ayt::net

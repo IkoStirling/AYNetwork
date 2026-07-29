@@ -492,6 +492,11 @@ private:
     INetworkSubSystem* _network = nullptr;
     INetworkExtension* _extension = nullptr;
 
+    // R4.1: authority gate. Server (dedicated) AND ListenServer (host) are
+    // both server-authoritative. Returns true if the effective mode is one
+    // of those. Used by tick/spawn/despawn/register.
+    bool isAuthority() const;
+
     // Test-only seam: when != Disconnected, overrides _network->getMode().
     // Lets unit tests exercise the server-authority broadcast path without
     // wiring a full INetworkSubSystem.
