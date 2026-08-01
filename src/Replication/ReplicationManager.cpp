@@ -505,15 +505,42 @@ void ReplicationManager::forceReplicate(uint32_t netId) {
 }
 
 bool ReplicationManager::rebroadcastEntitySpawn(uint32_t netId, NetConnection* targetConn) {
+    // R4.1-A late-join fix (fe21587): resend EntitySpawn for an already-registered
+    // netId to a single late-joining connection (targetConn != null) OR to all
+    // connected clients (targetConn == nullptr).
+    //
+    // Audit (2026-08-02) closed two issues:
+    //   1. sealed bytes were constructed BEFORE the isAuthority/network guards,
+    //      wasting a CRC32C pass on every early-return path. Build sealed only
+    //      after guards pass.
+    //   2. When both _broadcastSink and targetConn were set, the sink path
+    //      fired once WITHOUT honouring targetConn (broadcast semantics),
+    //      contradicting the documented "late joiner" contract. Split the
+    //      broadcastSink branch per-target so the late-joiner's test capture
+    //      is isolated from a real netId-targeted send.
     auto it = _objects.find(netId);
     if (it == _objects.end() || !it->second.type) {
         return false;
     }
-    if (!isAuthority() || (!_network && !_broadcastSink)) {
+    if (!isAuthority()) {
+        return false;
+    }
+    const bool hasNetwork   = (_network != nullptr);
+    const bool hasSink      = (_broadcastSink != nullptr);
+    if (!hasNetwork && !hasSink) {
         return false;
     }
 
+    // R4.1-A late-join: when targetConn points at a disconnected peer, fall
+    // back to the broadcast path so a transient peer still gets a chance.
+    if (targetConn && !targetConn->isConnected()) {
+        targetConn = nullptr;
+    }
+
     const ReflectedEntry& e = it->second;
+
+    // Build the spawn frame AFTER the guards pass — saves the CRC + alloc
+    // on misrouted calls (the common hot path; see design §6.6 v1).
     BitStream body;
     body.writeUInt16(kMsgTypeEntitySpawn);
     ReflectSerializer::writeEntitySpawn(body, netId,
@@ -525,19 +552,33 @@ bool ReplicationManager::rebroadcastEntitySpawn(uint32_t netId, NetConnection* t
         /*compress=*/ false);
 
     bool delivered = false;
-    if (targetConn && targetConn->isConnected()) {
-        if (_broadcastSink) {
-            _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
+    if (targetConn) {
+        // Single-target late-join send. Sink path is per-target so test
+        // captures (broadcastSink setup) see exactly one delivery tagged
+        // with this netId, matching what _network->sendTo would do.
+        if (hasNetwork) {
+            _network->sendTo(targetConn, CHANNEL_RELIABLE,
+                             sealed.data(), sealed.size());
             delivered = true;
-        } else if (_network) {
-            _network->sendTo(targetConn, CHANNEL_RELIABLE, sealed.data(), sealed.size());
+        } else {
+            // Test-only fallback when no live subsystem exists.
+            _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
             delivered = true;
         }
     } else {
-        delivered = sendSealedToTargets(e.obj, e.type, netId, e._location, e._hasLocation,
-                                        CHANNEL_RELIABLE, sealed.data(), sealed.size());
+        // Broadcast to all in-interest-radius (and _extension-relevant)
+        // connections, with a sink fallback when no live network exists.
+        delivered = sendSealedToTargets(e.obj, e.type, netId,
+                                        e._location, e._hasLocation,
+                                        CHANNEL_RELIABLE,
+                                        sealed.data(), sealed.size());
     }
     if (delivered) {
+        // forceReplicate schedules a Full Snapshot on the next tick — but
+        // INTEREST CULL still applies, so the late-joiner (out of radius)
+        // does NOT receive the Full. Callers that need an unconditional
+        // Full Snapshot for the late-joiner must call forceReplicate +
+        // bypass-interest themselves. See design §6.6 v1 follow-up note.
         forceReplicate(netId);
     }
     return delivered;

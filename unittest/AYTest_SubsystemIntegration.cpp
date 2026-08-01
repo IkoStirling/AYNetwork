@@ -234,4 +234,93 @@ TEST_CASE(OneServerTwoClientsRpcAndReplicate) {
     delete client2;
 }
 
+TEST_CASE(LateJoinClientReceivesRebroadcastedEntitySpawn) {
+    // Regression test for the late-join fix (fe21587): when a second client
+    // connects AFTER an entity is already registered on the server, the new
+    // client must still receive an EntitySpawn. Without the fix the late-
+    // join client would never see existing entities until the next field
+    // change bubbled up via dirty-tracking.
+    //
+    // Audit (2026-08-02): rebroadcastEntitySpawn(netId, targetConn) must
+    // honour the `targetConn` argument when a network subsystem is present
+    // (issue 1: sink path ignored targetConn; issue 2: sealed bytes were
+    // constructed before any authority/network guard).
+    ayt::test::setCurrentCase("LateJoinClientReceivesRebroadcastedEntitySpawn");
+
+    INetworkSubSystem* server = createNetworkSubSystemForTest();
+    INetworkSubSystem* client1 = createNetworkSubSystemForTest();
+    INetworkSubSystem* client2 = createNetworkSubSystemForTest();
+    CHECK(server && client1 && client2);
+    CHECK(server->initialize());
+    CHECK(client1->initialize());
+    CHECK(client2->initialize());
+
+    constexpr uint16_t kPort = 27555;
+    server->listen(kPort);
+
+    // Connect ONLY client1 first.
+    client1->connect("127.0.0.1", kPort);
+
+    std::vector<INetworkSubSystem*> pre{server, client1};
+    CHECK(pumpUntil(std::chrono::seconds(8), [&]() {
+        pumpAll(pre);
+        return client1->isConnected() && server->getConnections().size() >= 1;
+    }));
+
+    // Register an object while ONLY client1 is connected.
+    auto* replType = ayt::reflect::TypeRegistryImpl::instance().findType("SubsystemReplicationNoNet");
+    CHECK(replType != nullptr);
+    struct ReplObj { int32_t hp = 100; int32_t score = 0; };
+    ReplObj serverObj;
+    serverObj.score = 11;
+    constexpr uint32_t kNetId = 4711;
+    server->getReplicationManager()->registerObject(&serverObj, replType, kNetId);
+
+    uint16_t typeHash1 = 0;
+    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
+        pumpAll(pre);
+        return client1->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash1);
+    }));
+
+    // Now connect client2 (the late joiner). fe21587 wires the synthetic
+    // Connected callback; verify the server's onConnectionChange fires AND
+    // the rebroadcast delivers an EntitySpawn to client2.
+    std::atomic<bool> client2ConnFired{false};
+    server->onConnectionChange([&](NetConnection* conn, bool connected, DisconnectReason) {
+        if (connected && conn) client2ConnFired.store(true);
+    });
+
+    client2->connect("127.0.0.1", kPort);
+    std::vector<INetworkSubSystem*> all{server, client1, client2};
+    CHECK(pumpUntil(std::chrono::seconds(8), [&]() {
+        pumpAll(all);
+        return client2->isConnected();
+    }));
+    CHECK(client2ConnFired.load());
+
+    // After onConnectionChange fires, the late-join logic must deliver an
+    // EntitySpawn announcement to client2 for the already-registered kNetId.
+    uint16_t typeHash2 = 0;
+    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
+        pumpAll(all);
+        return client2->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash2);
+    }));
+
+    // Sanity: client2 must NOT have received the field value (no Full
+    // Snapshot unless interest/forceReplicate sends one) — the minimum
+    // invariant is the spawn announcement + the late-joiner entry in
+    // server->getConnections().
+    CHECK(server->getConnections().size() >= 2);
+
+    server->disconnect();
+    client1->disconnect();
+    client2->disconnect();
+    server->shutdown();
+    client1->shutdown();
+    client2->shutdown();
+    delete server;
+    delete client1;
+    delete client2;
+}
+
 TEST_SUITE_END

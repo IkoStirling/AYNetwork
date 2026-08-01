@@ -69,6 +69,14 @@ bool shouldAutoCompressRpcResponse(const uint8_t* body, size_t bodyLen, size_t m
 // =============================================================================
 // R4.1-B: RpcAsyncPool — worker threads invoke isAsync RPCs; completions are
 // drained on the network/game thread via RpcHandler::tick().
+//
+// Audit (2026-08-02): Job/Completion stored `NetConnection* from` as a raw
+// pointer. Between worker submission and drain on the game thread, the
+// caller could disconnect/listen/server-restart, which destroys the
+// NetConnectionImpl. The drain path (drainAsyncRpcCompletions) would then
+// pass a dangling pointer to _network->sendTo. Switched to a stable
+// uint32_t netId snapshot; the drain path re-resolves the live conn on
+// the game thread and drops the completion if no live conn matches.
 // =============================================================================
 class RpcAsyncPool {
 public:
@@ -77,13 +85,13 @@ public:
         void* obj = nullptr;
         std::vector<uint8_t> argBuf;
         uint64_t callId = 0;
-        NetConnection* from = nullptr;
+        uint32_t fromNetId = 0; // 0 = no per-target send (broadcast/multicast)
         bool isMulticast = false;
     };
 
     struct Completion {
         uint64_t callId = 0;
-        NetConnection* from = nullptr;
+        uint32_t fromNetId = 0;
         const ayt::reflect::ITypeInfo* returnType = nullptr;
         std::vector<uint8_t> returnBuf;
         bool hasReturn = false;
@@ -164,7 +172,7 @@ private:
 
             Completion completion;
             completion.callId = job.callId;
-            completion.from = job.from;
+            completion.fromNetId = job.fromNetId;
             completion.isMulticast = job.isMulticast;
             if (!job.methodInfo || !job.obj) {
                 completion.hasReturn = false;
@@ -607,25 +615,52 @@ void RpcHandler::drainAsyncRpcCompletions() {
     if (!_asyncPool) return;
     RpcAsyncPool::Completion completion;
     while (_asyncPool->tryPopCompletion(completion)) {
-        if (completion.isMulticast) continue;
+        if (completion.isMulticast) continue; // Multicast is fire-and-forget; the queue entry holds only the returnBuf allocation which is freed by Completion destructor when we exit this block.
+        // Lifetime guard (audit 2026-08-02): re-resolve the target
+        // connection from the stable netId snapshot. If the conn was
+        // disconnected between submit and drain, findNetConnectionById
+        // returns nullptr and we drop the completion silently — the
+        // pending callback map (if any) will eventually time out via
+        // expirePendingCalls.
+        NetConnection* liveFrom = completion.fromNetId
+            ? findNetConnectionById(completion.fromNetId)
+            : nullptr;
+        if (completion.fromNetId != 0 && !liveFrom) {
+            // Target conn is gone. We don't have a direct handle to the
+            // pending callback here (callers using async+RpcResponse
+            // track via the standard Response path), so just skip the
+            // response emission; the original caller's pending will
+            // expire on the standard timeout.
+            continue;
+        }
         if (completion.hasReturn && completion.returnType && !completion.returnBuf.empty()) {
             BitStream respBody;
             RpcSerializer::writeRpcResponse(respBody, completion.returnType, completion.callId,
                                             completion.returnBuf.data());
-            emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, completion.from);
+            emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, liveFrom);
         } else {
             BitStream respBody;
             RpcSerializer::writeRpcResponse(respBody, nullptr, completion.callId, nullptr);
-            emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, completion.from);
+            emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, liveFrom);
         }
     }
 }
 
 uint32_t RpcHandler::computeRetryBackoffMs(uint32_t retryCount) const {
+    // Audit (2026-08-02): the previous branch
+    //   `if (shift >= 31) return _retryBaseMs * 0x80000000u;`
+    // used uint32_t multiplication which wraps modulo 2^32 — _retryBaseMs
+    // of 100 * 0x80000000 mod 2^32 = 0x20000000 ms (~17 days), not the
+    // intended saturated value. Switch to uint64_t arithmetic with a 30s
+    // cap so a caller-supplied _maxRetries > 32 cannot create a retry
+    // storm (a 0 ms or near-zero backoff would loop forever).
+    constexpr uint64_t kMaxBackoffMs = 30'000ull;
     if (retryCount == 0 || _retryBaseMs == 0) return _retryBaseMs;
     const uint32_t shift = retryCount - 1;
-    if (shift >= 31) return _retryBaseMs * 0x80000000u;
-    return _retryBaseMs << shift;
+    if (shift >= 30) return static_cast<uint32_t>(kMaxBackoffMs);
+    const uint64_t shifted = static_cast<uint64_t>(_retryBaseMs) << shift;
+    const uint64_t capped = (shifted > kMaxBackoffMs) ? kMaxBackoffMs : shifted;
+    return static_cast<uint32_t>(capped);
 }
 
 bool RpcHandler::emitRequestBody(uint8_t channel, uint16_t envelopeMsgType,
@@ -931,7 +966,12 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
         job.obj = obj;
         job.argBuf = std::move(argBuf);
         job.callId = callId;
-        job.from = from;
+        // Lifetime note (audit 2026-08-02): store the stable netId only.
+        // The worker thread cannot dereference `from` because the network
+        // thread may disconnect the connection before drain; the drain
+        // re-resolves from _network->getConnections() and drops the
+        // completion if the conn is no longer live.
+        job.fromNetId = from ? from->getId() : 0u;
         job.isMulticast = isMulticast;
         _asyncPool->submit(std::move(job));
         return true;
