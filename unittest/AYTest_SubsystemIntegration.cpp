@@ -285,9 +285,25 @@ TEST_CASE(LateJoinClientReceivesRebroadcastedEntitySpawn) {
     // Now connect client2 (the late joiner). fe21587 wires the synthetic
     // Connected callback; verify the server's onConnectionChange fires AND
     // the rebroadcast delivers an EntitySpawn to client2.
+    //
+    // Design note (audit 2026-08-02): fe21587 provides rebroadcastEntitySpawn
+    // as an API but does NOT auto-call it — the integration is the user
+    // iterating registered netIds inside the onConnectionChange handler. The
+    // test mirrors that pattern: iterate the server's replicated objects
+    // and rebroadcast to the late joiner on connect.
+    ReplicationManager* rm = server->getReplicationManager();
+    CHECK(rm != nullptr);
     std::atomic<bool> client2ConnFired{false};
     server->onConnectionChange([&](NetConnection* conn, bool connected, DisconnectReason) {
-        if (connected && conn) client2ConnFired.store(true);
+        if (!connected || !conn) return;
+        client2ConnFired.store(true);
+        // Late-join rebroadcast loop: walk all registered entities on
+        // the server and resend EntitySpawn + forceReplicate for each.
+        // Tests exercise one netId only (kNetId=4711) so iterate by hand
+        // rather than copy the entire _objects map.
+        if (rm->findType(kNetId) != nullptr) {
+            (void)rm->rebroadcastEntitySpawn(kNetId, conn);
+        }
     });
 
     client2->connect("127.0.0.1", kPort);
