@@ -17,9 +17,9 @@
 #include <Protocol/PacketHeader.h>
 #include <Transport/GnsConnection.h>
 
-#include <ayreflect/IReflect.h>
-#include <ayreflect/ReflectMacros.h>
-#include <ayreflect/ReflectRegistry.h>
+#include <AYReflect/IReflect.h>
+#include <AYReflect/ReflectMacros.h>
+#include <AYReflect/ReflectRegistry.h>
 
 #include <atomic>
 #include <chrono>

@@ -13,8 +13,8 @@
 #include <Protocol/PacketCodec.h>
 #include <Transport/GnsConnection.h>
 
-#include <ayreflect/IReflect.h>
-#include <ayreflect/ReflectRegistry.h>
+#include <AYReflect/IReflect.h>
+#include <AYReflect/ReflectRegistry.h>
 
 #include <lz4.h>
 

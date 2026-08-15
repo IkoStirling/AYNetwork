@@ -5,7 +5,7 @@
 
 #include <PacketCodec.h>
 
-#include <aystorage/Lz4Decompressor.h>   // R2: decode-side reuse from AYStorage
+#include <AYStorage/Lz4Decompressor.h>   // R2: decode-side reuse from AYStorage
 
 #include <lz4.h>                         // R2: encode side, raw block API
 

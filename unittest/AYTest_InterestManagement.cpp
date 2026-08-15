@@ -5,8 +5,8 @@
 
 #include <Replication/ReflectSerializer.h>
 
-#include <ayreflect/IReflect.h>
-#include <ayreflect/detail/ReflectImpl.h>
+#include <AYReflect/IReflect.h>
+#include <AYReflect/detail/ReflectImpl.h>
 #include <AYReflect.h>
 
 #include <atomic>

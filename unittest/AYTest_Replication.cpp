@@ -23,9 +23,9 @@
 #include <Replication/ReflectSerializer.h>
 #include <Replication/ReplicationManager.h>
 
-#include <ayreflect/IReflect.h>
-#include <ayreflect/ReflectMacros.h>
-#include <ayreflect/detail/ReflectImpl.h>
+#include <AYReflect/IReflect.h>
+#include <AYReflect/ReflectMacros.h>
+#include <AYReflect/detail/ReflectImpl.h>
 #include <AYReflect.h>
 
 #include <array>

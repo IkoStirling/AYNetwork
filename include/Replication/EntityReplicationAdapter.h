@@ -51,7 +51,7 @@ public:
 // Entity class is forward-declared above; the implementation needs the full
 // definition (T::getComponent<T>, TypeRegistryImpl::findType<T>).
 // =============================================================================
-#include <ayreflect/ReflectRegistry.h>
+#include <AYReflect/ReflectRegistry.h>
 
 #include <type_traits>
 

@@ -7,7 +7,7 @@
 #include <Transport/GnsConnection.h>
 #include <IAYNetwork.h>
 
-#include <ayreflect/IReflect.h>
+#include <AYReflect/IReflect.h>
 
 #include <cstdio>
 

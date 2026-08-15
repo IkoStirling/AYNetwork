@@ -10,7 +10,7 @@
 // See design.md §13 R4 checklist and §10 Phase 4 for the full spec.
 
 #include <IAYNetwork.h>
-#include <ayreflect/IReflect.h>
+#include <AYReflect/IReflect.h>
 
 #include <atomic>
 #include <chrono>

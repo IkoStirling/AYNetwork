@@ -27,8 +27,8 @@ class ReplicationManager;
 // We do NOT forward-declare ayt::reflect::ITypeInfo here — a forward
 // declaration placed inside namespace ayt::net would be parsed as
 // ayt::net::ayt::reflect::ITypeInfo, which collides with the real type once
-// ReflectSerializer.cpp (or any consumer) includes <ayreflect/IReflect.h>.
-// Callers that need the full type must include <ayreflect/IReflect.h>
+// ReflectSerializer.cpp (or any consumer) includes <AYReflect/IReflect.h>.
+// Callers that need the full type must include <AYReflect/IReflect.h>
 // themselves. AYNetwork's CMakeLists PUBLIC-links AYReflect so the include
 // path is available to consumers without extra setup.
 
