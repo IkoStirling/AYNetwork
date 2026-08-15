@@ -1,5 +1,5 @@
 #pragma once
-// ReflectSerializer.h - R3.0/R3.1 AYReflect-driven wire format serializer
+// AYNetwork/Replication/AYNetwork/Replication/AYNetwork/Replication/ReflectSerializer.h - R3.0/R3.1 AYReflect-driven wire format serializer
 //
 // R3.0 (2026-07-27): serialization is driven entirely by ayt::reflect::ITypeInfo
 // metadata. The user tags fields with FieldAttribute::NetReplicate; this header
@@ -36,7 +36,7 @@
 // serializeObject to return false — the field is silently skipped (logged at
 // debug verbosity). R3.2+ extends WireTypeId range to cover more cases.
 
-#include <IAYNetwork.h>
+#include <AYNetwork/INetwork.h>
 
 #include <cstdint>
 #include <cstddef>

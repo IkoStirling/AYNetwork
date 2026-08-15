@@ -1,9 +1,9 @@
 // NetConnectionImpl.cpp - GnsConnection → NetConnection 适配器实现 (R4.1)
 //
-// 类定义见 include/Transport/NetConnectionImpl.h。本 TU 只做方法实现。
+// 类定义见 include/Transport/AYNetwork/Transport/AYNetwork/Transport/AYNetwork/Transport/NetConnectionImpl.h。本 TU 只做方法实现。
 
-#include <Transport/NetConnectionImpl.h>
-#include <Transport/GnsConnection.h>
+#include <AYNetwork/Transport/NetConnectionImpl.h>
+#include <AYNetwork/Transport/GnsConnection.h>
 
 namespace ayt::net
 {

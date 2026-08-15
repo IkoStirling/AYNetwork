@@ -1,5 +1,5 @@
 #pragma once
-// ReplicationSystem.h - R3.0 thin adapter for ECS-style integration
+// AYNetwork/Replication/AYNetwork/Replication/AYNetwork/Replication/ReplicationSystem.h - R3.0 thin adapter for ECS-style integration
 //
 // R3.0 (2026-07-27): previously held its own netId↔entityId maps and
 // registerEntity/findEntity API. Design §13 R3 explicitly forbids the double
@@ -17,7 +17,7 @@
 //     EntityReplicationAdapter::registerEntityComponent<T>(mgr, entity, netId).
 //     This class is NOT a peer of ReplicationManager in the data sense.
 
-#include <IAYNetwork.h>
+#include <AYNetwork/INetwork.h>
 #include <cstdint>
 
 namespace ayt::net

@@ -20,10 +20,10 @@
 //     decrement it back. This means the wire header fieldCount always
 //     reflects fields actually emitted; receivers don't see a mismatch.
 
-#include <Replication/ReflectSerializer.h>
+#include <AYNetwork/Replication/ReflectSerializer.h>
 
 #include <AYReflect/IReflect.h>
-#include <Protocol/PacketCodec.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
 #include <algorithm>
 #include <cstring>
 #include <string>

@@ -5,8 +5,8 @@
 
 #include <AYNetwork.h>
 #include <AYTest.h>
-#include <UdpSocket.h>
-#include <GnsConnection.h>
+#include <AYNetwork/Transport/UdpSocket.h>
+#include <AYNetwork/Transport/GnsConnection.h>
 #include <cstdio>
 
 using namespace ayt::net;

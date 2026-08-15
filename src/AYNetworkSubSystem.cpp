@@ -1,13 +1,13 @@
 // AYNetworkSubSystem.cpp - 网络子系统实现
 
 #include <AYNetwork.h>
-#include <AYNetworkModule.h>
+#include <AYNetwork/NetworkModule.h>
 #include <AYGameLoop.h>
-#include <AYSubSystemRegistry.h>
-#include <GnsConnection.h>
-#include <PacketCodec.h>
-#include <RPC/RpcHandler.h>
-#include <Transport/NetConnectionImpl.h>
+#include <AYGameLoop/SubSystemRegistry.h>
+#include <AYNetwork/Transport/GnsConnection.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
+#include <AYNetwork/RPC/RpcHandler.h>
+#include <AYNetwork/Transport/NetConnectionImpl.h>
 // R1.A (2026-07-27): pull in EResult + AcceptConnection signature. The
 // GnsConnection.cpp TU-private includes are sufficient because s_gns is a
 // fully-typed pointer in this TU — we just need the constants.

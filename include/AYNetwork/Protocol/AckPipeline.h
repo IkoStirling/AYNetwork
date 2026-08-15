@@ -1,13 +1,13 @@
 #pragma once
-// AckPipeline.h - R4.1-B explicit CHANNEL_ACK pipeline
+// AYNetwork/Protocol/AYNetwork/Protocol/AYNetwork/Protocol/AckPipeline.h - R4.1-B explicit CHANNEL_ACK pipeline
 //
 // RequiresAck frames carry a 4-byte seq prefix in the body. Receivers
 // reply with kMsgTypeAppAck on CHANNEL_ACK. GNS transport remains
 // responsible for wire reliability; this layer gives callers an optional
 // application-level delivery confirmation hook.
 
-#include <IAYNetwork.h>
-#include <PacketCodec.h>
+#include <AYNetwork/INetwork.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
 
 #include <atomic>
 #include <chrono>

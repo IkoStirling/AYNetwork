@@ -1,6 +1,6 @@
 // KcpConnection.cpp - KCP reliable connection wrapper
 
-#include <KcpConnection.h>
+#include <AYNetwork/Transport/KcpConnection.h>
 
 namespace ayt::net
 {

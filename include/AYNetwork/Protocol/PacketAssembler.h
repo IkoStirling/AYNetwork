@@ -1,5 +1,5 @@
 #pragma once
-// PacketAssembler.h - Fragment a payload and reassemble fragments.
+// AYNetwork/Protocol/AYNetwork/Protocol/AYNetwork/Protocol/PacketAssembler.h - Fragment a payload and reassemble fragments.
 //
 // R2 (2026-07-27): rewrote the R1 stub. Two halves:
 //   - static fragment(payload, mtu, ...) -> vector<vector<uint8_t>>
@@ -17,8 +17,8 @@
 //     fragment completes the set).
 
 #include <AYCore.h>
-#include <PacketHeader.h>
-#include <PacketCodec.h>
+#include <AYNetwork/Protocol/PacketHeader.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
 
 #include <cstdint>
 #include <cstddef>

@@ -11,11 +11,11 @@
 #include <AYNetwork.h>
 #include <AYTest.h>
 
-#include <RPC/RpcHandler.h>
-#include <Replication/ReflectSerializer.h>
-#include <Protocol/PacketCodec.h>
-#include <Protocol/PacketHeader.h>
-#include <Transport/GnsConnection.h>
+#include <AYNetwork/RPC/RpcHandler.h>
+#include <AYNetwork/Replication/ReflectSerializer.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
+#include <AYNetwork/Protocol/PacketHeader.h>
+#include <AYNetwork/Transport/GnsConnection.h>
 
 #include <AYReflect/IReflect.h>
 #include <AYReflect/ReflectMacros.h>
@@ -49,7 +49,7 @@ using ayt::net::hasFlag;
 // RpcMethodInfoImpl — hand-rolled IMethodInfo derived class for fixtures.
 //
 // Why not reuse AYScript's MethodInfoImpl? Per `Test_Reflect.cpp:600-603`
-// comment, that template lives in `logia/AYMethodInfoImpl.h` and is
+// comment, that template lives in `logia/AYScript/logia/AYScript/logia/AYScript/logia/AYScript/logia/MethodInfoImpl.h` and is
 // tied to AYScript's PMF variadic unpack. RpcHandler needs only
 // enough metadata to (de)serialize + invoke + validate, so a tiny
 // hand-rolled template fits the test scope without dragging in

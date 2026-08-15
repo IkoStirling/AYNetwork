@@ -3,10 +3,10 @@
 #include <AYNetwork.h>
 #include <AYTest.h>
 
-#include <Protocol/AckPipeline.h>
-#include <Protocol/PacketCodec.h>
-#include <Protocol/PacketHeader.h>
-#include <GnsConnection.h>
+#include <AYNetwork/Protocol/AckPipeline.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
+#include <AYNetwork/Protocol/PacketHeader.h>
+#include <AYNetwork/Transport/GnsConnection.h>
 
 #include <atomic>
 #include <chrono>

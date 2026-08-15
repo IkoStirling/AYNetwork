@@ -1,9 +1,9 @@
 #pragma once
-// AYConnection.h - Connection state machine
+// AYEventSystem\Connection.h - Connection state machine
 
 #include <AYCore.h>
-#include <UdpSocket.h>
-#include <KcpConnection.h>
+#include <AYNetwork/Transport/UdpSocket.h>
+#include <AYNetwork/Transport/KcpConnection.h>
 #include <cstdint>
 #include <functional>
 #include <string>

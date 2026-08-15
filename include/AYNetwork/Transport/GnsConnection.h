@@ -1,5 +1,5 @@
 #pragma once
-// GnsConnection.h - Thin wrapper around ISteamNetworkingSockets.
+// AYNetwork/Transport/AYNetwork/Transport/AYNetwork/Transport/GnsConnection.h - Thin wrapper around ISteamNetworkingSockets.
 //
 // R1 (2026-07-26): replaces the stub KcpConnection that AYConnection.cpp used.
 // R1.A (2026-07-27): multi-connection support. Server-side GnsConnection
@@ -26,9 +26,9 @@
 // update() is first called.
 
 #include <AYCore.h>
-#include <IAYNetwork.h>                // R1 done: DisconnectReason / HandshakeMsgType / kProtocolVersion
-#include <PacketAssembler.h>           // R2: receive-side reassembly
-#include <Protocol/AckPipeline.h>      // R4.1-B: CHANNEL_ACK pipeline
+#include <AYNetwork/INetwork.h>                // R1 done: DisconnectReason / HandshakeMsgType / kProtocolVersion
+#include <AYNetwork/Protocol/PacketAssembler.h>           // R2: receive-side reassembly
+#include <AYNetwork/Protocol/AckPipeline.h>      // R4.1-B: CHANNEL_ACK pipeline
 #include <cstdint>
 #include <functional>
 #include <string>

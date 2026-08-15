@@ -6,11 +6,11 @@
 #include <AYNetwork.h>
 #include <AYTest.h>
 #include <AYEntity.h>
-#include <AYEntityModule.h>
+#include <AYEntity/EntityModule.h>
 
-#include <Replication/EntityReplicationAdapter.h>
-#include <components/AYHealthComponent.h>
-#include <components/AYNetworkComponent.h>
+#include <AYNetwork/Replication/EntityReplicationAdapter.h>
+#include <AYEntity/components/HealthComponent.h>
+#include <AYEntity/components/NetworkComponent.h>
 
 #include <chrono>
 #include <functional>

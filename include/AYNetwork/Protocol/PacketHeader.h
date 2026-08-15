@@ -1,5 +1,5 @@
 #pragma once
-// PacketHeader.h - Application-layer packet header (R2 redesign).
+// AYNetwork/Protocol/AYNetwork/Protocol/AYNetwork/Protocol/PacketHeader.h - Application-layer packet header (R2 redesign).
 //
 // R2 (2026-07-27): rewrote the orphan R1 stub (which was 16B with packetId
 // contradicting design §3.3 "no double-counted transport seq") into a 12B

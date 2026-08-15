@@ -18,10 +18,10 @@
 
 #include <AYNetwork.h>
 #include <AYTest.h>
-#include <PacketCodec.h>
-#include <GnsConnection.h>
-#include <Replication/ReflectSerializer.h>
-#include <Replication/ReplicationManager.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
+#include <AYNetwork/Transport/GnsConnection.h>
+#include <AYNetwork/Replication/ReflectSerializer.h>
+#include <AYNetwork/Replication/ReplicationManager.h>
 
 #include <AYReflect/IReflect.h>
 #include <AYReflect/ReflectMacros.h>

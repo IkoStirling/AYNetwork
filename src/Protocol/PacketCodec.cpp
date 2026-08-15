@@ -3,7 +3,7 @@
 // R2 (2026-07-27): CRC32C + lz4 (decode side reuses AYStorage::Lz4Decompressor;
 // encode side is a thin wrapper over <lz4.h> raw block API).
 
-#include <PacketCodec.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
 
 #include <AYStorage/Lz4Decompressor.h>   // R2: decode-side reuse from AYStorage
 

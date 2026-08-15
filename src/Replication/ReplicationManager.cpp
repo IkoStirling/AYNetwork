@@ -1,11 +1,11 @@
 // ReplicationManager.cpp - R3.0 Replication manager implementation
 
-#include <Replication/ReplicationManager.h>
+#include <AYNetwork/Replication/ReplicationManager.h>
 
-#include <Replication/ReflectSerializer.h>
-#include <Protocol/PacketCodec.h>
-#include <Transport/GnsConnection.h>
-#include <IAYNetwork.h>
+#include <AYNetwork/Replication/ReflectSerializer.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
+#include <AYNetwork/Transport/GnsConnection.h>
+#include <AYNetwork/INetwork.h>
 
 #include <AYReflect/IReflect.h>
 

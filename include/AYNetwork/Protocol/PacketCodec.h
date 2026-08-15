@@ -1,5 +1,5 @@
 #pragma once
-// PacketCodec.h - Pure encode/decode of a PacketHeader v2 frame.
+// AYNetwork/Protocol/AYNetwork/Protocol/AYNetwork/Protocol/PacketCodec.h - Pure encode/decode of a PacketHeader v2 frame.
 //
 // R2 (2026-07-27): the new framing layer in front of GNS reliable send.
 //
@@ -9,7 +9,7 @@
 // GnsConnection. GnsConnection wraps these calls at the send/recv funnel.
 
 #include <AYCore.h>
-#include <PacketHeader.h>
+#include <AYNetwork/Protocol/PacketHeader.h>
 
 #include <cstdint>
 #include <cstddef>

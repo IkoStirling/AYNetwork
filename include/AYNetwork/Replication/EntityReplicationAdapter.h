@@ -1,5 +1,5 @@
 #pragma once
-// EntityReplicationAdapter.h - R3.0 ECS bridge (header-only)
+// AYNetwork/Replication/AYNetwork/Replication/AYNetwork/Replication/EntityReplicationAdapter.h - R3.0 ECS bridge (header-only)
 //
 // R3.0 (2026-07-27): thin ECS bridge between AYEntity and ReplicationManager.
 // The user wires AYEntity's World update to drive replication by calling
@@ -16,7 +16,7 @@
 // entities holding NetworkComponent and registers/unregisters them as they
 // enter/leave the world.
 
-#include <Replication/ReplicationManager.h>
+#include <AYNetwork/Replication/ReplicationManager.h>
 
 #include <cstdint>
 

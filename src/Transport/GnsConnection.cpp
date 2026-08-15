@@ -14,9 +14,9 @@
 //   4. instance.disconnect(reason) — graceful close.
 //   5. gns::shutdown() — call from NetworkSubSystem::shutdown().
 
-#include <GnsConnection.h>
-#include <IAYNetwork.h>                  // R1 done: HandshakeMsgType / DisconnectReason / kProtocolVersion
-#include <PacketCodec.h>                  // R2: framing layer
+#include <AYNetwork/Transport/GnsConnection.h>
+#include <AYNetwork/INetwork.h>                  // R1 done: HandshakeMsgType / DisconnectReason / kProtocolVersion
+#include <AYNetwork/Protocol/PacketCodec.h>                  // R2: framing layer
 
 #include <steam/steamclientpublic.h>     // EResult
 #include <steam/steamnetworkingtypes.h>  // identity, connection info, send flags
@@ -409,7 +409,7 @@ int GnsConnection::sendRequireAck(uint16_t msgType, uint8_t channel,
 }
 
 // R2: low-level GNS send. R4.0 (2026-07-29) expands the channel -> GNS
-// send-flag map to all 4 channels declared in IAYNetwork.h:39-42.
+// send-flag map to all 4 channels declared in AYNetwork/INetwork.h:39-42.
 //
 //   CHANNEL_RELIABLE   = 0  -> k_nSteamNetworkingSend_Reliable
 //                            (default — RPC default + Replication Full)

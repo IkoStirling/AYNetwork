@@ -13,7 +13,7 @@
 
 #include <AYNetwork.h>
 #include <AYTest.h>
-#include <GnsConnection.h>
+#include <AYNetwork/Transport/GnsConnection.h>
 
 #include <atomic>
 #include <chrono>

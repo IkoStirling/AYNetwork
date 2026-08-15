@@ -3,7 +3,7 @@
 #include <AYNetwork.h>
 #include <AYTest.h>
 
-#include <Replication/ReflectSerializer.h>
+#include <AYNetwork/Replication/ReflectSerializer.h>
 
 #include <AYReflect/IReflect.h>
 #include <AYReflect/detail/ReflectImpl.h>

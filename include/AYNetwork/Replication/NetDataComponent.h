@@ -1,5 +1,5 @@
 #pragma once
-// NetDataComponent.h - Macros for marking data components for network replication
+// AYNetwork/Replication/AYNetwork/Replication/AYNetwork/Replication/NetDataComponent.h - Macros for marking data components for network replication
 //
 // P0 audit fix (2026-07-26):
 //   - AY_NET_FIELD was an empty macro (no expansion), causing design §6.2 examples
@@ -10,7 +10,7 @@
 //     useful compile-time guard for trivially copyable constraint) but drop the
 //     empty nested struct/registrar so future code can't accidentally depend on it.
 
-#include <IAYNetwork.h>
+#include <AYNetwork/INetwork.h>
 #include <type_traits>
 
 namespace ayt::net

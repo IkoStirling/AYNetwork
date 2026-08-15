@@ -8,20 +8,20 @@
 //     keeps working.
 //   - Provides optional ECS wiring (registerSystem on AYEntity::World) via a
 //     caller-supplied function pointer. The full ECS bridge is in
-//     EntityReplicationAdapter.h.
+//     AYNetwork/Replication/AYNetwork/Replication/AYNetwork/Replication/EntityReplicationAdapter.h.
 //
 // The old _netIdToEntity / _entityToNetId maps are GONE. Entity↔netId
 // metadata is held by ReplicationManager._objects (and by NetworkComponent
 // stubs in AYEntity for the user-facing API).
 
-#include <Replication/ReplicationSystem.h>
+#include <AYNetwork/Replication/ReplicationSystem.h>
 
 namespace ayt::net
 {
 
 void ReplicationSystem::onStart() {
     // R3.0: no per-system priming needed. The ECS bridge in
-    // EntityReplicationAdapter.h takes care of subscribing to AYEntity's
+    // AYNetwork/Replication/AYNetwork/Replication/AYNetwork/Replication/EntityReplicationAdapter.h takes care of subscribing to AYEntity's
     // World::update path if the user wires it in.
 }
 

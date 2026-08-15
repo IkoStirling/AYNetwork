@@ -1,5 +1,5 @@
 #pragma once
-// IAYNetwork.h - 网络子系统接口
+// AYNetwork/INetwork.h - 网络子系统接口
 
 #include <AYCore.h>
 #include <AYGameLoop.h>   // P0 audit fix (2026-07-26): ISubSystem lives in AYGameLoop's IAYGameLoop.h, not in a separate ISubSystem.h
@@ -34,7 +34,7 @@ class ReplicationManager;
 
 // R4.0 (2026-07-29): forward-declare RpcHandler — referenced by
 // INetworkSubSystem::getRpcHandler(). Same rule: consumers that need
-// the full type include <RPC/RpcHandler.h>. AYNetwork's CMakeLists
+// the full type include <RPC/AYNetwork/RPC/AYNetwork/RPC/AYNetwork/RPC/RpcHandler.h>. AYNetwork's CMakeLists
 // compiles RpcHandler.cpp into the same library so the link is
 // automatic.
 class RpcHandler;
@@ -116,7 +116,7 @@ constexpr uint16_t kMsgTypeHandshake = 0xFFFF;
 constexpr uint16_t kMsgTypeApp       = 0;
 
 // R3.0 (2026-07-27): Replication msgType slots. Body format documented in
-// ReflectSerializer.h. Sent over CHANNEL_RELIABLE via PacketCodec seal.
+// AYNetwork/Replication/AYNetwork/Replication/AYNetwork/Replication/ReflectSerializer.h. Sent over CHANNEL_RELIABLE via PacketCodec seal.
 constexpr uint16_t kMsgTypeReplication  = 0x0001;  // server → clients: full snapshot of one registered entity
 constexpr uint16_t kMsgTypeEntitySpawn  = 0x0002;  // server → clients: register new replicated entity (carries typeHash)
 constexpr uint16_t kMsgTypeEntityDespawn = 0x0003;  // server → clients: unregister replicated entity
@@ -318,7 +318,7 @@ public:
     // R4.1 (2026-08): onPreReplicate 签名升级。
     // 旧签名 (IReplicable* obj, BitStream& stream, vector<NetConnection*>& targets)
     // 是 R1 时代 stub，R4.0 主路径用 (void* obj, const ITypeInfo* type, uint32_t
-    // netId) 反射注册 (IAYNetwork.h:415)，旧签名从未真正调用。R4.1 统一到
+    // netId) 反射注册 (AYNetwork/INetwork.h:415)，旧签名从未真正调用。R4.1 统一到
     // 反射路径 (void*, ITypeInfo*, netId)：
     //   - `obj`  -- 反射注册时的对象指针 (game 直接读字段)
     //   - `type` -- AYReflect 类型元数据 (ITypeInfo::getField 等可查)

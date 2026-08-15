@@ -7,11 +7,11 @@
 //
 // See design.md §13 R4 checklist and design.md §10 Phase 4.
 
-#include <RPC/RpcHandler.h>
+#include <AYNetwork/RPC/RpcHandler.h>
 
-#include <Replication/ReflectSerializer.h>
-#include <Protocol/PacketCodec.h>
-#include <Transport/GnsConnection.h>
+#include <AYNetwork/Replication/ReflectSerializer.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
+#include <AYNetwork/Transport/GnsConnection.h>
 
 #include <AYReflect/IReflect.h>
 #include <AYReflect/ReflectRegistry.h>

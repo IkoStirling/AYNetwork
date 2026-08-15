@@ -1,7 +1,7 @@
 #pragma once
-// AYNetworkModule.h - explicit GameLoop registration (static-lib safe)
+// AYNetwork/NetworkModule.h - explicit GameLoop registration (static-lib safe)
 
-#include <IAYNetwork.h>
+#include <AYNetwork/INetwork.h>
 
 namespace ayt::net
 {

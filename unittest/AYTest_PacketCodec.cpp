@@ -25,9 +25,9 @@
 
 #include <AYNetwork.h>
 #include <AYTest.h>
-#include <PacketCodec.h>
-#include <PacketAssembler.h>
-#include <GnsConnection.h>
+#include <AYNetwork/Protocol/PacketCodec.h>
+#include <AYNetwork/Protocol/PacketAssembler.h>
+#include <AYNetwork/Transport/GnsConnection.h>
 
 #include <atomic>
 #include <chrono>

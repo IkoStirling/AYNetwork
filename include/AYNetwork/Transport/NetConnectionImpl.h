@@ -1,5 +1,5 @@
 #pragma once
-// NetConnectionImpl.h - GnsConnection → NetConnection adapter (R4.1)
+// AYNetwork/Transport/AYNetwork/Transport/AYNetwork/Transport/NetConnectionImpl.h - GnsConnection → NetConnection adapter (R4.1)
 //
 // R4.1 (2026-08): GnsConnection 仍独自管理传输（不强行继承 NetConnection，
 // 避免传输层污染）。NetConnectionImpl 持 GnsConnection* 非拥有指针
