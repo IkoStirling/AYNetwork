@@ -14,7 +14,10 @@
 #include <steam/steamclientpublic.h>
 #include <steam/isteamnetworkingsockets.h>
 #include <cstdio>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 namespace ayt::net
 {
@@ -35,7 +38,9 @@ public:
                     | ::ayt::game::phaseBit(::ayt::game::FramePhase::FixedPrePhysics)
                     | ::ayt::game::phaseBit(::ayt::game::FramePhase::Egress),
             .clock = ::ayt::game::ClockDomain::RealWall,
-            .phasePriority = 100
+            .phasePriority = 100,
+            .reads = {},
+            .writes = {"Simulation.World"}
         };
         return desc;
     }
@@ -75,14 +80,19 @@ public:
     void tick(::ayt::game::FramePhase phase,
               const ::ayt::game::FrameContext& context) override {
         if (phase == ::ayt::game::FramePhase::Ingress) {
+            _ingressTargetSimTick = context.simTick + 1;
+            _stagedIngress = true;
             if (_clientConn) _clientConn->update();
             if (_serverConn) _serverConn->update();
             for (auto& child : _serverClients) {
                 if (child) child->update();
             }
+            _stagedIngress = false;
         } else if (phase == ::ayt::game::FramePhase::FixedPrePhysics) {
-            // Transport polling only queues work. Apply incoming RPCs at the
-            // deterministic simulation boundary before scripts and physics.
+            // Apply packets assigned to this simulation tick once. All data
+            // observed at this frame's Ingress belongs before its first
+            // catch-up tick and is never replayed by later catch-up ticks.
+            drainSimulationInbound(context.simTick);
             _rpcHandler.tick(context.fixedDeltaTime);
         } else if (phase == ::ayt::game::FramePhase::Egress) {
             // Observe the completed World state when producing replication.
@@ -98,6 +108,11 @@ public:
 
     void shutdown() override {
         disconnect();
+        {
+            std::lock_guard<std::mutex> lock(_simulationInboundMutex);
+            _simulationInbound.clear();
+        }
+        _ingressTargetSimTick = 0;
         // R1.A: clear adopt factory so a stray incoming connection during
         // shutdown doesn't try to register through us.
         GnsConnection::setAdoptFactory(nullptr);
@@ -200,32 +215,110 @@ public:
             return;
         }
         const uint8_t channel = decoded.header.channel;
-        BitStream bodyStream(decoded.body.data(), decoded.body.size());
         switch (decoded.header.msgType) {
             case kMsgTypeRpcRequest:
-                bodyStream.resetForRead();
-                _rpcHandler.onRpcRequest(bodyStream, from);
-                return;
             case kMsgTypeRpcResponse:
-                bodyStream.resetForRead();
-                _rpcHandler.onRpcResponse(bodyStream, from);
-                return;
             case kMsgTypeRpcReject:
-                bodyStream.resetForRead();
-                _rpcHandler.onRpcReject(bodyStream, from);
-                return;
-            case kMsgTypeReplication:
             case kMsgTypeDelta:
+            case kMsgTypeReplication:
             case kMsgTypeEntitySpawn:
             case kMsgTypeEntityDespawn:
-                bodyStream.resetForRead();
-                _replicationManager.onReceive(bodyStream, from);
+                if (_stagedIngress) {
+                    queueSimulationInbound(decoded.header.msgType,
+                                           from != nullptr ? from->getId() : 0,
+                                           decoded.body.data(), decoded.body.size());
+                } else {
+                    applySimulationInbound(decoded.header.msgType, from,
+                                           decoded.body.data(), decoded.body.size());
+                }
                 return;
             default:
                 if (_messageHandlers[channel]) {
                     _messageHandlers[channel](from, channel, data, len);
                 }
                 return;
+        }
+    }
+
+    struct PendingSimulationInbound {
+        uint64_t targetSimTick = 0;
+        uint16_t messageType = 0;
+        uint32_t fromNetId = 0;
+        std::vector<uint8_t> body;
+    };
+
+    void queueSimulationInbound(uint16_t messageType,
+                                uint32_t fromNetId,
+                                const uint8_t* body,
+                                size_t bodySize) {
+        PendingSimulationInbound pending;
+        pending.targetSimTick = _ingressTargetSimTick != 0
+            ? _ingressTargetSimTick
+            : 1;
+        pending.messageType = messageType;
+        pending.fromNetId = fromNetId;
+        if (body != nullptr && bodySize != 0) {
+            pending.body.assign(body, body + bodySize);
+        }
+
+        std::lock_guard<std::mutex> lock(_simulationInboundMutex);
+        _simulationInbound.push_back(std::move(pending));
+    }
+
+    NetConnection* findConnectionById(uint32_t netId) const {
+        if (netId == 0) return nullptr;
+        if (_clientNetConn && _clientNetConn->getId() == netId) {
+            return _clientNetConn.get();
+        }
+        for (const auto& connection : _netConns) {
+            if (connection && connection->getId() == netId) return connection.get();
+        }
+        return nullptr;
+    }
+
+    void applySimulationInbound(uint16_t messageType,
+                                NetConnection* from,
+                                uint8_t* body,
+                                size_t bodySize) {
+        BitStream bodyStream(body, bodySize);
+        bodyStream.resetForRead();
+        switch (messageType) {
+        case kMsgTypeRpcRequest:
+            (void)_rpcHandler.onRpcRequest(bodyStream, from);
+            break;
+        case kMsgTypeRpcResponse:
+            (void)_rpcHandler.onRpcResponse(bodyStream, from);
+            break;
+        case kMsgTypeRpcReject:
+            (void)_rpcHandler.onRpcReject(bodyStream, from);
+            break;
+        case kMsgTypeReplication:
+        case kMsgTypeDelta:
+        case kMsgTypeEntitySpawn:
+        case kMsgTypeEntityDespawn:
+            (void)_replicationManager.onReceive(bodyStream, from);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void drainSimulationInbound(uint64_t simTick) {
+        std::vector<PendingSimulationInbound> due;
+        {
+            std::lock_guard<std::mutex> lock(_simulationInboundMutex);
+            while (!_simulationInbound.empty()
+                   && _simulationInbound.front().targetSimTick <= simTick) {
+                due.push_back(std::move(_simulationInbound.front()));
+                _simulationInbound.pop_front();
+            }
+        }
+
+        for (PendingSimulationInbound& pending : due) {
+            NetConnection* from = findConnectionById(pending.fromNetId);
+            if (pending.fromNetId != 0 && from == nullptr) continue;
+            applySimulationInbound(pending.messageType, from,
+                                   pending.body.data(), pending.body.size());
         }
     }
 
@@ -480,6 +573,10 @@ private:
     // R4.0 (2026-07-29): mirrors _replicationManager ownership. Routed by
     // onMessage via PacketHeader.msgType envelope kind.
     RpcHandler _rpcHandler{this};
+    std::mutex _simulationInboundMutex;
+    std::deque<PendingSimulationInbound> _simulationInbound;
+    uint64_t _ingressTargetSimTick = 0;
+    bool _stagedIngress = false;
 };
 
 // 注册宏 — may be stripped from static libs; callers should also invoke
