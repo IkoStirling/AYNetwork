@@ -29,7 +29,13 @@ public:
         static ::ayt::game::SubSystemDescriptor desc = {
             .name = "Network",
             .dependencies = {},  // 无依赖
-            .basePriority = 100  // 早期初始化
+            .basePriority = 100,  // 早期初始化
+            .timeType = ::ayt::game::SubSystemDescriptor::TimeType::Real,
+            .phases = ::ayt::game::phaseBit(::ayt::game::FramePhase::Ingress)
+                    | ::ayt::game::phaseBit(::ayt::game::FramePhase::FixedPrePhysics)
+                    | ::ayt::game::phaseBit(::ayt::game::FramePhase::Egress),
+            .clock = ::ayt::game::ClockDomain::RealWall,
+            .phasePriority = 100
         };
         return desc;
     }
@@ -66,9 +72,26 @@ public:
         _rpcHandler.tick(deltaTime);
     }
 
-    // P0 audit fix (2026-07-26): ISubSystem requires fixedUpdate(float). Network
-    // doesn't need a separate fixed-rate update path — forward to update() so
-    // fixed-timestep clients (physics-coupled) get the same behaviour.
+    void tick(::ayt::game::FramePhase phase,
+              const ::ayt::game::FrameContext& context) override {
+        if (phase == ::ayt::game::FramePhase::Ingress) {
+            if (_clientConn) _clientConn->update();
+            if (_serverConn) _serverConn->update();
+            for (auto& child : _serverClients) {
+                if (child) child->update();
+            }
+        } else if (phase == ::ayt::game::FramePhase::FixedPrePhysics) {
+            // Transport polling only queues work. Apply incoming RPCs at the
+            // deterministic simulation boundary before scripts and physics.
+            _rpcHandler.tick(context.fixedDeltaTime);
+        } else if (phase == ::ayt::game::FramePhase::Egress) {
+            // Observe the completed World state when producing replication.
+            _replicationManager.tick(context.deltaTime);
+        }
+    }
+
+    // Legacy direct-call compatibility. The staged loop uses tick() above and
+    // never enters this adapter for an explicitly phased subsystem.
     void fixedUpdate(float fixedDeltaTime) override {
         update(fixedDeltaTime);
     }
