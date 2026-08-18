@@ -328,6 +328,73 @@ TEST_SUITE_END
 // =============================================================================
 TEST_SUITE(PacketCodecGNS)
 
+TEST_CASE(CodecRejectsOversizedPlainBody) {
+    ayt::test::setCurrentCase("CodecRejectsOversizedPlainBody");
+
+    std::vector<uint8_t> body(PacketCodec::kMaxWireBodySize + 1u, 0x5A);
+    auto wire = PacketCodec::encode(
+        body.data(), body.size(), 7, kSchemaVersion,
+        CHANNEL_RELIABLE, 0, 1, false);
+    CHECK(wire.empty());
+}
+
+TEST_CASE(CodecRejectsDecompressionBomb) {
+    ayt::test::setCurrentCase("CodecRejectsDecompressionBomb");
+
+    std::vector<uint8_t> body(1024, 0x41);
+    auto wire = PacketCodec::encode(
+        body.data(), body.size(), 8, kSchemaVersion,
+        CHANNEL_RELIABLE, 0, 2, true);
+    CHECK(!wire.empty());
+
+    const uint32_t oversized =
+        static_cast<uint32_t>(PacketCodec::kMaxDecodedBodySize + 1u);
+    uint8_t* unc = wire.data() + PacketCodec::kHeaderSize;
+    unc[0] = static_cast<uint8_t>(oversized & 0xFF);
+    unc[1] = static_cast<uint8_t>((oversized >> 8) & 0xFF);
+    unc[2] = static_cast<uint8_t>((oversized >> 16) & 0xFF);
+    unc[3] = static_cast<uint8_t>((oversized >> 24) & 0xFF);
+
+    const uint32_t crc = PacketCodec::computeCrc32c(
+        wire.data(), wire.size() - PacketCodec::kCrcSize);
+    uint8_t* trailer = wire.data() + wire.size() - PacketCodec::kCrcSize;
+    trailer[0] = static_cast<uint8_t>(crc & 0xFF);
+    trailer[1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+    trailer[2] = static_cast<uint8_t>((crc >> 16) & 0xFF);
+    trailer[3] = static_cast<uint8_t>((crc >> 24) & 0xFF);
+
+    auto decoded = PacketCodec::decode(wire.data(), wire.size());
+    CHECK(!decoded.ok);
+    CHECK(decoded.body.empty());
+}
+
+TEST_CASE(AssemblerEnforcesFragmentAndInflightBudgets) {
+    ayt::test::setCurrentCase("AssemblerEnforcesFragmentAndInflightBudgets");
+
+    PacketAssembler assembler;
+    assembler.setMaxFragments(2);
+    assembler.setMaxInFlight(1);
+    assembler.setTimeoutMs(10);
+
+    // [fragmentId=1][index=0][count=3][one-byte chunk]
+    const uint8_t tooManyFragments[] = {1,0,0,0, 0,0, 3,0, 0xAA};
+    auto rejected = assembler.consume(
+        tooManyFragments, sizeof(tooManyFragments), 100);
+    CHECK(!rejected.has_value());
+    CHECK_INT_EQ(assembler.pendingCount(), 0);
+
+    const uint8_t firstAssembly[] = {2,0,0,0, 0,0, 2,0, 0xBB};
+    const uint8_t secondAssembly[] = {3,0,0,0, 0,0, 2,0, 0xCC};
+    (void)assembler.consume(firstAssembly, sizeof(firstAssembly), 100);
+    CHECK_INT_EQ(assembler.pendingCount(), 1);
+    (void)assembler.consume(secondAssembly, sizeof(secondAssembly), 101);
+    CHECK_INT_EQ(assembler.pendingCount(), 1);
+
+    assembler.reapExpired(111);
+    CHECK_INT_EQ(assembler.pendingCount(), 0);
+    CHECK_INT_EQ(assembler.pendingBytes(), 0);
+}
+
 // 8) HELLO/WELCOME sealed as kMsgTypeHandshake frames; onRawData demuxes
 //    by msgType; both sides reach Ready; small app message flows.
 TEST_CASE(HandshakeOverPacketHeaderHappyPath) {

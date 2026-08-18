@@ -339,4 +339,86 @@ TEST_CASE(LateJoinClientReceivesRebroadcastedEntitySpawn) {
     delete client2;
 }
 
+TEST_CASE(ProductionDefaultsAndAdmissionGate) {
+    ayt::test::setCurrentCase("ProductionDefaultsAndAdmissionGate");
+
+    INetworkSubSystem* server = createNetworkSubSystemForTest();
+    INetworkSubSystem* client = createNetworkSubSystemForTest();
+    CHECK(server != nullptr);
+    CHECK(client != nullptr);
+    CHECK(server->initialize());
+    CHECK(client->initialize());
+
+    CHECK_INT_EQ(server->getProtocolVersion(), kProtocolVersion);
+    CHECK(!server->isConnected());
+
+    NetworkLimits limits = server->getLimits();
+    limits.maxConnections = 1;
+    limits.maxQueuedInboundMessages = 16;
+    server->setLimits(limits);
+    CHECK_INT_EQ(server->getLimits().maxConnections, 1);
+
+    std::atomic<int> admissionCalls{0};
+    server->setAcceptCallback([&](NetConnection* connection) {
+        CHECK(connection != nullptr);
+        admissionCalls.fetch_add(1);
+        return false;
+    });
+
+    constexpr uint16_t kPort = 27552;
+    server->listen(kPort);
+    CHECK(server->isListening());
+    CHECK(!server->isConnected());
+    client->connect("127.0.0.1", kPort);
+
+    std::vector<INetworkSubSystem*> systems{server, client};
+    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
+        pumpAll(systems);
+        return admissionCalls.load() == 1;
+    }));
+    CHECK(server->getConnections().empty());
+
+    server->disconnect();
+    client->disconnect();
+    server->shutdown();
+    client->shutdown();
+    delete server;
+    delete client;
+}
+
+TEST_CASE(SubsystemProtocolMismatchIsRejected) {
+    ayt::test::setCurrentCase("SubsystemProtocolMismatchIsRejected");
+
+    INetworkSubSystem* server = createNetworkSubSystemForTest();
+    INetworkSubSystem* client = createNetworkSubSystemForTest();
+    CHECK(server->initialize());
+    CHECK(client->initialize());
+    client->setProtocolVersion(kProtocolVersion + 1);
+
+    std::atomic<bool> mismatch{false};
+    client->onConnectionChange(
+        [&](NetConnection*, bool connected, DisconnectReason reason) {
+            if (!connected && reason == DisconnectReason::ProtocolMismatch) {
+                mismatch.store(true);
+            }
+        });
+
+    constexpr uint16_t kPort = 27553;
+    server->listen(kPort);
+    client->connect("127.0.0.1", kPort);
+    std::vector<INetworkSubSystem*> systems{server, client};
+    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
+        pumpAll(systems);
+        return mismatch.load();
+    }));
+    CHECK(server->getConnections().empty());
+
+    server->disconnect();
+    client->disconnect();
+    server->shutdown();
+    client->shutdown();
+    delete server;
+    delete client;
+}
+
 TEST_SUITE_END

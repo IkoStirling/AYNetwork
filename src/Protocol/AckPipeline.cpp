@@ -74,8 +74,8 @@ void AckTracker::registerPending(uint32_t seq, Callback cb, uint32_t timeoutMs) 
     if (!cb) return;
     Entry entry;
     entry.cb = std::move(cb);
-    entry.deadline = std::chrono::steady_clock::now() +
-                     std::chrono::milliseconds(timeoutMs);
+    entry.deadlineUs = ayt::performanceNowUs()
+        + static_cast<uint64_t>(timeoutMs) * 1000u;
     std::lock_guard<std::mutex> lk(_mutex);
     _pending[seq] = std::move(entry);
 }
@@ -93,12 +93,12 @@ void AckTracker::onAck(uint32_t seq) {
 }
 
 void AckTracker::expire() {
-    const auto now = std::chrono::steady_clock::now();
+    const uint64_t nowUs = ayt::performanceNowUs();
     std::vector<Callback> expired;
     {
         std::lock_guard<std::mutex> lk(_mutex);
         for (auto it = _pending.begin(); it != _pending.end();) {
-            if (now >= it->second.deadline) {
+            if (nowUs >= it->second.deadlineUs) {
                 expired.push_back(std::move(it->second.cb));
                 it = _pending.erase(it);
             } else {

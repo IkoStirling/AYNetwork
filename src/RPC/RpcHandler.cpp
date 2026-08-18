@@ -20,7 +20,6 @@
 
 #include <cstring>
 #include <cstdio>
-#include <chrono>
 #include <condition_variable>
 #include <atomic>
 #include <queue>
@@ -690,20 +689,20 @@ void RpcHandler::registerPendingWithRetry(uint64_t callId, RpcCallback cb,
         static_cast<const uint8_t*>(requestBody.getData()),
         static_cast<const uint8_t*>(requestBody.getData()) + requestBody.getSize());
     entry.phase = PendingPhase::AwaitingResponse;
-    entry.deadline = std::chrono::steady_clock::now() +
-                     std::chrono::milliseconds(_pendingTimeoutMs);
+    entry.deadlineUs = ayt::performanceNowUs()
+        + static_cast<uint64_t>(_pendingTimeoutMs) * 1000u;
     std::lock_guard<std::mutex> lk(_pendingCallsMutex);
     _pendingCalls[callId] = std::move(entry);
 }
 
 void RpcHandler::expirePendingCalls() {
-    const auto now = std::chrono::steady_clock::now();
+    const uint64_t nowUs = ayt::performanceNowUs();
     std::vector<uint64_t> due;
     {
         std::lock_guard<std::mutex> lk(_pendingCallsMutex);
         due.reserve(_pendingCalls.size());
         for (const auto& kv : _pendingCalls) {
-            if (now >= kv.second.deadline) due.push_back(kv.first);
+            if (nowUs >= kv.second.deadlineUs) due.push_back(kv.first);
         }
     }
 
@@ -718,7 +717,7 @@ void RpcHandler::expirePendingCalls() {
             auto it = _pendingCalls.find(callId);
             if (it == _pendingCalls.end()) continue;
             PendingEntry& entry = it->second;
-            if (now < entry.deadline) continue;
+            if (nowUs < entry.deadlineUs) continue;
 
             if (entry.phase == PendingPhase::Backoff) {
                 if (entry.retryEnabled) {
@@ -726,14 +725,14 @@ void RpcHandler::expirePendingCalls() {
                     action = PendingAction::Resend;
                 }
                 entry.phase = PendingPhase::AwaitingResponse;
-                entry.deadline = std::chrono::steady_clock::now() +
-                                 std::chrono::milliseconds(_pendingTimeoutMs);
+                entry.deadlineUs = ayt::performanceNowUs()
+                    + static_cast<uint64_t>(_pendingTimeoutMs) * 1000u;
             } else if (entry.retryEnabled && entry.retriesLeft > 0) {
                 entry.retriesLeft--;
                 entry.retryCount++;
                 entry.phase = PendingPhase::Backoff;
-                entry.deadline = std::chrono::steady_clock::now() +
-                                 std::chrono::milliseconds(computeRetryBackoffMs(entry.retryCount));
+                entry.deadlineUs = ayt::performanceNowUs()
+                    + static_cast<uint64_t>(computeRetryBackoffMs(entry.retryCount)) * 1000u;
             } else {
                 failCb = std::move(entry.cb);
                 _pendingCalls.erase(it);

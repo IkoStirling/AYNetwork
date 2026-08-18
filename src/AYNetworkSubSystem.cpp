@@ -13,10 +13,12 @@
 // fully-typed pointer in this TU — we just need the constants.
 #include <steam/steamclientpublic.h>
 #include <steam/isteamnetworkingsockets.h>
+#include <algorithm>
 #include <cstdio>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace ayt::net
@@ -26,6 +28,26 @@ namespace ayt::net
 // NetworkSubSystem - 子系统实现
 // =============================================================================
 class NetworkSubSystem : public INetworkSubSystem {
+    struct ServerClientRecord {
+        std::unique_ptr<GnsConnection> transport;
+        std::unique_ptr<NetConnectionImpl> facade;
+        bool extensionDisconnectNotified = false;
+    };
+
+    enum class DeferredControlType : uint8_t {
+        None,
+        Connect,
+        Listen,
+        Disconnect,
+        Shutdown,
+    };
+
+    struct DeferredControl {
+        DeferredControlType type = DeferredControlType::None;
+        std::string address;
+        uint16_t port = 0;
+    };
+
 public:
     const char* getName() const override { return "Network"; }
     const ::ayt::game::SubSystemDescriptor& getDescriptor() const override {
@@ -46,12 +68,14 @@ public:
     }
 
     bool initialize() override {
+        if (_initialized) return true;
         // R1 (2026-07-26): bring up GNS once per process. Ref-counted, so
         // subsequent initialise/shutdown cycles are safe.
         if (!gns::init()) {
             ::printf("[Network] Failed to init GameNetworkingSockets\n");
             return false;
         }
+        _initialized = true;
         ::printf("[Network] Initialized (GNS ready)\n");
         return true;
     }
@@ -64,15 +88,7 @@ public:
         // expected GameLoop semantics).
         // R1.A (2026-07-27): pump client conn (if any), server parent (if
         // listening), AND all server children (accepted client connections).
-        if (_clientConn) {
-            _clientConn->update();
-        }
-        if (_serverConn) {
-            _serverConn->update();
-        }
-        for (auto& child : _serverClients) {
-            if (child) child->update();
-        }
+        pumpTransport();
         _replicationManager.tick(deltaTime);
         _rpcHandler.tick(deltaTime);
     }
@@ -82,11 +98,7 @@ public:
         if (phase == ::ayt::game::FramePhase::Ingress) {
             _ingressTargetSimTick = context.simTick + 1;
             _stagedIngress = true;
-            if (_clientConn) _clientConn->update();
-            if (_serverConn) _serverConn->update();
-            for (auto& child : _serverClients) {
-                if (child) child->update();
-            }
+            pumpTransport();
             _stagedIngress = false;
         } else if (phase == ::ayt::game::FramePhase::FixedPrePhysics) {
             // Apply packets assigned to this simulation tick once. All data
@@ -107,16 +119,24 @@ public:
     }
 
     void shutdown() override {
-        disconnect();
+        if (!_initialized) return;
+        if (GnsConnection::isPumping()) {
+            _deferredControl = {DeferredControlType::Shutdown, {}, 0};
+            return;
+        }
+        shutdownNow();
+    }
+
+    void shutdownNow() {
+        disconnectNow();
         {
             std::lock_guard<std::mutex> lock(_simulationInboundMutex);
             _simulationInbound.clear();
+            _simulationInboundBytes = 0;
         }
         _ingressTargetSimTick = 0;
-        // R1.A: clear adopt factory so a stray incoming connection during
-        // shutdown doesn't try to register through us.
-        GnsConnection::setAdoptFactory(nullptr);
         gns::shutdown();
+        _initialized = false;
         ::printf("[Network] Shutdown\n");
     }
 
@@ -129,6 +149,12 @@ public:
             ::fprintf(stderr, "[Network] incoming conn %u but server not listening\n", incoming);
             return nullptr;
         }
+        if (_serverClients.size() >= _limits.maxConnections) {
+            GnsConnection::s_gns->CloseConnection(
+                incoming, 0, "server connection limit reached", false);
+            ++_rejectedConnections;
+            return nullptr;
+        }
         // Accept the connection on GNS side first.
         EResult r = GnsConnection::s_gns->AcceptConnection(incoming);
         if (r != k_EResultOK) {
@@ -137,23 +163,22 @@ public:
         }
         // Create the server-child GnsConnection, install it in our list.
         auto child = std::make_unique<GnsConnection>();
+        child->setProtocolVersion(_protocolVersion);
         child->adoptIncomingConnection(incoming);
 
         // R1.A: route onData to the registered message handler (if any).
         GnsConnection* rawChild = child.get();
-        NetConnectionImpl* netPtr = nullptr;
-        {
-            auto netConn = std::make_unique<NetConnectionImpl>(rawChild, ++_nextNetId);
-            netPtr = netConn.get();
-            _netConns.push_back(std::move(netConn));
-        }
+        auto netConn = std::make_unique<NetConnectionImpl>(rawChild, allocateNetId());
+        NetConnectionImpl* netPtr = netConn.get();
 
-        // R4.1: INetworkExtension::onIncomingConnection gate. Returning false
-        // rejects the connection. Fire BEFORE pushing into _serverClients so
-        // the extension's decision is atomic with the accept.
-        if (_extension && !_extension->onIncomingConnection(netPtr)) {
-            rawChild->disconnect("rejected by extension");
-            _netConns.pop_back();
+        // Both public admission APIs participate in the same atomic gate.
+        bool accepted = !_acceptCallback || _acceptCallback(netPtr);
+        if (accepted && _extension) {
+            accepted = _extension->onIncomingConnection(netPtr);
+        }
+        if (!accepted) {
+            rawChild->disconnect("connection admission rejected");
+            ++_rejectedConnections;
             return nullptr;
         }
 
@@ -189,7 +214,10 @@ public:
         }
 
         GnsConnection* raw = child.get();
-        _serverClients.push_back(std::move(child));
+        ServerClientRecord record;
+        record.transport = std::move(child);
+        record.facade = std::move(netConn);
+        _serverClients.push_back(std::move(record));
         ::printf("[Network] accepted incoming client (now %zu clients)\n", _serverClients.size());
         return raw;
     }
@@ -251,6 +279,15 @@ public:
                                 uint32_t fromNetId,
                                 const uint8_t* body,
                                 size_t bodySize) {
+        std::lock_guard<std::mutex> lock(_simulationInboundMutex);
+        if ((body == nullptr && bodySize != 0) ||
+            bodySize > _limits.maxQueuedInboundBytes ||
+            _simulationInbound.size() >= _limits.maxQueuedInboundMessages ||
+            bodySize > _limits.maxQueuedInboundBytes - _simulationInboundBytes) {
+            ++_droppedInboundMessages;
+            return;
+        }
+
         PendingSimulationInbound pending;
         pending.targetSimTick = _ingressTargetSimTick != 0
             ? _ingressTargetSimTick
@@ -260,8 +297,7 @@ public:
         if (body != nullptr && bodySize != 0) {
             pending.body.assign(body, body + bodySize);
         }
-
-        std::lock_guard<std::mutex> lock(_simulationInboundMutex);
+        _simulationInboundBytes += pending.body.size();
         _simulationInbound.push_back(std::move(pending));
     }
 
@@ -270,8 +306,10 @@ public:
         if (_clientNetConn && _clientNetConn->getId() == netId) {
             return _clientNetConn.get();
         }
-        for (const auto& connection : _netConns) {
-            if (connection && connection->getId() == netId) return connection.get();
+        for (const auto& connection : _serverClients) {
+            if (connection.facade && connection.facade->getId() == netId) {
+                return connection.facade.get();
+            }
         }
         return nullptr;
     }
@@ -310,6 +348,7 @@ public:
             while (!_simulationInbound.empty()
                    && _simulationInbound.front().targetSimTick <= simTick) {
                 due.push_back(std::move(_simulationInbound.front()));
+                _simulationInboundBytes -= due.back().body.size();
                 _simulationInbound.pop_front();
             }
         }
@@ -328,16 +367,102 @@ public:
         }
     }
 
+    uint32_t allocateNetId() {
+        do {
+            ++_nextNetId;
+        } while (_nextNetId == INVALID_NET_ID);
+        return _nextNetId;
+    }
+
+    void pumpTransport() {
+        const GnsPumpBudget budget{
+            _limits.maxPumpMessages,
+            _limits.maxPumpBytes,
+        };
+        const GnsPumpResult result = GnsConnection::pump(budget);
+        if (result.budgetExhausted) ++_pumpBudgetExhaustions;
+        reapDisconnectedClients();
+        processDeferredControl();
+    }
+
+    void reapDisconnectedClients() {
+        auto it = _serverClients.begin();
+        while (it != _serverClients.end()) {
+            if (!it->transport ||
+                it->transport->getState() == GnsConnectionState::Disconnected) {
+                if (_extension && it->facade &&
+                    !it->extensionDisconnectNotified) {
+                    _extension->onConnectionDisconnected(it->facade.get());
+                    it->extensionDisconnectNotified = true;
+                }
+                it = _serverClients.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void clearServerClients(const char* reason) {
+        for (auto& record : _serverClients) {
+            if (_extension && record.facade &&
+                !record.extensionDisconnectNotified) {
+                _extension->onConnectionDisconnected(record.facade.get());
+                record.extensionDisconnectNotified = true;
+            }
+            if (record.transport) record.transport->disconnect(reason);
+        }
+        _serverClients.clear();
+    }
+
+    void processDeferredControl() {
+        if (_deferredControl.type == DeferredControlType::None ||
+            GnsConnection::isPumping()) {
+            return;
+        }
+        DeferredControl control = std::move(_deferredControl);
+        _deferredControl = {};
+        switch (control.type) {
+        case DeferredControlType::Connect:
+            connectNow(control.address.c_str(), control.port);
+            break;
+        case DeferredControlType::Listen:
+            listenNow(control.port);
+            break;
+        case DeferredControlType::Disconnect:
+            disconnectNow();
+            break;
+        case DeferredControlType::Shutdown:
+            shutdownNow();
+            break;
+        case DeferredControlType::None:
+            break;
+        }
+    }
+
     // ===== 连接管理 =====
     void connect(const char* address, uint16_t port) override {
+        if (GnsConnection::isPumping()) {
+            _deferredControl = {
+                DeferredControlType::Connect,
+                address ? address : "",
+                port,
+            };
+            return;
+        }
+        connectNow(address, port);
+    }
+
+    void connectNow(const char* address, uint16_t port) {
         if (_clientConn) {
             _clientConn->disconnect("superseded by connect()");
             _clientConn.reset();
             _clientNetConn.reset();
         }
         _clientConn = std::make_unique<GnsConnection>();
+        _clientConn->setProtocolVersion(_protocolVersion);
         _clientConn->initClient(address, port);
-        _clientNetConn = std::make_unique<NetConnectionImpl>(_clientConn.get(), ++_nextNetId);
+        _clientNetConn = std::make_unique<NetConnectionImpl>(
+            _clientConn.get(), allocateNetId());
         _mode = ConnectionMode::Client;
         installInboundRoutes();
         if (_connectionHandler) {
@@ -354,30 +479,29 @@ public:
     }
 
     void listen(uint16_t port) override {
+        if (GnsConnection::isPumping()) {
+            _deferredControl = {DeferredControlType::Listen, {}, port};
+            return;
+        }
+        listenNow(port);
+    }
+
+    void listenNow(uint16_t port) {
         if (_serverConn) {
             _serverConn->disconnect("superseded by listen()");
             _serverConn.reset();
         }
-        // R1.A: clear any leftover server children from a previous listen.
-        // R4.1: fire onConnectionDisconnected for each before dropping.
-        for (size_t i = 0; i < _netConns.size(); ++i) {
-            if (_extension && _netConns[i]) _extension->onConnectionDisconnected(_netConns[i].get());
-        }
-        for (auto& child : _serverClients) {
-            if (child) child->disconnect("superseded by listen()");
-        }
-        _serverClients.clear();
-        _netConns.clear();
-        _nextNetId = 0;
+        clearServerClients("superseded by listen()");
 
         _serverConn = std::make_unique<GnsConnection>();
+        _serverConn->setProtocolVersion(_protocolVersion);
         _serverConn->initServer(port);
-        // R4.1-A: adopt factory is registered only while listening so multiple
-        // subsystem instances (e.g. integration tests) can initialize GNS
-        // without clobbering the server's incoming-connection handler.
-        GnsConnection::setAdoptFactory([this](HSteamNetConnection incoming) -> GnsConnection* {
-            return this->adoptIncomingClient(incoming);
-        });
+        const HSteamListenSocket listener = _serverConn->getInnerListenSocket();
+        GnsConnection::setAdoptFactory(
+            listener,
+            [this](HSteamNetConnection incoming) -> GnsConnection* {
+                return this->adoptIncomingClient(incoming);
+            });
         // R4.1: listen() means "host is also a player" — design §6.6
         // distinguishes Server (dedicated) vs ListenServer (host). R4.0
         // collapsed these; R4.1 fixes the typo so ReplicationManager's
@@ -387,44 +511,71 @@ public:
     }
 
     void disconnect() override {
+        if (GnsConnection::isPumping()) {
+            _deferredControl = {DeferredControlType::Disconnect, {}, 0};
+            return;
+        }
+        disconnectNow();
+    }
+
+    void disconnectNow() {
         if (_clientConn) {
             _clientConn->disconnect("client disconnect");
             _clientConn.reset();
             _clientNetConn.reset();
         }
         if (_serverConn) {
-            GnsConnection::setAdoptFactory(nullptr);
             _serverConn->disconnect("server shutdown");
             _serverConn.reset();
         }
-        // R1.A: tear down all server children too. R4.1: fire
-        // onConnectionDisconnected BEFORE reset so the extension sees
-        // the conn in its valid state.
-        for (auto& c : _netConns) {
-            if (c && _extension) _extension->onConnectionDisconnected(c.get());
+        clearServerClients("server shutdown");
+        {
+            std::lock_guard<std::mutex> lock(_simulationInboundMutex);
+            _simulationInbound.clear();
+            _simulationInboundBytes = 0;
         }
-        for (auto& child : _serverClients) {
-            if (child) child->disconnect("server shutdown");
-        }
-        _serverClients.clear();
-        _netConns.clear();
-        _nextNetId = 0;
         _mode = ConnectionMode::Disconnected;
     }
 
     bool isConnected() const override {
         if (_clientConn && _clientConn->isConnected()) return true;
-        if (_serverConn && _serverConn->isConnected()) return true;
-        // R1.A: server is also "connected" if at least one client is connected.
         for (auto& child : _serverClients) {
-            if (child && child->isConnected()) return true;
+            if (child.transport && child.transport->isConnected()) return true;
         }
         return false;
+    }
+
+    bool isListening() const override {
+        return _serverConn &&
+            _serverConn->getInnerListenSocket() != k_HSteamListenSocket_Invalid;
     }
 
     ConnectionMode getMode() const override {
         return _mode;
     }
+
+    void setProtocolVersion(uint32_t version) override {
+        if (_clientConn || _serverConn || !_serverClients.empty()) {
+            ::fprintf(stderr,
+                "[Network] setProtocolVersion ignored while transport is active\n");
+            return;
+        }
+        _protocolVersion = version;
+    }
+
+    uint32_t getProtocolVersion() const override { return _protocolVersion; }
+
+    void setLimits(const NetworkLimits& limits) override {
+        _limits.maxConnections = std::max(1u, limits.maxConnections);
+        _limits.maxPumpMessages = std::max(1u, limits.maxPumpMessages);
+        _limits.maxPumpBytes = std::max(1u, limits.maxPumpBytes);
+        _limits.maxQueuedInboundMessages =
+            std::max(1u, limits.maxQueuedInboundMessages);
+        _limits.maxQueuedInboundBytes =
+            std::max(1u, limits.maxQueuedInboundBytes);
+    }
+
+    NetworkLimits getLimits() const override { return _limits; }
 
     // ===== 消息发送 =====
     void send(uint8_t channel, const void* data, size_t size) override {
@@ -445,17 +596,17 @@ public:
     void broadcast(uint8_t channel, const void* data, size_t size) override {
         // R1.A: actually iterate all server children and send to each.
         for (auto& child : _serverClients) {
-            if (child && child->isConnected()) {
-                child->send(channel, data, size);
+            if (child.transport && child.transport->isConnected()) {
+                child.transport->send(channel, data, size);
             }
         }
     }
 
     void broadcastExcept(NetConnection* exclude, uint8_t channel, const void* data, size_t size) override {
-        for (auto& netConn : _netConns) {
-            if (!netConn || !netConn->isConnected()) continue;
-            if (exclude && netConn.get() == exclude) continue;
-            netConn->send(channel, data, size);
+        for (auto& record : _serverClients) {
+            if (!record.facade || !record.facade->isConnected()) continue;
+            if (exclude && record.facade.get() == exclude) continue;
+            record.facade->send(channel, data, size);
         }
     }
 
@@ -502,13 +653,12 @@ public:
     }
 
     const std::vector<NetConnection*>& getConnections() override {
-        // R4.1: rebuild on each call from _netConns (the owning vector).
-        // R4.0 returned a permanently-empty _connections (never populated);
-        // that's the bug. N≤100 → rebuild cost is negligible.
         _connections.clear();
-        _connections.reserve(_netConns.size());
-        for (auto& c : _netConns) {
-            if (c) _connections.push_back(c.get());
+        _connections.reserve(_serverClients.size());
+        for (auto& record : _serverClients) {
+            if (record.facade && record.facade->isConnected()) {
+                _connections.push_back(record.facade.get());
+            }
         }
         return _connections;
     }
@@ -540,6 +690,7 @@ public:
 
 private:
     ConnectionMode _mode = ConnectionMode::Disconnected;
+    bool _initialized = false;
     bool _connected = false;
     uint32_t _hostId = 0;
 
@@ -556,14 +707,14 @@ private:
     std::unique_ptr<GnsConnection> _clientConn;
     std::unique_ptr<NetConnectionImpl> _clientNetConn;
     std::unique_ptr<GnsConnection> _serverConn;
-    std::vector<std::unique_ptr<GnsConnection>> _serverClients;
-
-    // R4.1: mirror of _serverClients that owns the NetConnectionImpl
-    // adapters. Populated in adoptIncomingClient; cleared on listen()/disconnect().
-    // _netConns is the source of truth for getConnections() (rebuilt into
-    // _connections on each call to avoid stale-pointer bugs).
-    std::vector<std::unique_ptr<NetConnectionImpl>> _netConns;
+    std::vector<ServerClientRecord> _serverClients;
     uint32_t _nextNetId = 0;
+    uint32_t _protocolVersion = kProtocolVersion;
+    NetworkLimits _limits{};
+    DeferredControl _deferredControl{};
+    uint64_t _rejectedConnections = 0;
+    uint64_t _pumpBudgetExhaustions = 0;
+    uint64_t _droppedInboundMessages = 0;
 
     // Pending handler captured at onConnectionChange time so adoptIncomingClient()
     // can install it on each new server child.
@@ -575,6 +726,7 @@ private:
     RpcHandler _rpcHandler{this};
     std::mutex _simulationInboundMutex;
     std::deque<PendingSimulationInbound> _simulationInbound;
+    size_t _simulationInboundBytes = 0;
     uint64_t _ingressTargetSimTick = 0;
     bool _stagedIngress = false;
 };

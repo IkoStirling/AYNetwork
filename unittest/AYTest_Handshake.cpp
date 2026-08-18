@@ -75,7 +75,7 @@ TEST_CASE(HandshakeHappyPath) {
     // Wait for server-side adopted child to reach Ready. The server parent
     // GnsConnection stays Connected (it only owns the listen socket), but
     // the adopt-fallback path replaces its _conn with the child's. Since the
-    // no-factory fallback adopts into serverAdopters().front() and erases
+    // no-factory fallback adopts into the owner of this exact listen socket
     // it, the *server-side GnsConnection* becomes the child's container.
     // Verify its state also reached Ready.
     bool serverReady = pumpUntil(client, server, std::chrono::seconds(5), [&] {

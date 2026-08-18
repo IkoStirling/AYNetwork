@@ -18,6 +18,11 @@ std::vector<std::vector<uint8_t>> PacketAssembler::fragment(
 {
     std::vector<std::vector<uint8_t>> frames;
 
+    if ((payload == nullptr && payloadLen != 0) ||
+        payloadLen > kDefaultMaxReassembledBytes) {
+        return frames;
+    }
+
     // Per-fragment body = [FragmentHeader 8B][chunk]. Each frame wire =
     // [PacketHeader 12B][body][CRC32C 4B].
     // chunkSize = mtu - 12 - 8 - 4 = mtu - 24.
@@ -33,9 +38,11 @@ std::vector<std::vector<uint8_t>> PacketAssembler::fragment(
                                 - PacketCodec::kCrcSize;
     if (chunkSize == 0) return frames;
 
-    const uint16_t fragmentCount = (payloadLen == 0)
+    const size_t fragmentCountWide = (payloadLen == 0)
         ? 1u
-        : static_cast<uint16_t>((payloadLen + chunkSize - 1) / chunkSize);
+        : ((payloadLen + chunkSize - 1) / chunkSize);
+    if (fragmentCountWide > kDefaultMaxFragments) return frames;
+    const uint16_t fragmentCount = static_cast<uint16_t>(fragmentCountWide);
 
     // Special case: payload fits in one frame, no Fragmented flag.
     if (fragmentCount == 1) {
@@ -66,6 +73,7 @@ std::vector<std::vector<uint8_t>> PacketAssembler::fragment(
             static_cast<uint8_t>(PacketFlag::Fragmented),
             timestampMs,
             /*compress=*/false);
+        if (frame.empty()) return {};
         frames.push_back(std::move(frame));
         return frames;
     }
@@ -100,6 +108,7 @@ std::vector<std::vector<uint8_t>> PacketAssembler::fragment(
             static_cast<uint8_t>(PacketFlag::Fragmented),
             timestampMs,
             /*compress=*/false);
+        if (frame.empty()) return {};
         frames.push_back(std::move(frame));
     }
     return frames;
@@ -111,6 +120,16 @@ std::vector<std::vector<uint8_t>> PacketAssembler::fragment(
 std::optional<std::vector<uint8_t>> PacketAssembler::consume(
     const uint8_t* fragBody, size_t fragBodyLen)
 {
+    const uint32_t nowMs = static_cast<uint32_t>(
+        (ayt::performanceNowUs() / 1000u) & 0xFFFFFFFFu);
+    return consume(fragBody, fragBodyLen, nowMs);
+}
+
+std::optional<std::vector<uint8_t>> PacketAssembler::consume(
+    const uint8_t* fragBody, size_t fragBodyLen, uint32_t monotonicNowMs)
+{
+    reapExpired(monotonicNowMs);
+
     if (fragBody == nullptr ||
         fragBodyLen < PacketCodec::kFragmentHeaderSize) {
         return std::nullopt;
@@ -129,17 +148,24 @@ std::optional<std::vector<uint8_t>> PacketAssembler::consume(
           static_cast<uint16_t>(fh[6])
         | (static_cast<uint16_t>(fh[7]) << 8);
 
-    if (fragmentCount == 0 || fragmentIndex >= fragmentCount) {
+    if (fragmentCount == 0 || fragmentIndex >= fragmentCount ||
+        fragmentCount > _maxFragments) {
         return std::nullopt; // malformed
     }
 
     const uint8_t* chunk = fragBody + PacketCodec::kFragmentHeaderSize;
     const size_t   chunkLen = fragBodyLen - PacketCodec::kFragmentHeaderSize;
 
-    auto& buf = _pending[fragmentId];
+    auto pendingIt = _pending.find(fragmentId);
+    if (pendingIt == _pending.end()) {
+        if (_pending.size() >= _maxInFlight) return std::nullopt;
+        pendingIt = _pending.emplace(fragmentId, FragmentBuffer{}).first;
+    }
+    auto& buf = pendingIt->second;
     if (buf.fragmentCount == 0) {
         // First time we see this id — initialize.
         buf.fragmentCount = fragmentCount;
+        buf.firstSeenMs = monotonicNowMs;
         buf.receivedMask.assign(fragmentCount, false);
         // We don't know maxChunk up front; instead, we'll copy each
         // chunk at a tentative offset based on observed index. The
@@ -159,10 +185,20 @@ std::optional<std::vector<uint8_t>> PacketAssembler::consume(
         return std::nullopt;
     }
 
+
+    if (chunkLen > _maxReassembledBytes - buf.totalBytes ||
+        chunkLen > _maxPendingBytes - _pendingBytes) {
+        _pendingBytes -= buf.totalBytes;
+        _pending.erase(pendingIt);
+        return std::nullopt;
+    }
+
     // Record the chunk at its tentative position. We'll flatten on completion.
     buf._indexToChunk[fragmentIndex].assign(chunk, chunk + chunkLen);
     buf.receivedMask[fragmentIndex] = true;
     buf.receivedCount++;
+    buf.totalBytes += chunkLen;
+    _pendingBytes += chunkLen;
 
     if (buf.receivedCount != buf.fragmentCount) {
         return std::nullopt;
@@ -184,12 +220,28 @@ std::optional<std::vector<uint8_t>> PacketAssembler::consume(
     }
 
     // Reap.
+    _pendingBytes -= buf.totalBytes;
     _pending.erase(fragmentId);
     return out;
 }
 
 void PacketAssembler::clear() {
     _pending.clear();
+    _pendingBytes = 0;
+}
+
+void PacketAssembler::reapExpired(uint32_t monotonicNowMs) {
+    for (auto it = _pending.begin(); it != _pending.end();) {
+        // Unsigned subtraction intentionally handles the 32-bit millisecond
+        // clock wrapping roughly every 49 days.
+        if (static_cast<uint32_t>(monotonicNowMs - it->second.firstSeenMs) >=
+            _timeoutMs) {
+            _pendingBytes -= it->second.totalBytes;
+            it = _pending.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 } // namespace ayt::net

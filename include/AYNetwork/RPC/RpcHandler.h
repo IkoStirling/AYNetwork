@@ -13,7 +13,6 @@
 #include <AYReflect/IReflect.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -216,8 +215,8 @@ public:
         std::lock_guard<std::mutex> lk(_pendingCallsMutex);
         PendingEntry entry;
         entry.cb = std::move(cb);
-        entry.deadline = std::chrono::steady_clock::now() +
-                         std::chrono::milliseconds(_pendingTimeoutMs);
+        entry.deadlineUs = ayt::performanceNowUs()
+            + static_cast<uint64_t>(_pendingTimeoutMs) * 1000u;
         _pendingCalls[callId] = std::move(entry);
     }
     bool hasPending(uint64_t callId) const {
@@ -305,7 +304,7 @@ private:
 
     struct PendingEntry {
         RpcCallback cb;
-        std::chrono::steady_clock::time_point deadline;
+        uint64_t deadlineUs = 0;
         PendingPhase phase = PendingPhase::AwaitingResponse;
         uint32_t retriesLeft = 0;
         uint32_t retryCount = 0;

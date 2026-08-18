@@ -31,6 +31,9 @@ namespace ayt::net
 
 class PacketAssembler {
 public:
+    static constexpr uint16_t kDefaultMaxFragments = 4096;
+    static constexpr size_t kDefaultMaxReassembledBytes = 4u * 1024u * 1024u;
+    static constexpr size_t kDefaultMaxPendingBytes = 8u * 1024u * 1024u;
     // ========================================================================
     // Fragment a payload into N sealed frames. If payloadLen fits in one
     // MTU, returns a single-element vector. Last fragment may be shorter
@@ -66,13 +69,22 @@ public:
     // ========================================================================
     std::optional<std::vector<uint8_t>> consume(
         const uint8_t* fragBody, size_t fragBodyLen);
+    std::optional<std::vector<uint8_t>> consume(
+        const uint8_t* fragBody, size_t fragBodyLen, uint32_t monotonicNowMs);
 
     // Drop all in-flight reassembly state.
     void clear();
+    void reapExpired(uint32_t monotonicNowMs);
 
     // Configuration
-    void setMaxInFlight(uint32_t n)  { _maxInFlight = n; }
-    void setTimeoutMs(uint32_t ms)  { _timeoutMs = ms; }
+    void setMaxInFlight(uint32_t n) { _maxInFlight = n == 0 ? 1 : n; }
+    void setTimeoutMs(uint32_t ms) { _timeoutMs = ms == 0 ? 1 : ms; }
+    void setMaxFragments(uint16_t n) { _maxFragments = n == 0 ? 1 : n; }
+    void setMaxReassembledBytes(size_t n) { _maxReassembledBytes = n == 0 ? 1 : n; }
+    void setMaxPendingBytes(size_t n) { _maxPendingBytes = n == 0 ? 1 : n; }
+
+    size_t pendingCount() const { return _pending.size(); }
+    size_t pendingBytes() const { return _pendingBytes; }
 
 private:
     struct FragmentBuffer {
@@ -82,13 +94,18 @@ private:
         // R1 over-alloc bug (which sized chunks as count*chunkSize and
         // ignored last-fragment-is-shorter).
         std::vector<std::vector<uint8_t>> _indexToChunk;
-        uint32_t                 firstSeenMs = 0;    // for timeout (R3 uses)
+        uint32_t                 firstSeenMs = 0;    // monotonic arrival time
         uint32_t                 receivedCount = 0;  // unique received
+        size_t                   totalBytes = 0;
     };
 
     std::unordered_map<uint32_t, FragmentBuffer> _pending;
-    uint32_t _maxInFlight = 64;
+    uint32_t _maxInFlight = 32;
     uint32_t _timeoutMs   = 5000;
+    uint16_t _maxFragments = kDefaultMaxFragments;
+    size_t _maxReassembledBytes = kDefaultMaxReassembledBytes;
+    size_t _maxPendingBytes = kDefaultMaxPendingBytes;
+    size_t _pendingBytes = 0;
 };
 
 } // namespace ayt::net

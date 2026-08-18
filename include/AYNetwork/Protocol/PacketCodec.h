@@ -37,6 +37,9 @@ public:
     static constexpr size_t kCrcSize          = 4;
     static constexpr size_t kUncompressedSizePrefix = 4; // u32 before lz4 block
     static constexpr size_t kFragmentHeaderSize = sizeof(FragmentHeader); // 8
+    static constexpr size_t kMaxWireBodySize = 0xFFFFu;
+    static constexpr size_t kMaxDecodedBodySize = 4u * 1024u * 1024u;
+    static constexpr uint32_t kMaxCompressionRatio = 256;
 
     // ========================================================================
     // Encode: returns wire bytes ready to hand to SendMessageToConnection.

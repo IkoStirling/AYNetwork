@@ -3,7 +3,7 @@
 //
 // R4.1 (2026-08): GnsConnection 仍独自管理传输（不强行继承 NetConnection，
 // 避免传输层污染）。NetConnectionImpl 持 GnsConnection* 非拥有指针
-// （生命周期由 AYNetworkSubSystem::_netConns 兜底），把 NetConnection
+// （生命周期由 AYNetworkSubSystem 的连接记录兜底），把 NetConnection
 // 接口的 send/disconnect 转发到 _gns。getAddress/getHostId 缓存自 ctor
 // 时刻（避免每帧 GNS getter 调用）；getPing/isConnected 仍每帧查 GNS。
 //
@@ -45,7 +45,7 @@ public:
     GnsConnection* getInner() const { return _gns; }
 
 private:
-    GnsConnection* _gns = nullptr;   // 非拥有；由 AYNetworkSubSystem::_netConns 管理
+    GnsConnection* _gns = nullptr;   // 非拥有；由 AYNetworkSubSystem 连接记录管理
     uint32_t _id = 0;
     uint32_t _hostId = 0;
     std::string _address;            // 缓存自 ctor，避免每帧 getter 调用

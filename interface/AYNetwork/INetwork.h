@@ -60,6 +60,17 @@ enum class ConnectionMode : uint8_t {
     ListenServer // 监听服务器（也是客户端）
 };
 
+// Hard runtime budgets for untrusted network input.  Defaults are deliberately
+// conservative for a game process; applications may lower them before
+// connect()/listen().  Zero is never interpreted as "unlimited".
+struct NetworkLimits {
+    uint32_t maxConnections = 256;
+    uint32_t maxPumpMessages = 512;
+    uint32_t maxPumpBytes = 2u * 1024u * 1024u;
+    uint32_t maxQueuedInboundMessages = 4096;
+    uint32_t maxQueuedInboundBytes = 8u * 1024u * 1024u;
+};
+
 // =============================================================================
 // R1 done (2026-07-27): DisconnectReason — applied enum that travels with
 // every disconnect so receivers can react meaningfully (kick UI, reconnect,
@@ -93,10 +104,9 @@ enum class DisconnectReason : uint8_t {
 //   - On WELCOME both sides transition from Handshaking to Connected (Ready).
 //   - The handshake is RELIABLE; uses CHANNEL_RELIABLE.
 //
-// Handshake only fires when the application has registered a
-// protocolVersion (via AYNetworkSubSystem::setProtocolVersion). If never
-// set, GnsConnection::initClient/listen will skip the handshake and treat
-// GNS Connected as Ready (back-compat for the R1.A loopback tests).
+// INetworkSubSystem defaults to kProtocolVersion and therefore performs the
+// handshake. Version 0 is an explicit legacy/test opt-out for callers that
+// construct GnsConnection directly.
 // =============================================================================
 enum class HandshakeMsgType : uint8_t {
     Hello   = 1,    // client -> server
@@ -205,7 +215,16 @@ public:
     virtual void listen(uint16_t port) = 0;
     virtual void disconnect() = 0;
     virtual bool isConnected() const = 0;
+    virtual bool isListening() const { return false; }
     virtual ConnectionMode getMode() const = 0;
+
+    // Must be configured before connect()/listen().  The production default
+    // is kProtocolVersion; version 0 is an explicit legacy/test opt-out.
+    virtual void setProtocolVersion(uint32_t version) { (void)version; }
+    virtual uint32_t getProtocolVersion() const { return 0; }
+
+    virtual void setLimits(const NetworkLimits& limits) { (void)limits; }
+    virtual NetworkLimits getLimits() const { return {}; }
 
     // ===== 消息发送 =====
     virtual void send(uint8_t channel, const void* data, size_t size) = 0;

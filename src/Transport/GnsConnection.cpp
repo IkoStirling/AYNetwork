@@ -9,8 +9,8 @@
 //      Ref-counted. Fetches sockets + utils interfaces and registers the
 //      global status-callback.
 //   2. GnsConnection instance — initClient(addr, port) or initServer(port).
-//   3. Per frame: instance.update() drains ReceiveMessagesOnPollGroup and
-//      pumps RunCallbacks (status changes).
+//   3. Per frame: GnsConnection::pump() runs callbacks once and drains the
+//      shared poll group within the configured message/byte budget.
 //   4. instance.disconnect(reason) — graceful close.
 //   5. gns::shutdown() — call from NetworkSubSystem::shutdown().
 
@@ -26,7 +26,6 @@
 
 #include <atomic>
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -42,7 +41,6 @@ namespace ayt::net
 // =============================================================================
 ISteamNetworkingSockets* GnsConnection::s_gns       = nullptr;
 HSteamNetPollGroup       GnsConnection::s_pollGroup = k_HSteamNetPollGroup_Invalid;
-GnsConnection::AdoptFactory GnsConnection::s_adoptFactory = nullptr;
 
 // Active connection map (HSteamNetConnection -> GnsConnection*).
 static std::unordered_map<HSteamNetConnection, GnsConnection*>& connMap() {
@@ -50,63 +48,64 @@ static std::unordered_map<HSteamNetConnection, GnsConnection*>& connMap() {
     return m;
 }
 
-// R1.A (2026-07-27): server-side adopters. When no s_adoptFactory is
-// registered, the global status callback picks the first available
-// server-side GnsConnection from this list. Protected by connMapMutex.
-static std::vector<GnsConnection*>& serverAdopters() {
-    static std::vector<GnsConnection*> v;
-    return v;
+static std::unordered_map<HSteamListenSocket, GnsConnection::AdoptFactory>&
+listenerFactories() {
+    static std::unordered_map<HSteamListenSocket, GnsConnection::AdoptFactory> factories;
+    return factories;
 }
-// R1.5 (2026-07-27): recursive mutex. The status callback can recurse: an
-// incoming connection state change fires while we're inside adoptIncomingConnection
-// (which itself updates the map). A plain std::mutex deadlocks.
-static std::recursive_mutex connMapMutex;
+
+static std::unordered_map<HSteamListenSocket, GnsConnection*>& listenerOwners() {
+    static std::unordered_map<HSteamListenSocket, GnsConnection*> owners;
+    return owners;
+}
+
+static std::recursive_mutex registryMutex;
+static std::mutex pumpMutex;
+static thread_local bool insidePump = false;
 
 static void gns_status_callback(SteamNetConnectionStatusChangedCallback_t* info) {
     if (!info) return;
 
-    // R1.A (2026-07-27): when an incoming connection arrives on a server
-    // listen socket, GNS posts a Connecting state callback for the NEW
-    // HSteamNetConnection. We delegate the adopt decision to a factory
-    // registered by AYNetworkSubSystem (so GnsConnection stays decoupled
-    // from the subsystem type). The factory returns a fresh GnsConnection*
-    // that owns the new conn, or nullptr to reject.
     if (info->m_info.m_eState == k_ESteamNetworkingConnectionState_Connecting) {
-        // Quick check whether this conn is already known (avoid factory call
-        // for our own outgoing client connections, which also go through the
-        // Connecting path).
         bool needsAdopt = false;
         {
-            std::lock_guard<std::recursive_mutex> lk(connMapMutex);
+            std::lock_guard<std::recursive_mutex> lk(registryMutex);
             needsAdopt = (connMap().find(info->m_hConn) == connMap().end());
         }
         if (needsAdopt) {
-            // Prefer a registered factory (subsystem mode). Otherwise fall
-            // back to the first server-side GnsConnection in serverAdopters().
-            if (GnsConnection::s_adoptFactory) {
-                GnsConnection* child = GnsConnection::s_adoptFactory(info->m_hConn);
+            GnsConnection::AdoptFactory factory;
+            GnsConnection* fallbackOwner = nullptr;
+            {
+                std::lock_guard<std::recursive_mutex> lk(registryMutex);
+                auto factoryIt = listenerFactories().find(info->m_info.m_hListenSocket);
+                if (factoryIt != listenerFactories().end()) factory = factoryIt->second;
+                auto ownerIt = listenerOwners().find(info->m_info.m_hListenSocket);
+                if (ownerIt != listenerOwners().end()) fallbackOwner = ownerIt->second;
+            }
+
+            // Route by the exact listener.  This avoids the old process-wide
+            // last-writer-wins factory and permits independent listeners.
+            if (factory) {
+                GnsConnection* child = factory(info->m_hConn);
                 (void)child;  // result stored by factory's adoptIncomingConnection
                 return;
             }
-            // R1.A fallback (no factory registered): the first available
-            // server-side GnsConnection in serverAdopters() adopts the
-            // incoming connection. Used by tests that use GnsConnection
-            // directly without going through the subsystem. Real
-            // applications should always register a factory.
-            if (GnsConnection::s_gns) {
+
+            // Direct GnsConnection tools use the listener owner itself as a
+            // single accepted peer.  Subsystem mode always installs a factory.
+            if (GnsConnection::s_gns && fallbackOwner) {
                 EResult r = GnsConnection::s_gns->AcceptConnection(info->m_hConn);
                 if (r != k_EResultOK) {
                     ::fprintf(stderr, "[GnsConnection] AcceptConnection failed: %d\n", r);
                     return;
                 }
-            }
-            std::lock_guard<std::recursive_mutex> lk(connMapMutex);
-            auto& adopters = serverAdopters();
-            if (!adopters.empty()) {
-                GnsConnection* adopter = adopters.front();
-                adopters.erase(adopters.begin());
-                adopter->adoptIncomingConnection(info->m_hConn);
+                fallbackOwner->adoptIncomingConnection(info->m_hConn);
                 return;
+            }
+
+            if (GnsConnection::s_gns) {
+                GnsConnection::s_gns->CloseConnection(
+                    info->m_hConn, 0, "no listener owner", false);
             }
             ::fprintf(stderr, "[GnsConnection] incoming conn %u but no server-side adopter\n",
                       info->m_hConn);
@@ -114,14 +113,18 @@ static void gns_status_callback(SteamNetConnectionStatusChangedCallback_t* info)
         }
     }
 
-    std::lock_guard<std::recursive_mutex> lk(connMapMutex);
-    auto it = connMap().find(info->m_hConn);
-    if (it == connMap().end()) {
+    GnsConnection* owner = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lk(registryMutex);
+        auto it = connMap().find(info->m_hConn);
+        if (it != connMap().end()) owner = it->second;
+    }
+    if (!owner) {
         ::fprintf(stderr, "[GnsConnection] status change for unregistered conn %u (state %d -> %d)\n",
                   info->m_hConn, info->m_eOldState, info->m_info.m_eState);
         return;
     }
-    it->second->handleStatusChange(info->m_eOldState, info->m_info.m_eState);
+    owner->handleStatusChange(info->m_eOldState, info->m_info.m_eState);
 }
 
 namespace gns
@@ -188,7 +191,11 @@ namespace gns
     }
 
     void shutdown() {
-        if (g_initRefCount.fetch_sub(1) != 1) {
+        uint32_t refs = g_initRefCount.load();
+        while (refs != 0 &&
+               !g_initRefCount.compare_exchange_weak(refs, refs - 1)) {
+        }
+        if (refs == 0 || refs != 1) {
             return;
         }
         if (g_utils) {
@@ -200,6 +207,12 @@ namespace gns
         }
         GnsConnection::s_gns       = nullptr;
         GnsConnection::s_pollGroup = k_HSteamNetPollGroup_Invalid;
+        {
+            std::lock_guard<std::recursive_mutex> lk(registryMutex);
+            connMap().clear();
+            listenerFactories().clear();
+            listenerOwners().clear();
+        }
         GameNetworkingSockets_Kill();
     }
 } // namespace gns
@@ -216,6 +229,23 @@ GnsConnection::~GnsConnection() {
     }
 }
 
+void GnsConnection::setAdoptFactory(HSteamListenSocket listener,
+                                    AdoptFactory factory) {
+    if (listener == k_HSteamListenSocket_Invalid) return;
+    std::lock_guard<std::recursive_mutex> lk(registryMutex);
+    if (factory) {
+        listenerFactories()[listener] = std::move(factory);
+    } else {
+        listenerFactories().erase(listener);
+    }
+}
+
+void GnsConnection::clearAdoptFactory(HSteamListenSocket listener) {
+    if (listener == k_HSteamListenSocket_Invalid) return;
+    std::lock_guard<std::recursive_mutex> lk(registryMutex);
+    listenerFactories().erase(listener);
+}
+
 void GnsConnection::initClient(const char* address, uint16_t virtualPort) {
     if (!s_gns) {
         ::fprintf(stderr, "[GnsConnection] initClient called before gns::init()\n");
@@ -228,6 +258,7 @@ void GnsConnection::initClient(const char* address, uint16_t virtualPort) {
 
     _address = address ? address : "";
     _port    = virtualPort;
+    _role    = GnsConnectionRole::Client;
 
     // R1.5 (2026-07-26): switch from P2P to IP-mode. The P2P API requires
     // a relay service (Steam backend or custom signaling) which is not
@@ -258,7 +289,7 @@ void GnsConnection::initClient(const char* address, uint16_t virtualPort) {
     }
 
     {
-        std::lock_guard<std::recursive_mutex> lk(connMapMutex);
+        std::lock_guard<std::recursive_mutex> lk(registryMutex);
         connMap()[_conn] = this;
     }
 
@@ -287,64 +318,99 @@ void GnsConnection::initServer(uint16_t virtualPort) {
         return;
     }
 
-    // R1.A (2026-07-27): the listen socket itself doesn't carry a
-    // HSteamNetConnection, so it isn't registered in connMap. But the
-    // GnsConnection still needs to be reachable from the global status
-    // callback when an incoming connection arrives, so we register it in
-    // serverAdopters(). This is the no-factory fallback path; when a
-    // factory is registered (subsystem mode), it owns the routing and
-    // serverAdopters is unused.
     {
-        std::lock_guard<std::recursive_mutex> lk(connMapMutex);
-        serverAdopters().push_back(this);
+        std::lock_guard<std::recursive_mutex> lk(registryMutex);
+        listenerOwners()[_listen] = this;
     }
 
     _port = virtualPort;
+    _role = GnsConnectionRole::Listener;
     setState(GnsConnectionState::Connected);
 }
 
 void GnsConnection::update() {
-    if (!s_gns) return;
-    if (_state == GnsConnectionState::Disconnected) return;
+    (void)pump();
+}
 
-    _ackTracker.expire();
+bool GnsConnection::isPumping() {
+    return insidePump;
+}
 
-    // RunCallbacks triggers any pending status-change callbacks. Calling this
-    // every frame is the canonical GNS pattern — it's cheap (just drains a
-    // queue).
+GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
+    GnsPumpResult result;
+    if (!s_gns || s_pollGroup == k_HSteamNetPollGroup_Invalid || insidePump) {
+        return result;
+    }
+
+    std::lock_guard<std::mutex> pumpLock(pumpMutex);
+    insidePump = true;
+    struct PumpScope {
+        ~PumpScope() { insidePump = false; }
+    } pumpScope;
+
+    const uint32_t maxMessages = std::max(1u, requestedBudget.maxMessages);
+    const uint32_t maxBytes = std::max(1u, requestedBudget.maxBytes);
+    const uint32_t maintenanceNowMs = nowMs();
+    std::vector<GnsConnection*> owners;
+    {
+        std::lock_guard<std::recursive_mutex> lk(registryMutex);
+        owners.reserve(connMap().size());
+        for (const auto& [handle, owner] : connMap()) {
+            (void)handle;
+            if (owner) owners.push_back(owner);
+        }
+    }
+    std::sort(owners.begin(), owners.end());
+    owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
+    for (GnsConnection* owner : owners) owner->runMaintenance(maintenanceNowMs);
+
+    // Exactly one callback pump for the shared GNS context.
     s_gns->RunCallbacks();
 
-    // Drain the shared poll group. R3 will switch to per-connection drains
-    // once we have many simultaneous connections.
-    constexpr int kMaxMessages = 32;
-    SteamNetworkingMessage_t* msgs[kMaxMessages];
-    int n = s_gns->ReceiveMessagesOnPollGroup(s_pollGroup, msgs, kMaxMessages);
-    if (n < 0) {
-        // Negative return means an error; GNS doesn't expose details.
-        ::fprintf(stderr, "[GnsConnection] ReceiveMessagesOnPollGroup returned %d\n", n);
-        return;
-    }
-    for (int i = 0; i < n; ++i) {
-        HSteamNetConnection msgConn = msgs[i]->m_conn;
-        GnsConnection* owner = nullptr;
-        {
-            std::lock_guard<std::recursive_mutex> lk(connMapMutex);
-            auto it = connMap().find(msgConn);
-            if (it != connMap().end()) owner = it->second;
+    constexpr uint32_t kBatchSize = 32;
+    while (result.messages < maxMessages && result.bytes < maxBytes) {
+        SteamNetworkingMessage_t* messages[kBatchSize]{};
+        const uint32_t remaining = maxMessages - result.messages;
+        const int requestCount = static_cast<int>(std::min(kBatchSize, remaining));
+        const int count = s_gns->ReceiveMessagesOnPollGroup(
+            s_pollGroup, messages, requestCount);
+        if (count < 0) {
+            ::fprintf(stderr, "[GnsConnection] ReceiveMessagesOnPollGroup returned %d\n", count);
+            break;
         }
-        if (owner && msgs[i]->m_pData && msgs[i]->m_cbSize > 0) {
-            // R1 done: route through onRawData so handshake frames can be
-            // intercepted before reaching the user's data handler. onRawData
-            // itself forwards non-handshake frames to _dataHandler.
-            owner->onRawData(static_cast<const uint8_t*>(msgs[i]->m_pData),
-                             static_cast<size_t>(msgs[i]->m_cbSize));
+        if (count == 0) break;
+
+        for (int i = 0; i < count; ++i) {
+            SteamNetworkingMessage_t* message = messages[i];
+            GnsConnection* owner = nullptr;
+            {
+                std::lock_guard<std::recursive_mutex> lk(registryMutex);
+                auto it = connMap().find(message->m_conn);
+                if (it != connMap().end()) owner = it->second;
+            }
+            if (message->m_cbSize > 0) {
+                result.bytes += static_cast<uint32_t>(message->m_cbSize);
+            }
+            ++result.messages;
+            if (owner && message->m_pData && message->m_cbSize > 0) {
+                owner->onRawData(static_cast<const uint8_t*>(message->m_pData),
+                                 static_cast<size_t>(message->m_cbSize));
+            }
+            message->Release();
         }
-        msgs[i]->Release();
     }
+
+    result.budgetExhausted =
+        result.messages >= maxMessages || result.bytes >= maxBytes;
+    return result;
 }
 
 int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
     if (!s_gns || _conn == k_HSteamNetConnection_Invalid) return -1;
+    if ((data == nullptr && len != 0) ||
+        len > PacketCodec::kMaxDecodedBodySize || channel > CHANNEL_ACK) {
+        return -1;
+    }
     // R1 done: allow send in Connected (handshake off), Handshaking
     // (handshake frames), or Ready (post-handshake app data).
     if (_state != GnsConnectionState::Connected &&
@@ -368,6 +434,7 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
             /*flags=*/0,
             tsMs,
             /*compress=*/false);
+        if (wire.empty()) return -1;
         return _rawSend(wire.data(), static_cast<uint32_t>(wire.size()), channel);
     }
 
@@ -432,6 +499,7 @@ int GnsConnection::sendRequireAck(uint16_t msgType, uint8_t channel,
 // MSVC strict enum: do NOT do arithmetic on the GNS send-flag
 // constants — assign to `int flags` first then bitwise-OR.
 int GnsConnection::_rawSend(const uint8_t* data, uint32_t len, uint8_t channel) {
+    if (!data || len == 0 || channel > CHANNEL_ACK) return -1;
     int flags;
     switch (channel) {
         case CHANNEL_UNRELIABLE:
@@ -457,10 +525,12 @@ int GnsConnection::_rawSend(const uint8_t* data, uint32_t len, uint8_t channel) 
 
 // R2: monotonic-ish clock used to stamp PacketHeader.timestampMs.
 uint32_t GnsConnection::nowMs() {
-    using namespace std::chrono;
-    return static_cast<uint32_t>(
-        duration_cast<milliseconds>(
-            steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFFu);
+    return static_cast<uint32_t>((ayt::performanceNowUs() / 1000u) & 0xFFFFFFFFu);
+}
+
+void GnsConnection::runMaintenance(uint32_t monotonicNowMs) {
+    _ackTracker.expire();
+    _assembler.reapExpired(monotonicNowMs);
 }
 
 void GnsConnection::disconnect(const char* reason) {
@@ -471,7 +541,7 @@ void GnsConnection::disconnect(const char* reason) {
 
     if (_conn != k_HSteamNetConnection_Invalid) {
         {
-            std::lock_guard<std::recursive_mutex> lk(connMapMutex);
+            std::lock_guard<std::recursive_mutex> lk(registryMutex);
             connMap().erase(_conn);
         }
         // R1 done: local-initiated disconnect reports UserQuit. R2 will
@@ -484,15 +554,18 @@ void GnsConnection::disconnect(const char* reason) {
         _conn = k_HSteamNetConnection_Invalid;
     }
     if (_listen != k_HSteamListenSocket_Invalid) {
+        const HSteamListenSocket closingListen = _listen;
+        clearAdoptFactory(closingListen);
+        {
+            std::lock_guard<std::recursive_mutex> lk(registryMutex);
+            listenerOwners().erase(closingListen);
+        }
         s_gns->CloseListenSocket(_listen);
         _listen = k_HSteamListenSocket_Invalid;
-        // R1.A: remove from serverAdopters so a stale server doesn't try
-        // to adopt incoming conns after disconnect.
-        std::lock_guard<std::recursive_mutex> lk(connMapMutex);
-        auto& adopters = serverAdopters();
-        adopters.erase(std::remove(adopters.begin(), adopters.end(), this), adopters.end());
         _lastDisconnectReason = DisconnectReason::HostShutdown;
     }
+    _assembler.clear();
+    _role = GnsConnectionRole::None;
     setState(GnsConnectionState::Disconnected);
 }
 
@@ -511,11 +584,21 @@ int GnsConnection::getPing() const {
 
 void GnsConnection::adoptIncomingConnection(HSteamNetConnection conn) {
     _conn = conn;
+    if (_role != GnsConnectionRole::Listener) {
+        _role = GnsConnectionRole::AcceptedServerPeer;
+    }
     if (s_gns && s_pollGroup != k_HSteamNetPollGroup_Invalid) {
         s_gns->SetConnectionPollGroup(_conn, s_pollGroup);
+        SteamNetConnectionInfo_t info{};
+        if (s_gns->GetConnectionInfo(_conn, &info)) {
+            char address[SteamNetworkingIPAddr::k_cchMaxString]{};
+            info.m_addrRemote.ToString(address, sizeof(address), true);
+            _address = address;
+            _port = info.m_addrRemote.m_port;
+        }
     }
     {
-        std::lock_guard<std::recursive_mutex> lk(connMapMutex);
+        std::lock_guard<std::recursive_mutex> lk(registryMutex);
         connMap()[_conn] = this;
     }
     setState(GnsConnectionState::Connected);
@@ -538,13 +621,12 @@ void GnsConnection::handleStatusChange(int /*oldGnsState*/, int newGnsState) {
             // With handshake enabled, transition to Handshaking and the
             // client immediately sends HELLO; the server waits for HELLO
             // before responding with WELCOME.
-            if (_protocolVersion != 0 && _listen == k_HSteamListenSocket_Invalid) {
-                // Client side (or server-side adopted child): send HELLO.
+            if (_protocolVersion != 0 && _role == GnsConnectionRole::Client) {
+                // Only the initiating client sends HELLO.
                 _sendHello();
                 setState(GnsConnectionState::Handshaking);
-            } else if (_protocolVersion != 0 && _listen != k_HSteamListenSocket_Invalid) {
-                // Server-side parent listen socket itself — irrelevant, the
-                // child GnsConnections each have their own _listen==0.
+            } else if (_protocolVersion != 0) {
+                // Listener/accepted server peer waits for the client's HELLO.
                 setState(GnsConnectionState::Connected);
             } else {
                 setState(GnsConnectionState::Connected);
@@ -566,7 +648,7 @@ void GnsConnection::handleStatusChange(int /*oldGnsState*/, int newGnsState) {
                 s_gns->CloseConnection(_conn, 0, "peer closed", false);
             }
             {
-                std::lock_guard<std::recursive_mutex> lk(connMapMutex);
+                std::lock_guard<std::recursive_mutex> lk(registryMutex);
                 connMap().erase(_conn);
             }
             _conn = k_HSteamNetConnection_Invalid;

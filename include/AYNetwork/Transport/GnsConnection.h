@@ -7,7 +7,7 @@
 //                     socket + N accepted children) or a child (single
 //                     accepted client connection, no listen socket).
 //                     The global status callback routes incoming connections
-//                     through a static factory registered by the subsystem,
+//                     through a per-listener factory registered by the subsystem,
 //                     keeping GnsConnection unaware of the subsystem type.
 //
 // This wrapper deliberately exposes a tiny API surface — the rest of AYNetwork
@@ -19,7 +19,7 @@
 // Lifecycle:
 //   initClient(addr, port)  -> connects via ConnectByIPAddress
 //   initServer(port)        -> CreateListenSocketIP (parent)
-//   update()                -> poll ReceiveMessages / dispatch state changes
+//   pump()                  -> bounded shared callback/message dispatch
 //   disconnect(reason)      -> CloseConnection
 //
 // Status callbacks (onStateChange, onData) are set via setHandlers() before
@@ -55,6 +55,24 @@ enum class GnsConnectionState : uint8_t {
     Disconnecting  // CloseConnection issued, awaiting Close
 };
 
+enum class GnsConnectionRole : uint8_t {
+    None,
+    Client,
+    Listener,
+    AcceptedServerPeer,
+};
+
+struct GnsPumpBudget {
+    uint32_t maxMessages = 512;
+    uint32_t maxBytes = 2u * 1024u * 1024u;
+};
+
+struct GnsPumpResult {
+    uint32_t messages = 0;
+    uint32_t bytes = 0;
+    bool budgetExhausted = false;
+};
+
 // =============================================================================
 // GnsConnection - one endpoint (client OR server-side listen socket OR
 // server-side accepted client).
@@ -72,7 +90,7 @@ enum class GnsConnectionState : uint8_t {
 //     accepted client conn. AYNetworkSubSystem holds these children in a
 //     vector and pumps them every frame.
 //   The global status callback routes incoming connections through a
-//   factory registered by the subsystem (see s_adoptFactory below) so
+//   factory registered for the exact listener so
 //   GnsConnection itself stays decoupled from the subsystem type.
 // =============================================================================
 class GnsConnection {
@@ -87,7 +105,11 @@ public:
     // (AcceptConnection + SetConnectionPollGroup) and adopting the handle.
     // Returning nullptr means "reject the incoming connection".
     using AdoptFactory = std::function<GnsConnection*(HSteamNetConnection incomingConn)>;
-    static void setAdoptFactory(AdoptFactory factory) { s_adoptFactory = std::move(factory); }
+    // Register per-listener rather than process-global routing.  This permits
+    // multiple worlds/listeners in one process without last-writer-wins
+    // callback corruption.
+    static void setAdoptFactory(HSteamListenSocket listener, AdoptFactory factory);
+    static void clearAdoptFactory(HSteamListenSocket listener);
 
     GnsConnection();
     ~GnsConnection();
@@ -111,7 +133,13 @@ public:
     void adoptIncomingConnection(HSteamNetConnection conn);
 
     // ===== Per-frame =====
-    // Pump GNS callbacks + drain receive queue. Must be called every frame.
+    // Production path: pump the shared GNS callback/receive queue exactly once
+    // per network ingress and route messages by HSteamNetConnection.
+    static GnsPumpResult pump(const GnsPumpBudget& budget = {});
+    static bool isPumping();
+
+    // Compatibility adapter for direct GnsConnection tests/tools.  Subsystems
+    // must use pump() once instead of invoking update() on every connection.
     void update();
 
     // ===== Send / Close =====
@@ -125,6 +153,7 @@ public:
 
     // ===== State / info =====
     GnsConnectionState getState() const { return _state; }
+    GnsConnectionRole  getRole() const { return _role; }
     bool               isConnected() const {
         // "Connected" means app can use the link. R1 done: with handshake
         // enabled (setProtocolVersion > 0), this is Ready. With handshake
@@ -165,7 +194,6 @@ public:
     // (defined in GnsConnection.cpp only), so external code can't link them.
     static ISteamNetworkingSockets* s_gns;
     static HSteamNetPollGroup       s_pollGroup;
-    static AdoptFactory             s_adoptFactory;
 
     // GNS state -> our state mapping. Called from gns_status_callback.
     void handleStatusChange(int oldGnsState, int newGnsState);
@@ -181,6 +209,7 @@ public:
 
 private:
     void setState(GnsConnectionState newState);
+    void runMaintenance(uint32_t monotonicNowMs);
 
     // R1 done: handshake state machine helpers.
     void _sendHello();
@@ -190,6 +219,7 @@ private:
     bool _isHandshaking() const { return _state == GnsConnectionState::Handshaking; }
 
     GnsConnectionState _state = GnsConnectionState::Disconnected;
+    GnsConnectionRole  _role = GnsConnectionRole::None;
 
     std::string _address;
     uint16_t    _port = 0;

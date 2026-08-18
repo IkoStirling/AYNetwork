@@ -10,7 +10,6 @@
 #include <AYNetwork/Protocol/PacketCodec.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -52,7 +51,7 @@ public:
 private:
     struct Entry {
         Callback cb;
-        std::chrono::steady_clock::time_point deadline;
+        uint64_t deadlineUs = 0;
     };
 
     mutable std::mutex _mutex;

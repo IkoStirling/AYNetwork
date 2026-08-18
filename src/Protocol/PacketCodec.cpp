@@ -102,6 +102,11 @@ std::vector<uint8_t> PacketCodec::encode(
     uint8_t  channel, uint8_t  flags, uint32_t timestampMs,
     bool compress)
 {
+    if ((body == nullptr && bodyLen != 0) ||
+        bodyLen > PacketCodec::kMaxDecodedBodySize) {
+        return {};
+    }
+
     // R2 pitfall: Compressed + Fragmented never combine. Caller (Assembler)
     // compresses the entire payload first, then fragments the compressed
     // bytes if needed. We honor whatever flag the caller passed; if both
@@ -154,6 +159,14 @@ std::vector<uint8_t> PacketCodec::encode(
     // Total body length (between PacketHeader and trailing CRC):
     //   plain    : payloadLen
     //   compressed : kUncompressedSizePrefix (4) + payloadLen
+    const size_t framedPayloadLen =
+        (outFlags & static_cast<uint8_t>(PacketFlag::Compressed))
+            ? PacketCodec::kUncompressedSizePrefix + payloadLen
+            : payloadLen;
+    if (framedPayloadLen > PacketCodec::kMaxWireBodySize) {
+        return {};
+    }
+
     uint16_t length;
     if (outFlags & static_cast<uint8_t>(PacketFlag::Compressed)) {
         length = static_cast<uint16_t>(PacketCodec::kUncompressedSizePrefix + payloadLen);
@@ -214,6 +227,18 @@ DecodedPacket PacketCodec::decode(const uint8_t* wire, size_t wireLen) {
     out.header.flags         = hp[7];
     out.header.timestampMs   = readU32LE(hp + 8);
 
+    constexpr uint8_t kKnownFlags =
+        static_cast<uint8_t>(PacketFlag::Fragmented) |
+        static_cast<uint8_t>(PacketFlag::Compressed) |
+        static_cast<uint8_t>(PacketFlag::RequiresAck);
+    if (out.header.channel > 3 || (out.header.flags & ~kKnownFlags) != 0) {
+        return out;
+    }
+    if (hasFlag(out.header.flags, PacketFlag::Compressed) &&
+        hasFlag(out.header.flags, PacketFlag::Fragmented)) {
+        return out;
+    }
+
     // Length sanity: must equal (wireLen - header - crc).
     size_t expected = static_cast<size_t>(out.header.length)
                     + PacketCodec::kHeaderSize + PacketCodec::kCrcSize;
@@ -246,6 +271,12 @@ DecodedPacket PacketCodec::decode(const uint8_t* wire, size_t wireLen) {
         uint32_t uncSize = readU32LE(bodyStart);
         const uint8_t* compStart = bodyStart + PacketCodec::kUncompressedSizePrefix;
         size_t compLen = bodyLen - PacketCodec::kUncompressedSizePrefix;
+        if (uncSize == 0 || uncSize > PacketCodec::kMaxDecodedBodySize ||
+            compLen == 0 ||
+            static_cast<uint64_t>(uncSize) >
+                static_cast<uint64_t>(compLen) * PacketCodec::kMaxCompressionRatio) {
+            return out;
+        }
 
         // Reuse AYStorage's Lz4Decompressor. It decompresses everything at
         // once into its internal buffer; we then read into out.body.
