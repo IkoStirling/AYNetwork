@@ -785,6 +785,9 @@ private:
         void setExtension(ayt::net::INetworkExtension*) override {}
         ayt::net::ReplicationManager* getReplicationManager() override { return nullptr; }
         RpcHandler* getRpcHandler() override { return nullptr; }
+        // R5.3 (2026-08-24): Replay recorder wiring — stubs return nullptr.
+        void setReplayRecorder(ayt::replay::IReplayRecorder* /*rec*/) override {}
+        ayt::replay::IReplayRecorder* getReplayRecorder() const override { return nullptr; }
     };
 };
 

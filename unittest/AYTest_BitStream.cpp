@@ -7,6 +7,7 @@
 
 #include <AYNetwork.h>
 #include <AYTest.h>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 
@@ -91,6 +92,28 @@ TEST_CASE(Float) {
     stream.writeFloat(1.0f, 0.0f, 1.0f);
     stream.resetForRead();
     CHECK(stream.readFloat(0.0f, 1.0f) > 0.99f);
+}
+
+TEST_CASE(RawFloatingPointAfterSubBytePrefix) {
+    ayt::test::setCurrentCase("RawFloatingPointAfterSubBytePrefix");
+
+    BitStream stream;
+    const uint8_t prefix = 0x05;
+    const float floatValue = -123.75f;
+    const double doubleValue = 1.0 / 10.0;
+    stream.writeBits(&prefix, 3);
+    stream.writeFloatRaw(floatValue);
+    stream.writeDouble(doubleValue);
+
+    stream.resetForRead();
+    uint8_t decodedPrefix = 0;
+    stream.readBits(&decodedPrefix, 3);
+    const float decodedFloat = stream.readFloatRaw();
+    const double decodedDouble = stream.readDouble();
+
+    CHECK_INT_EQ(decodedPrefix & 0x07u, prefix);
+    CHECK(std::bit_cast<uint32_t>(decodedFloat) == std::bit_cast<uint32_t>(floatValue));
+    CHECK(std::bit_cast<uint64_t>(decodedDouble) == std::bit_cast<uint64_t>(doubleValue));
 }
 
 TEST_CASE(String) {

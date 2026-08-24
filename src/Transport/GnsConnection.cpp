@@ -462,7 +462,33 @@ int GnsConnection::sendEncoded(uint8_t channel, const void* data, size_t len) {
         (_state != GnsConnectionState::Connected &&
          _state != GnsConnectionState::Handshaking &&
          _state != GnsConnectionState::Ready)) return -1;
-    return _rawSend(static_cast<const uint8_t*>(data), static_cast<uint32_t>(len), channel);
+    const auto* wire = static_cast<const uint8_t*>(data);
+    if (len <= kFrameMtu) {
+        return _rawSend(wire, static_cast<uint32_t>(len), channel);
+    }
+
+    // Internal protocol producers hand us an already sealed PacketCodec
+    // frame. Re-open oversized frames and fragment their decoded body while
+    // preserving the original protocol identity; otherwise replication/RPC
+    // payloads larger than the transport MTU bypass the normal fragmenter.
+    DecodedPacket decoded = PacketCodec::decode(wire, len);
+    if (!decoded.ok ||
+        hasFlag(decoded.header.flags, PacketFlag::Fragmented) ||
+        hasFlag(decoded.header.flags, PacketFlag::RequiresAck)) {
+        return -1;
+    }
+    auto frames = PacketAssembler::fragment(
+        decoded.body.data(), decoded.body.size(), static_cast<uint32_t>(kFrameMtu),
+        decoded.header.msgType, decoded.header.schemaVersion, channel,
+        decoded.header.timestampMs, ++_nextFragmentId);
+    if (frames.empty()) return -1;
+
+    int lastResult = 0;
+    for (const auto& frame : frames) {
+        lastResult = _rawSend(frame.data(), static_cast<uint32_t>(frame.size()), channel);
+        if (lastResult != 0) break;
+    }
+    return lastResult;
 }
 
 int GnsConnection::sendRequireAck(uint16_t msgType, uint8_t channel,
@@ -673,7 +699,7 @@ void GnsConnection::handleStatusChange(int /*oldGnsState*/, int newGnsState) {
 // =============================================================================
 // R1 done (2026-07-27): Handshake implementation.
 //
-// Wire format (host byte order, little-endian on x64):
+// Wire format is explicitly little-endian, independent of host byte order:
 //   HELLO:    [u8 msgType=1][u32 version][u8 nameLen][name bytes]
 //   WELCOME:  [u8 msgType=2][u32 version][u8 reasonCode=0]
 //   REJECT:   [u8 msgType=3][u8 reasonCode=DisconnectReason]

@@ -8,7 +8,7 @@
 //      typeid(T).hash_code() for the 12 R3.0 primitives.
 //   3. deserializeObject: read field records and write back through the
 //      field offset (memcpy via get(void*)). Field matching uses FNV-1a hash
-//      of the field name (low 16 bits) for a deterministic lookup.
+//      of the field name (full FNV-1a 32 bits) for a deterministic lookup.
 //
 // Pitfalls observed during R3.0:
 //   - ITypeInfo::getField(i) returns nullptr for out-of-range indices; bail.
@@ -269,11 +269,45 @@ bool readFieldValue(BitStream& s, WireTypeId id, void* fieldPtr) {
 // =============================================================================
 // ReplicationFrame header writers/readers
 // =============================================================================
-void ReflectSerializer::writeReplicationFrameHeader(BitStream& s, uint32_t netId, uint64_t schemaHash, uint8_t fieldCount) {
+void ReflectSerializer::writeServerTick(BitStream& s, uint32_t serverTick) {
+    s.writeUInt32(serverTick);
+}
+
+bool ReflectSerializer::readServerTick(BitStream& s, uint32_t& serverTick) {
+    if (s.getBitPosition() + 32 > s.getBitCount()) return false;
+    serverTick = s.readUInt32();
+    return true;
+}
+
+// =============================================================================
+// R5.2 (2026-08-24) optional ack tail — only emitted when the snapshot is
+// destined for a connection that owns an AutonomousProxy ghost. Layout:
+//   [u32 lastAckedInputTick][u32 serverCommandAge]
+// When AckTail::present is false, no bytes are written/read and the
+// R5.0/R5.1 wire format is preserved exactly.
+// =============================================================================
+void ReflectSerializer::writeAckTail(BitStream& s, const AckTail& tail) {
+    if (!tail.present) return;
+    s.writeUInt32(tail.lastAckedInputTick);
+    s.writeUInt32(tail.serverCommandAge);
+}
+
+bool ReflectSerializer::readAckTail(BitStream& s, AckTail& tail) {
+    if (!tail.present) return true; // nothing to read; caller said skip
+    if (s.getBitPosition() + 64 > s.getBitCount()) return false;
+    tail.lastAckedInputTick = s.readUInt32();
+    tail.serverCommandAge   = s.readUInt32();
+    return true;
+}
+
+void ReflectSerializer::writeReplicationFrameHeader(BitStream& s, uint32_t netId, uint64_t schemaHash,
+                                                     uint8_t fieldCount, uint8_t flags) {
     s.writeUInt32(netId);
     s.writeUInt64(schemaHash);
     s.writeUInt8(fieldCount);
-    s.writeUInt8(0); // reserved
+    // R5.1: this byte was reserved (always 0) in R5.0. Carrying frame flags
+    // here keeps the header length unchanged so R5.0 readers still parse.
+    s.writeUInt8(flags);
 }
 
 bool ReflectSerializer::readReplicationFrameHeader(BitStream& s, FrameHeader& out) {
@@ -311,7 +345,8 @@ bool ReflectSerializer::readEntityDespawn(BitStream& s, uint32_t& netId) {
 // serializeObject / deserializeObject
 // =============================================================================
 bool ReflectSerializer::serializeObject(const ayt::reflect::ITypeInfo* type, const void* obj,
-                                         uint32_t netId, BitStream& s) {
+                                         uint32_t netId, BitStream& s,
+                                         uint32_t serverTick, uint8_t flags) {
     if (!type || !obj) return false;
 
     std::vector<const ayt::reflect::IFieldInfo*> fields;
@@ -323,7 +358,13 @@ bool ReflectSerializer::serializeObject(const ayt::reflect::ITypeInfo* type, con
 
     const uint64_t schemaHash = hashTypeSchema(type);
     if (schemaHash == 0) return false;
-    writeReplicationFrameHeader(s, netId, schemaHash, static_cast<uint8_t>(fieldCount));
+    // R5.0: serverTick prefix precedes the ReplicationFrame header when
+    // authority has stamped a tick (>0). serverTick==0 is the legacy
+    // sentinel meaning "no prefix" — existing R3.x round-trip tests and
+    // any direct serializer test that doesn't care about tick stamping
+    // continue to work without modification.
+    if (serverTick != 0) writeServerTick(s, serverTick);
+    writeReplicationFrameHeader(s, netId, schemaHash, static_cast<uint8_t>(fieldCount), flags);
 
     for (const auto* field : fields) {
         WireTypeId wid;
@@ -388,7 +429,7 @@ bool ReflectSerializer::deserializeObject(const ayt::reflect::ITypeInfo* type, v
 // Full Snapshot which always carries every NetReplicate field.
 //
 // Wire format produced by serializeDirtyFields is byte-for-byte the same as
-// serializeObject's frame: same 8B header, same field records. The receiver's
+// serializeObject's frame: same 14B header, same field records. The receiver's
 // deserializeObject doesn't care which envelope msgType wrapped it.
 // =============================================================================
 
@@ -428,7 +469,8 @@ uint32_t ReflectSerializer::hashFieldValue(WireTypeId id, const void* fieldPtr) 
 
 bool ReflectSerializer::serializeDirtyFields(const ayt::reflect::ITypeInfo* type, const void* obj,
                                              uint32_t netId, const std::vector<uint32_t>& denseIndices,
-                                             BitStream& s) {
+                                             BitStream& s,
+                                             uint32_t serverTick, uint8_t flags) {
     if (!type || !obj || denseIndices.empty()) return false;
 
     const uint32_t total = type->getFieldCount();
@@ -451,7 +493,13 @@ bool ReflectSerializer::serializeDirtyFields(const ayt::reflect::ITypeInfo* type
 
     const uint64_t schemaHash = hashTypeSchema(type);
     if (schemaHash == 0) return false;
-    writeReplicationFrameHeader(s, netId, schemaHash, static_cast<uint8_t>(fieldCount));
+    // R5.0: serverTick prefix precedes the ReplicationFrame header when
+    // the authority stamped a tick. serverTick==0 skips the prefix and
+    // emits the legacy R3.x wire layout — matches serializeObject's
+    // behaviour for symmetric round-trip. R5.1: `flags` is OR'd into the
+    // header's formerly-reserved byte (kFlagTeleport).
+    if (serverTick != 0) writeServerTick(s, serverTick);
+    writeReplicationFrameHeader(s, netId, schemaHash, static_cast<uint8_t>(fieldCount), flags);
 
     for (uint32_t k = 0; k < fieldCount; ++k) {
         const auto* field = netFields[denseIndices[k]];
@@ -498,7 +546,7 @@ uint8_t countNetReplicateFields(const ayt::reflect::ITypeInfo* type) {
 }
 
 // Emit a single struct's NetReplicate fields recursively. Caller writes
-// [u16 nestedTypeHash][u8 fieldCount] before calling this.
+// [u64 nestedSchemaHash][u8 fieldCount] before calling this.
 bool serializeNestedStructFields(BitStream& s, const ayt::reflect::ITypeInfo* type, const void* obj) {
     if (!type || !obj) return false;
     std::vector<const ayt::reflect::IFieldInfo*> fields;
@@ -516,7 +564,7 @@ bool serializeNestedStructFields(BitStream& s, const ayt::reflect::ITypeInfo* ty
 
 // Read [u8 fieldCount] then deserialize that many records into `obj`. Mirrors
 // serializeNestedStructFields. Caller is responsible for resolving the
-// nested struct type via [u16 nestedTypeHash] before calling this.
+// nested struct schema via [u64 nestedSchemaHash] before calling this.
 bool deserializeNestedStructFields(const ayt::reflect::ITypeInfo* type, void* obj, BitStream& s, uint8_t expectedFieldCount) {
     if (!type || !obj) return false;
     const uint32_t total = type->getFieldCount();
@@ -681,6 +729,9 @@ bool ReflectSerializer::readWireValue(BitStream& s, WireTypeId wid,
             const uint8_t elemWidByte = s.readUInt8();
             const uint8_t N            = s.readUInt8();
             const WireTypeId elemWid = static_cast<WireTypeId>(elemWidByte);
+            WireTypeId expectedElemWid;
+            if (!resolveWireTypeId(elemType, expectedElemWid) || expectedElemWid != elemWid ||
+                N != ctn->getContainerSize(fieldPtr)) return false;
             for (size_t i = 0; i < N; ++i) {
                 void* ePtr = ctn->getElementAt(fieldPtr, i);
                 if (!ePtr) return false;
@@ -699,6 +750,8 @@ bool ReflectSerializer::readWireValue(BitStream& s, WireTypeId wid,
             const uint8_t  elemWidByte = s.readUInt8();
             const uint32_t N           = s.readUInt32();
             const WireTypeId elemWid = static_cast<WireTypeId>(elemWidByte);
+            WireTypeId expectedElemWid;
+            if (!resolveWireTypeId(elemType, expectedElemWid) || expectedElemWid != elemWid) return false;
             // Resize the container so getElementAt(0..N-1) is valid.
             ctn->resize(fieldPtr, N);
             for (uint32_t i = 0; i < N; ++i) {
@@ -719,6 +772,8 @@ bool ReflectSerializer::readWireValue(BitStream& s, WireTypeId wid,
             const uint8_t  valueWidByte = s.readUInt8();
             const uint32_t N             = s.readUInt32();
             const WireTypeId valueWid = static_cast<WireTypeId>(valueWidByte);
+            WireTypeId expectedValueWid;
+            if (!resolveWireTypeId(valueType, expectedValueWid) || expectedValueWid != valueWid) return false;
             // Clear existing entries so server-authoritative state wins.
             ctn->resize(fieldPtr, 0);
             for (uint32_t i = 0; i < N; ++i) {

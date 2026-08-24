@@ -207,6 +207,16 @@ void BitStream::resetForRead() {
     _bitPosition = 0;
 }
 
+void BitStream::setBitPosition(size_t bits) {
+    // R5.0 (2026-08-24): allow callers to seek back to a previously
+    // captured bit position. Used by the onReceive fallback path that
+    // probes both R5.0 (with prefix) and R3.x (no prefix) wire layouts.
+    // Clamp to [0, _bitCount] so a buggy caller can't read past the
+    // end of the buffer.
+    if (bits > _bitCount) bits = _bitCount;
+    _bitPosition = bits;
+}
+
 void BitStream::ensureCapacity(size_t additionalBytes) {
     if (!_ownsData) return;
 

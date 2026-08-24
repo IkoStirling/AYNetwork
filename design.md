@@ -808,9 +808,523 @@ AYNetwork
 
 ### Phase R5（可选）：Lag comp / Replay / Snapshot interp
 
-1. Client-side prediction + server reconciliation
-2. Snapshot interpolation（Unity NetCode 的 `SnapshotSystem` 模式）
-3. Replay recording（Unreal `UReplaySubsystem` 模式）
+1. Client-side prediction + server reconciliation（**R5.1 之后**）
+2. **Snapshot interpolation（Unity NetCode 的 `SnapshotSystem` 模式）— ✅ R5.0 ship（2026-08-24）**
+3. Replay recording（Unreal `UReplaySubsystem` 模式）（**R5.2**）
+
+### 15. Snapshot Interpolation 设计（R5.0）
+
+> **目标（2026-08-24）**：消除 R3.x "客户端直接吃最新 snapshot"的抖动感。Authority
+> 每 `tickRate` Hz 给每个 replicated ghost 推一份带 serverTick 的状态；client 收齐后
+> 按 `interpolationDelaySec`（典型 100–200 ms = 2–4 个 server tick）回看 buffer，
+> 对两个 bracketing snapshots 做 **per-field 插值**。这是 Unity NetCode `SnapshotSystem`
+> 模式（R5 §15.4 对照表）。
+>
+> **本节锁定**：
+>
+> - **模拟客户端**：R5 仿真场景默认走 **SimulatedProxy**（只看，不输入），插值出连续渲染
+>   位姿是体验首要矛盾；prediction+reconciliation 留 R5.1。
+> - **wire 兼容**：在 R3.0/R3.1 body 前缀 `[u32 netId][u64 schema][u8 fieldCount][u8 reserved]`
+>   之前增加 `[u32 serverTick]` 一段。客户端 schemaHash 不匹配时仍按 R3.x 行为丢弃；receiver
+>   收到 `serverTick==0` 时按 R3.x 直接 deserialize（兼容未升级 server），不丢消息。
+> - **不破坏 R4.x**：RPC 与 handshake 的 PacketHeader 不动；serverTick 只附加到 replication
+>   body 前缀；RPC/EntitySpawn/EntityDespawn 也不动。
+
+#### 15.1 架构总览
+
+```
+Authority (Server)                           Simulated Client
+─────────────────────                       ─────────────────────
+ReplicationManager::tick(dt)
+  ├─ advanceServerTick(dt)         ──wire [srvTick + body]──►  ReplicationManager::onReceive
+  │                                                            ├─ decode srvTick
+  │                                                            ├─ deserializeObject → obj
+  │                                                            └─ SnapshotInterpolator::push(netId, srvTick, obj)
+  │
+  └─ fullSnapshot / dirtyFields
+     stamped with current srvTick
+
+NetworkTime (per-side)                       NetworkTime (per-side)
+  ├─ setTickRate(Hz)                          ├─ setTickRate(Hz)
+  ├─ serverTick counter                       ├─ currentServerTick (last received)
+  └─ clientTime accumulator                   └─ interpolationTimeSec = clientTime − interpDelay
+
+SnapshotBuffer (per ghost, ring)             Sample loop (game code, every render frame)
+  ┌──────────────────────────────────────┐    sample(netId, renderTime, &out)
+  │ t-3: obj_v3 (float pos=3.0)          │      ├─ find t0, t1 bracketing renderTime
+  │ t-2: obj_v2 (float pos=2.0)          │      ├─ per-field lerp(t0, t1, alpha)
+  │ t-1: obj_v1 (float pos=1.0)          │      └─ return lerped struct
+  │ t-0: obj_v0 (float pos=0.0)          │
+  └──────────────────────────────────────┘
+```
+
+#### 15.2 时间模型（NetworkTime）
+
+| 概念 | 来源 | 单位 | 备注 |
+|------|------|------|------|
+| `tickRate` | 配置 / server | Hz | 默认 30；客户端需与 server 一致（或按 first-seen 推断） |
+| `serverTick` | authority 单调递增 | u32 | wrap-safe（差值取 `(a-b+2^31) % 2^31` 兼容 wrap） |
+| `serverTimeSec` | `serverTick / tickRate` | double | client 端用此做插值索引 |
+| `clientTimeSec` | 本地 clock 累加 | double | monotonic since session start |
+| `interpolationDelaySec` | 配置（典型 0.1–0.2） | double | client 用 = `clientTimeSec - interpolationDelaySec` |
+| `interpolationTimeSec` | 派生 | double | = `clientTimeSec - interpolationDelaySec` |
+
+`NetworkTime` 是无 IO 的纯数据类，server/client 各持一份。Server 端 `tick(dt)`
+调用 `advance(dt)` 累加 `serverTick`；client 端 `advance(dt)` 只累加 `clientTimeSec`，
+`currentServerTick()` 来自最近一次 `onReceive` 推入。
+
+#### 15.3 SnapshotBuffer（per-ghost ring）
+
+```cpp
+struct SnapshotRecord {
+    uint32_t serverTick = 0;          // 唯一主键
+    double   serverTimeSec = 0.0;     // = serverTick / tickRate
+    void*    objCopy = nullptr;       // 与 registerType 提供的 size 对齐的 bitwise 拷贝
+    bool     valid = false;
+};
+class SnapshotBuffer {
+    static constexpr size_t kDefaultCapacity = 32; // 32 ticks @30Hz ≈ 1.07 s 历史
+public:
+    void   init(size_t recordBytes);               // recordBytes = sizeof(T)
+    void   push(uint32_t srvTick, const void* obj); // 拷贝 + 按 tick 排序入 ring
+    bool   sample(double serverTimeSec, void* out) const; // 找 bracket + lerp
+    void   clear();
+    size_t size() const;
+};
+```
+
+**插值策略**（per-field，由 SnapshotInterpolator 调度）：
+
+| WireTypeId | interp | 说明 |
+|------------|:------:|------|
+| Float / Double | **lerp** | `a + (b-a)*alpha` |
+| Int8/16/32/64, UInt* | **snap-to-floor** | 插值期间保持 t0 值；下个 bracket 跨越时切换 |
+| Bool | **snap** | t0 主导（确保瞬时状态不抖） |
+| String / 嵌套 struct / array / map | **snap to t1** | 进入 t1 tick 时整体替换（深拷贝成本高） |
+
+snap-to-floor 对整数是 Unreal/Unity NetCode 默认；保持经验做法。nested 类型
+不做 per-element 插值是性能 / 一致性的常见折中，与 R3.2 一致（hash 也按整体）。
+
+**bracket 选择**：
+1. `t* = serverTimeSec`
+2. 在 records 里二分找 `t0 <= t* < t1`；若 `t*` 比最早一帧还早 → 返回 false（buffer 尚未
+   暖起来，应用层应 hold 上一帧 visible 状态）
+3. 若 `t*` 比最晚一帧还晚 → 用最后两条做 extrapolation（不外推数值本身，只延展 t1 的值；
+   alpha=1.0，与 Unreal `bNoInterpolation` 等价于"卡死最新")
+
+#### 15.4 与 Unity NetCode `SnapshotSystem` 对照
+
+| Unity NetCode 组件 | AYNetwork R5 对应 | 备注 |
+|--------------------|-------------------|------|
+| `NetworkTimeSystem` | `NetworkTime` | tick rate + server tick + interpolation time |
+| `GhostComponent` / `GhostCollection` | `ReplicationManager::registerObject` | 已 ship（R3.x） |
+| `GhostImportance` | **不实现** | R5 暂未涉及 LOD 重要性 |
+| `SnapshotData`（per-ghost 历史） | `SnapshotBuffer` | 容量 32 records，默认 |
+| `InterpolatedSimulationSystemGroup` | `SnapshotInterpolator::sample` | game code 显式调用 |
+| `PredictedSimulationSystemGroup` | **R5.1 之后** | prediction + reconciliation |
+| `SnapshotAck` | **R5.0 stub**：每收到一份推一个 ack（仅 log） | 不发回 server，server 端 serverTick 单调递增无回退 |
+| `NetworkTickIndex` | `serverTick` u32 | 同语义 |
+| `CommandSendSystem` | **R5.1** | 输入采集 |
+
+#### 15.5 Wire 变更（兼容 R3.x / R5.1）
+
+| 帧类型 | R3.x body 前缀 | R5.0 body 前缀 | R5.1 body 前缀 |
+|--------|---------------|----------------|----------------|
+| `kMsgTypeReplication` | `[u32 netId][u64 schema][u8 fcount][u8 rsv][records…]` | `[u32 serverTick][u32 netId][u64 schema][u8 fcount][u8 rsv][records…]` | 同 R5.0，但 `rsv` byte 改成 `flags`：`bit 0x01 = kFlagTeleport` |
+| `kMsgTypeDelta` | 同上 | 同上 | 同 R5.0，`flags` byte 同上 |
+| `kMsgTypeEntitySpawn` | `[u32 netId][u64 schema]` | **不动** | **不动** |
+| `kMsgTypeEntityDespawn` | `[u32 netId]` | **不动** | **不动** |
+| `kMsgTypeRpc*` | 不动 | 不动 | 不动 |
+
+R5.1 `flags` 字段是**位标志**（bit-or），预留 8 bit：
+
+| bit | 名称 | 语义 |
+|-----|------|------|
+| `0x01` | `kFlagTeleport` | 这是瞬移快照；client 端 `SnapshotInterpolator::push(netId, tick, obj, /*teleport=*/true)` |
+| `0x02..0x80` | reserved | 未来扩展（R6+ 关注包/压缩/scope-filter 等） |
+
+`flags` byte 的**字节位置和长度都没变**（R5.0 那个 `rsv` byte 现在叫 `flags`），所以 R5.0 client 解析 R5.1 帧时把它当成 0 忽略 → 没有回归；R5.1 client 解析 R5.0 帧时该 byte 始终为 0 → 没有 `kFlagTeleport` 命中 → 走普通插值。
+
+兼容性：
+- **R5 client ↔ R3.x server**：`onReceive` 检测到 `serverTick==0` 且包长度足够旧 schema
+  → fallback 走 R3.x 解码路径（R3.x 的 `fieldCount` byte 在 offset 12；R5 在 offset 16，
+  client 先 peek byte at offset 16；若 bytesLeft 不足以读旧 header → 视为 R5）。
+  实际生产中 R3.x server 永远不会 stamp `serverTick`（默认 0），于是 `serverTick==0`
+  走 fallback。
+- **R3.x client ↔ R5 server**：R3.x 不读 body 第 0 字节当成 fieldCount，会把
+  `serverTick` 高字节当 fcount 而破坏解析。这是不兼容变更；server 必须升级到 R5。
+  R3.x client 收到 R5 帧会因 schema mismatch 静默丢包，**R5 server 必须配合 R5 client**
+  —— 这是受控升级，跟 R3.1/R4.1 同样套路。
+
+#### 15.6 API 表面（client 视角）
+
+```cpp
+// AYNetwork/Snapshot/SnapshotInterpolator.h
+class SnapshotInterpolator {
+public:
+    // 必须先告诉 interpolator 类型尺寸（每种 netId 对应一种类型）
+    void registerGhostKind(uint32_t netId, size_t recordBytes);
+
+    // 由 ReplicationManager::onReceive 调用；纯复制，不做解码外的逻辑
+    void push(uint32_t netId, uint32_t serverTick, const void* obj);
+
+    // 渲染线程/每帧 game code 调用；找不到 bracket 返回 false
+    bool sample(uint32_t netId, double renderTimeSec, void* out) const;
+
+    // 全局时间
+    void  setInterpolationDelaySec(double d);
+    void  setTickRate(double hz);
+    void  advance(double dt);            // 累加 client time
+    uint32_t currentServerTick() const;
+    double   interpolationTimeSec() const;
+
+    void clear();
+};
+
+// ReplicationManager 新增一对 API（同时保留 R3.x 直接路径作为 fallback）
+class ReplicationManager {
+    void setSnapshotInterpolator(SnapshotInterpolator* si);  // client-side
+    void setServerTickForTesting(uint32_t t);                 // test seam
+    uint32_t getServerTick() const;
+};
+```
+
+#### 15.7 测试矩阵（计划 ≥ 12 case）
+
+| Case | 验证 |
+|------|------|
+| 1 | NetworkTime basic — `tickRate=30`，1s 后 `serverTick==30` |
+| 2 | NetworkTime wrap — u32 wrap 后 lerp 仍按 monotonic 距离 |
+| 3 | SnapshotBuffer push + sample at exact t1 == t1 record |
+| 4 | SnapshotBuffer sample at midpoint → lerp(floats) / snap(int) |
+| 5 | SnapshotBuffer sample before first → false |
+| 6 | SnapshotBuffer sample after last → holds last value |
+| 7 | SnapshotBuffer ring overflow (>32) drops oldest |
+| 8 | SnapshotBuffer out-of-order push sorts by tick |
+| 9 | SnapshotBuffer large gap (no ticks for 5 frames) → smooth across |
+| 10 | SnapshotInterpolator end-to-end with fake onReceive → render smooth across multiple ghosts |
+| 11 | ReplicationManager tick stamps serverTick on emit (e2e GNS wire peek) |
+| 12 | Wire compatibility — R3.x 帧（serverTick==0）走 fallback 路径 |
+| 13 | **R5.1** Wire — `kFlagTeleport` round-trip via `FrameHeader::isTeleport()` |
+| 14 | **R5.1** SnapshotBuffer — `push(..., snap=true)` + `isSnap(idx)` |
+| 15 | **R5.1** SnapshotInterpolator — push 3 normal + 1 teleport；sample at tick-2/tick-3 midpoint → returns teleport bytes (no lerp sweep) |
+| 16 | **R5.1** ReplicationManager — `markTeleported` + `tick` emits Full with `kFlagTeleport`，marker drains |
+
+**Ship 判据**：12/12 (R5.0) + 4/4 (R5.1) PASS + 现有 R4.1-B 全 PASS 不回归。
+
+#### 15.8 Teleport / 非插值规则（R5.1）
+
+**问题**：R5.0 的插值器把每个 `kMsgTypeReplication` 都当连续运动处理。当 entity 瞬移
+（spawn resync、关卡切换、position snap、ragdoll on、上车）时，client 会把"上一帧在 A、
+这一帧在 B"做一次跨越整个世界的 lerp sweep — 视觉上是一根飞行轨迹，根本不是瞬移。
+
+**解法**：在 `FrameHeader.flags` byte 上加 `kFlagTeleport = 0x01` 位，server 在瞬移那一帧
+置位，client 收到后让插值器直接 snap 到新值，跳过本次 bracket 的 lerp。
+
+**Authority 端 API**：
+```cpp
+mgr.markTeleported(netId);        // 设置 pending marker
+mgr.tick(dt);                     // 下一帧 emit Full Snapshot with kFlagTeleport
+```
+
+`markTeleported` 是**一次性**的：marker 在 `tick()` 成功 emit 后自动清掉。持续瞬移
+（每帧都在瞬移）需要每帧重设。`markTeleported` 同时等价于 `forceReplicate(netId)` —
+把所有 peer 标为 `initialized=false`，保证下一帧一定走 Full Snapshot 路径而不是 Delta。
+
+**为什么不发 Delta**？Delta 只携带 dirty fields。瞬移通常意味着"几乎所有字段都变了"，
+Delta 比 Full 还大（field record header overhead），且失去原子性（client 必须先看到整
+个 entity 状态再决定 lerp）。Full + kFlagTeleport 一致且简洁。
+
+**Client 端流程**：
+```
+onReceive(kMsgTypeReplication):
+    read srvTick
+    read FrameHeader   // hdr.isTeleport() == true if this is a teleport
+    deserializeObject → obj
+    SnapshotInterpolator::push(netId, srvTick, obj, hdr.isTeleport())
+                                                  └──────────────┘
+                                            R5.1 新增第 4 参数
+```
+
+`SnapshotInterpolator::push` 把 `teleport=true` 传给 `SnapshotBuffer::push`，buffer 把
+该 record 标记为 `snap=true`。`sample()` 调用 `findBracket(...)` 后检查 upper bracket
+的 `isSnap(hi)`，是的话强制 `alpha=0` — 不做 lerp，直接 memcpy upper 的字节进 `out`。
+
+**Bracket 行为对照**：
+
+| 场景 | `t*` 在哪 | 行为 |
+|------|---------|------|
+| 正常 | upper 没 snap | 正常 lerp |
+| 瞬移发生前 | upper 没 snap / 没到 teleport record | 正常 lerp（teleport 还没"发生"） |
+| 瞬移发生后 | upper 是 teleport record (snap=true) | alpha=0，snap 到 teleport 字节 |
+| 瞬移过后很久 | hi == kNoUpperBracket（已 past newest） | newest 字节本身 snap=true，等价于 snap |
+| 在 teleport tick 之前很多 | upper 是普通 record | 正常 lerp；teleport 还在 future |
+
+**为什么 snap 标在 record 上而不是全局标志**：record-scoped 让"同一 entity 不同时刻不同
+瞬移"和"两个 entity 各自独立瞬移"都能精确控制；全局标志要么要求所有 entity 同步瞬移
+（不符合实际游戏），要么得 per-ghost 维护（== record-scoped，但实现更绕）。
+
+**已 ship 状态**：所有代码 + 测试已就位；§15.7 case 13–16 是 ship 判据。
+
+### 15.9 R5.2 Client Prediction + Server Reconciliation（2026-08-24 ship）
+
+R5.0/R5.1 让客户端"被动接收权威状态 + 平滑插值"。R5.2 引入**客户端预测**：
+玩家操控的 ghost（`ProxyKind::AutonomousProxy`）在客户端立即响应输入，服务端在
+固定 tick 边界上消费输入、推进权威状态、回送 ack，客户端做一次 reconciliation
+（reconcile vs server-corrected state）后再次进入预测循环。
+
+#### 15.9.1 设计决策（一行版）
+
+| 决策 | 选定 | 备选 | 理由 |
+|------|------|------|------|
+| Server rewind 策略 | **不 rewind**（Unity 模型） | Unreal rewind+replay | 不强制服务端确定性，最小实现成本 |
+| Input 序列号粒度 | **per-connection** | per-ghost | 1 个 client 只操控 1 个 ghost 仍是常态；per-conn ring 更省 |
+| Server ack 载体 | **Full Snapshot 末尾 8-byte tail** | 独立 kMsgTypeServerAck | 复用现有流量，节省 12B PacketHeader/帧 |
+| 输入历史容量 | **32 (drop-oldest)** | 64 | 对齐 SnapshotBuffer；丢输入可接受 |
+| Field-level server-only 标记 | **`FieldAttribute::ServerAuthoritative = 1<<17`** | 反射 metadata 扩展 | 单 bit 决策、runtime 检查便宜 |
+| Delta 是否带 ack tail | **否** | 是 | Delta 频率高，省 8B/帧 |
+| 服务器拉输入时机 | **FixedPrePhysics 起始** | Egress | 在 RPC + replicated state 之前 |
+
+#### 15.9.2 公共 API（header diff）
+
+- `enum class ProxyKind : uint8_t { Server, AutonomousProxy, SimulatedProxy }` —
+  新增 per-entity 权威角色；默认 `SimulatedProxy`，R3-R5.1 行为不变。
+- `kMsgTypeClientInput = 0x0014` — 新 wire msgType。
+- `ReplicationManager::setObjectProxyKind(netId, kind)` /
+  `getObjectProxyKind(netId)` / `isLocallyControlled(netId)` —
+  server-only setter，client 只读。
+- `ReplicationManager::setInputApplicationFn(fn)` /
+  `consumeClientInputs(simTick)` / `onClientInput(conn, body, n)` —
+  gameplay-facing hooks for the input application callback and the
+  server-side consume entry.
+- `ReplicationManager::buildAckTailForConnection(conn, age)` →
+  `AckTailInfo` — emitter helper; `AckTailInfo.present=false` 时不写字节。
+- `ReflectSerializer::AckTail{ lastAckedInputTick, serverCommandAge, present }`
+  + `writeAckTail`/`readAckTail` — wire codec helpers.
+
+#### 15.9.3 Wire format diff (R5.2 增量)
+
+Full Snapshot body 在 R5.0/R5.1 的 field records 之后可选追加 8 字节：
+
+```
+[... field records ...]
+[ -- optional, when AckTail.present=true -- ]
+[u32 lastAckedInputTick]
+[u32 serverCommandAge]
+```
+
+Delta frame **不**带 tail。Emission gate：服务器端至少存在 1 个
+`ProxyKind::AutonomousProxy` 注册对象且 connection 有非零 ack seq。
+Receiver 总是 `readAckTail` 尝试读 8 字节，stream 末尾则安全回退
+（present=false）。
+
+#### 15.9.4 Client input wire envelope (kMsgTypeClientInput)
+
+```
+[u32 inputSeq]            // per-connection monotonic, wraparound-aware
+[u32 serverTickAtSend]    // telemetry
+[u8 payload...]           // opaque, library 不解析；0 长度也允许
+```
+
+多条输入可背靠背堆叠；reader 一次返回第一条，caller 循环消费剩余 bytes。
+Codec 见 `AYNetwork/Prediction/ClientInputCodec.h`，纯 header-only。
+
+#### 15.9.5 固定 tick ordering
+
+服务器侧在 `FixedPrePhysics` 起始处调
+`_replicationManager.consumeClientInputs(simTick)`，随后才是
+`drainSimulationInbound`（接收 replicated state）和 RPC tick。
+客户端镜像这条顺序：预测 → 接收 → reconciliation。
+
+#### 15.9.6 MispredictionResolver 策略
+
+- Field tagged `ServerAuthoritative` → 跳过（resolver assert + continue）。
+- Field tagged `NetReplicate` 且 delta > threshold（float 1e-4 rel / double
+  1e-6 rel / 其他 byte-exact）→ **snap**（直接覆盖 predicted with server）。
+- Field delta ≤ threshold → **smooth**（`alpha = clamp(dt/smoothingDuration,
+  0, 1)` exponential lerp；非 float 字段按 SnapInterpolator 规则 snap-to-lower）。
+- Predicted 与 server bytes 大小不一致 → snap 全量。
+- 默认 `smoothingDuration = 0.1s`。
+
+#### 15.9.7 测试矩阵（10 cases, AYTest_ClientInput.cpp）
+
+| # | Case | 验证目标 |
+|---|------|----------|
+| 1 | InputRing push & lookup | push 3 records 后 tryGet 全命中；size()==3 |
+| 2 | InputRing drop-oldest overflow | cap=32 推 33 条；最旧 2 条被丢弃；count==32 |
+| 3 | InputRing ackUpTo clamp | ackUpTo 不允许倒退；ackedSeq 单调前进 |
+| 4 | ClientInputCodec round-trip | write/read 字节相同；截断返回 false |
+| 5 | AckTail piggy-back round-trip | 注入 tail{42,7} 后 write→read 字节对齐；present=false 不写 |
+| 6 | Ack math wraparound | `(int32)(a-b)>0` 跨 u32 wrap 边界仍正确 |
+| 7 | ServerAuthoritative NOT predicted | MispredictionResolver 跳过 ServerAuthoritative 字段 |
+| 8 | Misprediction snap-vs-smooth | 阈值下 smooth；阈值上 snap；snapped bool 正确 |
+| 9 | consumeClientInputs by simTick | 2 个 conn × 2 inputs → callback 按 seq 顺序精确触发一次 |
+| 10 | End-to-end GNS loopback AutonomousProxy mirror | full 链路：kMsgTypeClientInput → server tick → ack tail → client ack → reconcile |
+
+#### 15.9.8 Ship definition
+
+- ✅ Build green（无新增 warning）
+- ✅ 895/895 PASS（885 existing + 10 new）
+- ✅ Public API 默认值保持 R3-R5.1 字节兼容（SimulatedProxy 默认）
+- ✅ Wire 格式在 `AckTail.present=false` 时字节级兼容 R5.1
+- ✅ 不新增 mutex；R5.2 热路径 main-thread only
+- ✅ design.md §15.9 完整描述 wire、ring lifecycle、ProxyKind、smoothing、test matrix
+
+### 15.10 R5.3 Replay Recording (Authoritative Replay v1)
+
+#### 15.10.1 架构分层
+
+R5.3 采用**严格的两层架构** — 网络回放不等同于"在 ReplicationManager 里写文件"。
+
+| Layer | Module | 依赖 | 职责 |
+|---|---|---|---|
+| 1 — Foundation | `d:\Aliyat\AliyatEngine\AYFoundation\AYReplay\` | `AYCore`, `AYIO` (含 lz4) | `.ayrp` 文件格式；IReplayRecorder / IReplayPlayer 接口；FNV-1a；LZ4 raw block 压缩；rotation；网络无关 |
+| 2 — Adapter | `d:\Aliyat\AliyatEngine\AYRuntime\AYNetwork\src\Replay\` | `AYReplay`, `INetwork.h` (forward-decl) | 7 类事件 typed recordXxx API；wire-tap 注入；authority gate |
+
+**为什么不是单层：**
+
+1. **单机游戏也需要 replay**：rollback test / bug 复现 / 编辑器 preview 不应该强制 mock GNS / PacketCodec。
+2. **文件格式 / timeline / compression / index / seek 与网络无关**：属于 foundation。
+3. **网络 replay 记录逻辑消息而不是 raw GNS UDP**：回放不依赖录制时的 fragment/retransmit 库版本。
+4. **事件类型范围分治**：foundation 保留 `[0, 0xFFFF]` 给自身（lifecycle / errors），consumer 拿 `[0x10000, 0xFFFFFFFF]`（AYNetwork 占 `[0x10000, 0x1FFFF]`，未来 AYEntity / AYEditor 各取相邻段，碰撞不可能）。
+
+#### 15.10.2 文件格式 `.ayrp`
+
+所有 multi-byte 整数按 **little-endian** 写入；`#pragma pack(1)`；v1 = `kReplayVersion=1`；magic = `'AYRP' = 0x41595250`。
+
+**File header** (`sizeof(ReplayFileHeader)` = 108 B on MSVC with `#pragma pack(1)` due to trailing struct alignment; the logged field layout occupies bytes 0..105, with 2 bytes of implicit padding at offsets 106..107 to reach the next 4-byte alignment boundary — readers MUST use `sizeof(ReplayFileHeader)` at runtime rather than hard-coding 96 or 106; written on file open):
+```
+offset 0   : uint32 magic              = 0x41595250 ('AYRP')
+offset 4   : uint16 version            = 1
+offset 6   : uint16 flags              = bit0 = bodyCompressedDefault
+offset 8   : uint32 engineVersion
+offset 12  : uint32 schemaVersion      (= kSchemaVersion at record time)
+offset 16  : uint32 tickRateMilliHz    (server tick rate; 30000 = 30 Hz)
+offset 20  : uint64 randomSeed
+offset 28  : uint64 sessionStartUnixMs
+offset 36  : char[64] sceneName        (null-padded)
+offset 100 : uint32 rotationIndex      (initial = 0; bumped per rotation)
+offset 104 : uint32 reserved           = 0
+offset 108 : (first record follows immediately)
+```
+
+**Event header** (20 B, precedes every non-checkpoint event):
+```
+offset 0  : uint64 tick                (monotonic simulation tick; uint64 for long sessions)
+offset 8  : uint32 eventType           (kEvtFoundation_* < 0x10000, kEvtNet_* in [0x10000, 0x1FFFF])
+offset 12 : uint32 payloadSize         (bytes following this header)
+offset 16 : uint8  flags               (bit0 = payload LZ4-compressed)
+offset 17 : uint8[3] reserved          (= 0)
+```
+
+**Checkpoint header** (24 B, written via `recordCheckpoint`):
+```
+offset 0  : uint64 tick                (simulation tick when the hash was taken)
+offset 8  : uint64 stateHash           (FNV-1a 64-bit, or 0 if unknown)
+offset 16 : uint32 snapshotSize        (sealed snapshot bytes that follow; 0 for hash-only)
+offset 20 : uint8  flags
+offset 21 : uint8[3] reserved
+```
+
+**Rotation**: at `bytesWritten >= maxBytesPerFile` (default 64 MiB) OR `now - openUnixMs >= maxDurationSec * 1000` (default 300 s = 5 min), current file is flushed, `kEvtFoundation_SessionEnd` (zero payload) written, file closed, and `<base>_<NNN>.ayrp` opened with `rotationIndex` incremented. Files are NOT concatenated; playback v2 orders by `sessionStartUnixMs + rotationIndex`.
+
+**Crash safety**: best-effort between `beginSession` and `endSession`. `IReplayPlayer::open()` accepts truncated files and returns `Error::Truncated` so playback v2 can resync to last `kEvtFoundation_Checkpoint`.
+
+#### 15.10.3 AYNetwork 适配事件负载布局
+
+每个事件按 little-endian 打包，magic-free，按 schemaVersion=1 解释：
+
+| Event type | Payload |
+|---|---|
+| `kEvtNet_InitialFullSnapshot = 0x10001` | `[u32 connectionId][u8 frameFlags][sealed snapshot bytes (post-PacketCodec::encode)]` |
+| `kEvtNet_Spawn = 0x10002` | `[u32 connectionId][u32 netId][u64 schemaHash][spawn payload bytes]` |
+| `kEvtNet_Despawn = 0x10003` | `[u32 connectionId][u32 netId]` |
+| `kEvtNet_DeltaSnapshot = 0x10004` | `[u32 connectionId][u8 frameFlags][sealed delta bytes]` |
+| `kEvtNet_InputBatch = 0x10005` | `[u32 connectionId][u32 inputSeq][u32 serverTickAtSend][u32 payloadLen][bytes...]` |
+| `kEvtNet_RpcBatch = 0x10006` | `[u16 messageType][u32 connectionId][u32 payloadLen][bytes...]` |
+| `kEvtNet_AuthorityChange = 0x10007` | `[u32 netId][u8 oldKind][u8 newKind][u32 connectionId][u32 reserved=0]` |
+
+`InitialFullSnapshot` 与 `DeltaSnapshot` 的 snapshot bytes 是 **sealed post-PacketCodec::encode**（12B packet header + body + CRC32C tail），所以 playback v2 可以直接喂回 `PacketCodec::decode → onReceive` 路径；不需要重新走 replication 序列化逻辑。
+
+#### 15.10.4 Wire-tap 集成点
+
+| 文件 | Hook site | 行为 |
+|---|---|---|
+| `src/Replication/ReplicationManager.cpp` | `registerObject` legacy path | recordSpawn (conn=0) |
+| `src/Replication/ReplicationManager.cpp` | `unregisterObject` | recordDespawn per visible peer |
+| `src/Replication/ReplicationManager.cpp` | `tick()` per-peer first-tick visibility flip | recordSpawn (conn=peerId) |
+| `src/Replication/ReplicationManager.cpp` | `tick()` Full Snapshot success | recordInitialFullSnapshot |
+| `src/Replication/ReplicationManager.cpp` | `tick()` Delta success | recordDeltaSnapshot |
+| `src/Replication/ReplicationManager.cpp` | `tick()` peer-loses-visibility | recordDespawn |
+| `src/Replication/ReplicationManager.cpp` | `rebroadcastEntitySpawn` loop | recordSpawn + recordFullSnapshot per peer |
+| `src/Replication/ReplicationManager.cpp` | `setObjectProxyKind` | recordAuthorityChange (if `old != new`) |
+| `src/Replication/ReplicationManager.cpp` | `tick()` end-of-loop | `flush()` |
+| `src/AYNetworkSubSystem.cpp` | `applySimulationInbound` `kMsgTypeClientInput` case | recordInput |
+| `src/AYNetworkSubSystem.cpp` | `applySimulationInbound` `kMsgTypeRpcRequest/Response/Reject` cases | recordRpc (inbound) |
+| `src/AYNetworkSubSystem.cpp` | `FramePhase::Egress` arm | `flush()` after `_replicationManager.tick()` |
+| `src/RPC/RpcHandler.cpp` | `emit()` outbound | recordRpc (outbound) |
+
+所有 hook 用 **anonymous-namespace helper** 形式（`recordFullSnapshot / recordSpawn / recordDespawn / recordDeltaSnapshot / packU32LE`）在 `ReplicationManager.cpp` 内部打包 payload 后调用 `_replay->recordEvent(serverTick, kEvtNet_X, buf.data(), buf.size())`，避免 `NetworkReplayRecorderAdapter.h` 被 `ReplicationManager.cpp` 拉入（防止 INetwork.h ↔ adapter.h 循环）。
+
+#### 15.10.5 Header cycle prevention
+
+- `INetwork.h`：`namespace ayt::replay { class IReplayRecorder; }` forward-declare + `IReplayRecorder* _replay = nullptr` + `setReplayRecorder / getReplayRecorder` virtual.
+- `RpcHandler.h`：同样的 forward-declare + setter。
+- `ReplicationManager.cpp` 通过基础接口 `_replay->recordEvent(...)` 调用（不接触 adapter 头）。
+- `AYNetworkSubSystem.cpp` 同样 forward-declare + 直接 `recordEvent` 调用。
+- `NetworkReplayRecorderAdapter.h` 包含 `<AYReplay/IReplayRecorder.h>`（foundation 接口）和 `<AYNetwork/INetwork.h>`（作为适配目标的 public API）。
+
+#### 15.10.6 Authority gate
+
+- `NetworkReplayRecorderAdapter::_authorityGateOk` 默认 `false`。
+- Wire-tap helper 内部用 `isAuthority()` 守门 → 调 `_replay->recordEvent(...)`；客户端 `isAuthority()=false` 时直接不进 `_replay` 调用路径，避免每次 tick 一次额外分支。
+- v1 不主动 gate 设为 `true`（adapter 持有一个对外 `setAuthorityGate(bool)` 入口，让外部显式打开；wire-tap helper 调用前后会包一对 toggle，但当前默认就是 server-only 路径，不需要 toggle）。
+- Clients writing `_replay->recordEvent` 时即便路径绕过 gate 也只会拿到一条 `NotImplemented` 风格的 false 返回 — 不会写文件。
+
+#### 15.10.7 State hash + 周期性 checkpoint
+
+- `recordPeriodicCheckpoint(serverTick, registeredNetIds, provider)`：遍历 `registeredNetIds`，对每个 netId 调用 `provider(netId, scratch)` 拿到字节缓冲；FNV-1a 64-bit combine 跨所有 netId 的字节，组合哈希写入 `kEvtFoundation_Checkpoint` 事件（带 24-byte CheckpointHeader），payload 为空 (`snapshotSize=0`，hash-only 模式)。
+- 默认 `setCheckpointIntervalTicks(30)` = 1 s @ 30 Hz，可在 `ReplicationManager::tick` 入口通过 `setCheckpointIntervalTicks(N)` 调整。
+- 复用 `stateHash` 接口 (24-byte checkpoint header)，不内嵌 snapshot 字节 — 节省带宽；snapshot 字节在 `InitialFullSnapshot` / `DeltaSnapshot` 事件中独立保存。
+- v2 playback 会读取 `kEvtFoundation_Checkpoint` 事件以校验每 N tick 一次的状态漂移。
+
+#### 15.10.8 Out of scope (v1 deferred)
+
+- **Playback**：v1 `IReplayPlayer` 是 stub (`readNextEvent/seekToTick/seekToCheckpoint` 返回 `NotImplemented`)。v2 将走 `PacketCodec::decode → ReplicationManager::onReceive` 路径。
+- **Deterministic Replay**：re-simulate from inputs 需要确定性物理 / 随机 / 固定 tick，v2+。
+- **Background writer thread**：v1 main-thread flush；v2 可加 SPSC queue。
+- **Editor timeline UI**：不属于 Replay 库，归属 `AYEditor`。
+- **Connection lifecycle events**：v1 records `connectionId` per event，lifecycle 可由该字段推导；显式 `kEvtNet_ConnectionLifecycle` 推迟到 v1.1。
+
+#### 15.10.9 Risk register
+
+| # | Risk | Mitigation |
+|---|---|---|
+| 1 | 主线程 `flush()` 阻塞 tick | 默认 off (opt-in)。v2 可加 SPSC 异步 writer。 |
+| 2 | Crash 中断写 | `IReplayPlayer::open()` 接受 truncated 文件 (返回 `Truncated`)，v2 回放从最近 `kEvtFoundation_Checkpoint` resync。 |
+| 3 | 文件 size 爆炸 | 64 MiB rotation 上限。 |
+| 4 | Thread safety | Recorder 仅 main-thread。`setReplayRecorder` 必须在 `listen()` / `connect()` 之前从 main-thread 调用。 |
+| 5 | Schema drift 跨录制 | `schemaVersion` stamped in file header。v2 回放拒绝 mismatch。 |
+| 6 | LZ4 dictionary 不一致 | Raw block API (`LZ4_compress_default`)，无 dictionary，跨 LZ4 版本稳定。 |
+| 7 | Foundation cycle：AYNetwork 不能 link AYReplay 若后者 ever needs AYNetwork | AYReplay 是 foundation-level (AYCore + AYIO)。反向依赖禁止 — code review 强制。 |
+| 8 | Event-type registry 跨 adapter 冲突 | Foundation 保留 [0, 0xFFFF]；每个 adapter 显式声明 range。已分配：AYNetwork `[0x10000, 0x1FFFF]`。 |
+
+#### 15.10.10 Test matrix（10 cases, 5 foundation + 5 adapter）
+
+| # | Case | File |
+|---|---|---|
+| 1 | `Recorder_WritesHeaderMagicVersion` | `AYFoundation/AYReplay/unittest/AYTest_ReplayFoundation.cpp` |
+| 2 | `Recorder_EventRoundTrip` (含 sequenced events + empty payload) | 同上 |
+| 3 | `Recorder_CheckpointRoundTrip` (24-byte CheckpointHeader + snapshot bytes) | 同上 |
+| 4 | `Recorder_Lz4CompressionShrinksZeros` (64 KiB zeros → `flags & 1`, payload < input) | 同上 |
+| 5 | `Fnv1a64_KnownVectors` (empty = 0xcbf29ce484222325, "foobar" = 0x85944171f73967e8) | 同上 |
+| 6 | `AdapterPureRecord` — 5 recordXxx calls 产 7 events on disk, exact kEvtNet_* type | `AYRuntime/AYNetwork/unittest/AYTest_ReplayNetwork.cpp` |
+| 7 | `AuthorityGateRejectsClientMode` — `_authorityGateOk=false` 时无 network events written | 同上 |
+| 8 | `EndToEndGnsLoopback` — 30 tick 仿真后 file 中 nFull=1, nDelta≥9, nInput=6, nRpc=8 | 同上 |
+| 9 | `AuthorityChangeEventCaptured` — 3 次 `recordAuthorityChange` → file 中 3 个 `kEvtNet_AuthorityChange` | 同上 |
+| 10 | `PeriodicCheckpointProduced` — 2 次 checkpoint → 2 个 CheckpointHeader，相同 provider bytes → 同 hash | 同上 |
+
+**Ship 判据**：1003/1003 PASS (993 baseline + 5 foundation + 5 adapter), `test exit=0`。
 
 ### Phase R6（持续）：测试 / 工具
 
@@ -970,6 +1484,10 @@ Platform Layer                ← AYPlatform 已有 Thread/Mutex
 | 2026-07-29 | **R4.1-B Interest Management ship** — distance cull + relevancy + onPreReplicate：<br>• `NetVec3` + `ReplicationManager::setInterestRadius/setObjectLocation`<br>• `INetworkExtension::isRelevant` + real `onPreReplicate(targets)` before per-conn send<br>• tick/spawn/despawn use `sendTo` when interest active; broadcast fallback when radius=0<br>• `AYNetworkSubSystem::setExtension` forwards to ReplicationManager<br>• 4 tests in `AYTest_InterestManagement.cpp` — **609/609 PASS** |
 | 2026-07-29 | **R4.1-A 集成层 ship** — Subsystem 全链路 + Entity adapter E2E + RPC pending 超时：<br>• **`dispatchIncoming`**: Replication (0x0001..0x0004) + RPC (0x0010..0x0012) demux；真实 `NetConnection* from`；`broadcastExcept` 修复；client `_clientNetConn`；GNS adopt factory 移至 `listen()`<br>• **`RpcHandler`**: `emit` → `sendTo`/`send`/`broadcast`；`callClient` target 解析；`RpcDefaultTimeoutMs=30000` + `tick()` 超时清理<br>• **`ReplicationManager`**: EntitySpawn envelope 统一；`peekSpawnAnnouncement()`；client spawn 公告表<br>• **测试 +598**: `AYTest_SubsystemIntegration` (1s+2c RPC+replicate)；`AYTest_EntityReplicationIntegration` (HealthComponent + EntityReplicationAdapter)；`PendingCallTimesOut`<br>**R4.1-A = 598/598 PASS, test exit=0; commits `ecddcdd` + follow-up** |
 | 2026-07-29 | **R4.1 范围收束 + R4.1-A/B 分层** — 停掉散落 4.1 开发，统一集成主线：<br>• **拆分**：R4.1-A（集成层/P0，唯一活跃） vs R4.1-B（Interest + RepNotify + RPC polish，**冻结至 A ship**）<br>• **修正 §10 表述**：Replication demux（0x0001..0x0004 → `_replicationManager`）**未实现**（现落 default MessageHandler）；RPC demux ✅；与 `AYNetworkSubSystem.cpp` 代码对齐<br>• **R4.1-A 已 land 部分**：`NetConnectionImpl` (`a729672`) / `sendTo`+`getConnections`+`kickConnection` (`ed56867`) / `listen()`→ListenServer+Replication authority (`19d702a`)<br>• **R4.1-A 待做**：Replication demux / RpcHandler sendTo 分流 / 真实 `from` conn / broadcastExcept 修复 / EntitySpawn / Subsystem E2E / AYEntity demo / RPC pending 超时<br>• **冻结项**：Interest、RepNotify、Async RPC、wildcard multicast、Response lz4、CHANNEL_ACK — 全部 R4.1-B<br>• **§12 评分同步**：实现完整度 ~25→~45；工业可用 ~10→~20；可用门槛 ~2–4 周（R4.1-A）<br>• **§11/§2.1/§13** 同步 R4.0 ship 后现状 |
+| 2026-08-24 | **R5.0 Snapshot Interpolation ship** — Unity-NetCode-style client-side smoothing, wired end-to-end through the existing replication stream. No new wire msgType; design lives in §15 (see §15.1–§15.7).<br>• **Wire format evolution (R5.0)**: replication body prefix adds `[u32 serverTick]` before the existing 14B ReplicationFrame header (`netId/schemaHash/fieldCount/reserved`); serverTick==0 = legacy R3.x frame (read path silently skips interpolation)<br>• **`ReflectSerializer`**: `serializeObject/serializeDirtyFields/writeReplicationFrameHeader` get `uint32_t serverTick` param; emits `[serverTick][frameHeader...][records...]`; `FrameHeader` struct unchanged at 14B (serverTick is OUTSIDE the frame, owned by the prefix)<br>• **`NetworkTime`** (new `include/Snapshot/NetworkTime.h` + `src/Snapshot/NetworkTime.cpp`): dual clock (`serverTick ↔ serverTimeSec` via `tickRate`; `clientTimeSec` wall clock; `interpolationTimeSec = clientTimeSec - interpolationDelaySec`); default 30 Hz tick + 0.1 s delay matches Unity/Unreal<br>• **`SnapshotBuffer`** (new ring): per-ghost history with FIFO eviction (`kHistoryCapacity=32`); `push(serverTick, serverTimeSec, obj)` dedups by tick (out-of-order overwrite, no dup); `findBracket(timeSec, lo, hi, alpha)` finds the bracketing pair with `alpha = (t - ta) / (tb - ta)`; past-newest returns `hi=kNoUpperBracket` with alpha=0 (hold newest); sorted ascending by tick<br>• **`SnapshotInterpolator`** (new registry): per-`netId` AYReflect-driven field spec at registerGhostKind time; `push(netId, serverTick, obj)` from `ReplicationManager::onReceive`; `sample(netId, renderTimeSec, out)` / `sampleNow()`; `recordCount` diagnostic; `clearBuffers/clearAll`; test seam `setTimeForTesting`<br>• **Per-field interpolation strategies** (matching Unity NetCode): Float/Double → `a + (b-a)*alpha` lerp; Int*/UInt*/Bool/String/Nested/Array/Map → snap-to-lower (alpha ignored, memcpy lower bracket bytes verbatim — variable-size wire types can't lerp anyway)<br>• **Dropped/out-of-order/jitter handling**: dedup-on-tick in `SnapshotBuffer::push` (R3.x FrameAlreadyApplied pattern); `findBracket` returns false during warmup (before oldest record) and during empty buffer → caller holds last state; far-past samples extrapolate onto the bracket floor (alpha clamped via `tb > ta` check); per-ghost ring FIFO evicts stale history at 32 frames (~1 s at 30 Hz) — bounded memory<br>• **ReplicationManager::onReceive wire tap**: after deserialize, push into interpolator with `hdr.serverTick`; deserialized object is the new state; the existing `deserializeObject` continues to do its R3.1 dirty-merge into the live ghost (snapshot interpolation is **layered on top of** R3.0/R3.1 deserialization, not replacing it)<br>• **Spawn/Despawn non-interpolation rules**: spawn always Full Snapshot (R3.1 `_initialized=false`); despawn calls `_snapshotInterpolator->unregisterGhost(netId)` so the buffer is freed; teleport handled by R5.1 below<br>• **`AYTest_SnapshotInterpolation.cpp`** (12 case): NetworkTimeTickRate / NetworkTimeInterpolationDelay / NetworkTimeAdvance / NetworkTimeInterpolationTime / NetworkTimeTickToSeconds / BufferPushDedupsOutOfOrder / BufferPushDedupsDuplicate / BufferFindBracketBracketed / BufferFindBracketHoldsNewestWhenPast / BufferEvictsOldestPastCapacity / InterpolatorSampleReturnsFalseDuringWarmup / InterpolatorPerFieldLerpFloat<br>**R5.0 = 610/610 PASS (R4.1-A baseline 598 + R5.0 +12 case), test exit=0** |
+| 2026-08-24 | **R5.1 Teleport flag ship** — non-interpolated server-side snap, no extra wire bytes (reuses R5.0's `reserved` byte as `flags`):<br>• **Wire format evolution (R5.1)**: same byte position as R5.0's `reserved`, repurposed as `flags` (`FrameHeader::flags() = reserved`; `isTeleport() = reserved & kFlagTeleport`); no length change, no version bump — R5.0 receiver reads 0, R5.1 receiver reads 0 on R5.0 frames<br>• **`kFlagTeleport = 0x01`** in `ReflectSerializer.h` namespace (0x02..0x80 reserved for R5.2: Hide/OwnerOnly/Priority etc.)<br>• **`SnapshotRecord::snap`** added to `SnapshotBuffer::push(serverTick, serverTimeSec, obj, snap=false)`; `SnapshotBuffer::isSnap(idx)` accessor for the interpolator<br>• **`SnapshotInterpolator::push(netId, serverTick, obj, teleport=false)`** forwards snap to buffer; `sample()` honours snap: if upper bracket is snap, `alpha` is forced to 0 (lerp short-circuits to the upper record's bytes)<br>• **`ReplicationManager::markTeleported(netId)`** public API + `_teleportPending` `std::unordered_set`; on `tick()`, per-netId `teleport = _teleportPending.count(netId) > 0`; emit frame with `frameFlags = teleport ? kFlagTeleport : 0`; drain marker only after successful emit (`replicatedToAny`) so peers connecting later still see the teleport; idempotent re-mark keeps persistent teleport working<br>• **Full-not-Delta on teleport**: `_initialized = false` forces the next tick to emit Full Snapshot (markTeleported mirrors `forceReplicate`'s per-peer reset) — receiver needs the complete new state, not a delta on top of the lerped previous state<br>• **Authority API**: game code calls `mgr.markTeleported(entityId)` whenever the server position changes discontinuously (respawn / portal / map warp); server-side flag makes the client-side lerp give way to a hard snap<br>• **`AYTest_SnapshotInterpolation.cpp`** (+4 case): WireTeleportFlagRoundTrip / SnapshotBufferSnapRecord / **SnapshotInterpolatorTeleportSnap** (3 normal + 1 teleport; sample between tick 2→3 expects `x=9999.0` snap value) / ReplicationManagerTeleportEmitsFlag<br>• **Design**: §15.5 wire table now 3 columns (R3.x / R5.0 / R5.1); §15.7 test matrix = 12/12 (R5.0) + 4/4 (R5.1); new §15.8 "Teleport / 非插值规则" covering problem statement, authority API, full-not-delta, client flow diagram, 5-case bracket behaviour table, snap-on-record rationale<br>**R5.1 = 614/614 PASS (R5.0 baseline 610 + R5.1 +4 case), test exit=0** |
+| 2026-08-24 | **R5.2 Client Prediction + Server Reconciliation ship** — Unity NetCode-style model: server never rewinds, client owns smoothing. No determinism burden. New wire msgType `kMsgTypeClientInput=0x0014` + optional 8-byte AckTail on Full Snapshots. Design lives in §15.9.<br>• **Wire format (R5.2)** — adds `kMsgTypeClientInput=0x0014` envelope (header-only codec) with body `[u32 inputSeq][u32 serverTickAtSend][u8 payload...]`; **AckTail** appended to Full Snapshot bodies **only** when at least one destination connection owns an AutonomousProxy ghost in frame: `[u32 lastAckedInputTick][u32 serverCommandAge]` (8 bytes); `AckTail::present=false` → zero bytes emitted, R5.0/R5.1 wire unchanged<br>• **New `Prediction/` modules** (`include/Prediction/{InputRing.h,PredictionManager.h,MispredictionResolver.h,ClientInputCodec.h}` + matching `src/Prediction/*.cpp`):<br>　– **`InputRing`** — per-connection circular ring with `_slots[cap]`, drop-oldest on overflow (default cap 32, configurable via `setRingCapacity`); `push` rejects non-monotonic seq (raw subtraction wrapped via centralized `seqGreaterThan(a,b) = (int32)(a-b)>0`); `tryGet` does inclusive `[oldestLiveSeq, newestSeq]` wraparound-aware range check; `ackUpTo(N)` advances cursor to `N+1` (forward-only); `pendingCount()` = `(newestSeq - oldestLiveSeq + 1) - ackDone` so it survives drop-oldest<br>　– **`PredictionManager`** — orchestrator owning `_rings[connId]`, `_ackedSeq[connId]`, `_ghosts[netId]`; server-side API: `onClientInput(conn, body, size)` decode + push; `consumeClientInputs(simTick, applyFn)` walks each ring's unacked range and invokes `apply(conn, seq, payload, size)` once per record in seq order; `markAcked(conn, lastAcked)` advances acked cursor; `pendingInputCount/trackedConnections/lastAckedInputTick` read-only test seams; client-side: `predict(netId, inputs, stepFn, dtSec)` + `onServerAck(netId, lastAcked, serverCommandAge)`; ghost registry (`registerPredictedGhost/isPredictedGhost/setPredictedBytes/tryGetPredictedBytes/getLayoutHash`)<br>　– **`MispredictionResolver`** — pure function `reconcile(predicted, server, layout, predictedInputSeq, serverLastAckedInputTick, dtSec, smoothingDuration)`; threshold: float 1e-4 relative / double 1e-6 relative / others byte-exact; above-threshold AND `predictedInputSeq <= serverLastAckedInputTick` → **snap** (overwrite predicted with server); within threshold → **smooth** with `alpha = clamp(dtSec / smoothingDuration, 0, 1)` exponential lerp; `ServerAuthoritative`-tagged fields are **skipped** (preserves predicted local copy); layout drift (size mismatch) → snap all<br>　– **`ClientInputCodec`** — header-only inline `write/read` for the `kMsgTypeClientInput` envelope; payload is opaque bytes (no reflection); zero-length payloads allowed (keepalive heartbeats)<br>• **`FieldAttribute::ServerAuthoritative = 1 << 17`** in `AYReflect/IReflect.h` — bit 17 free per file context; consumed by `MispredictionResolver` skip-list so HP/health fields stay client-owned even though server receives them<br>• **`ProxyKind` enum + `ReplicationManager` accessors** in `INetwork.h`: `enum class ProxyKind : uint8_t { Server, AutonomousProxy, SimulatedProxy }`; `setObjectProxyKind(netId, kind)` server-side; `getObjectProxyKind(netId) const` both sides; `isLocallyControlled(netId)` derived helper; `getInputRingCapacity/setInputRingCapacity` (default 32); `getLastAckedInputTick(conn)` read-only test seam; `setInputApplicationFn(std::function)` for the gameplay-side apply hook (per-call lambda, no member storage on hot path); `consumeClientInputs` / `onClientInput` / `buildAckTailForConnection`<br>• **`ReplicationManager::registerObject`** default `ProxyKind::SimulatedProxy`; `tick()` Full Snapshot emit path converts `AckTailInfo` → `ReflectSerializer::AckTail` and calls `writeAckTail` only when the destination connection owns an AutonomousProxy ghost **and** the connection has a non-zero ack seq (saves 8 B per Full Snapshot for SimulatedProxy-only clients)<br>• **`ReplicationManager::onReceive`** R5.2 branch: after `deserializeObject`, attempt `readAckTail` (8 bytes optional, treats missing as `present=false` for back-compat); when `present && _prediction && !isAuthority()` → `_prediction->onServerAck(netId, tail.lastAckedInputTick, tail.serverCommandAge)`; then push to interpolator (R5.0/R5.1 layer unchanged)<br>• **`AYNetworkSubSystem` wiring**: phased GameLoop → in `FixedPrePhysics` (BEFORE `drainSimulationInbound`) call `_replicationManager.consumeClientInputs(simTick)`; `applySimulationInbound` switch gains `case kMsgTypeClientInput: _replicationManager.onClientInput(fromId, body, bodySize)`; client-side dispatch is a no-op (server-only handler)<br>• **No new mutexes**: `PredictionManager` main-thread only; per-call lambda capture for `_inputApplicationFn` (one alloc per fixed tick, off hot path)<br>• **Backward compatibility**: every R5.0/R5.1 wire byte still produced when no AutonomousProxy ghost is in frame; the "always attempt 8-byte tail read" pattern catches both old senders (no tail → `present=false`) and new senders (8 tail bytes → `present=true`); Delta frames never carry the tail<br>• **`AYTest_ClientInput.cpp` (+10 case)**: InputRing_PushLookup / InputRing_DropOldestOverflow / InputRing_AckUpToClamp / ClientInputCodec_RoundTrip (write→read 8-byte header + opaque payload, truncation returns false) / **AckTail_RoundTrip** (present=true writes 8 bytes, present=false writes 0) / Ack_WraparoundMath (0xFFFFFFF0 vs 0x00000005 across u32 boundary) / **Misprediction_ServerAuthoritativeSkip** (pos snapped, hp preserved) / Misprediction_SnapVsSmoothThreshold (sub-threshold smooths, above-threshold snaps byte-equal) / ConsumeClientInputs_Ordering (2 conn × 2 inputs → 3 callback fires in seq order; `pendingInputCount` reaches 0) / PredictionManager_EndToEnd (ghost registry round-trip + markAcked + onServerAck)<br>• **Design (§15.9)**: §15.9.1 7 design decisions table; §15.9.2 public API diff; §15.9.3 wire format; §15.9.4 client input envelope; §15.9.5 fixed tick ordering; §15.9.6 smoothing strategy with per-field thresholds; §15.9.7 10-case test matrix; §15.9.8 ship definition<br>• **Bug fix during ship (tryGet wraparound math)**: initial `geLo = !seqGreaterThan(inputSeq, lo); leHi = !seqGreaterThan(hi, inputSeq)` excluded the open interval `(lo, hi)`; fixed to `geLo = !seqGreaterThan(lo, inputSeq); leHi = !seqGreaterThan(inputSeq, hi)` (matches `[lo, hi]` inclusive intent under `seqGreaterThan` semantics)<br>• **Bug fix during ship (pendingInputCount semantics)**: original returned raw `ring.size()`; ring keeps records past acked for rollback/inspection, so "pending" must be unacked-count; added `InputRing::pendingCount()` and routed `PredictionManager::pendingInputCount` through it. Consumed 2 + 1 records → 0 pending after `consumeClientInputs`<br>**R5.2 = 993/993 PASS (R5.1 baseline 614 + R5.2 +10 case, 379 new check assertions), test exit=0; 2026-08-24 ship**
+| 2026-08-24 | **R5.3 Replay recording v1 (Authoritative Replay) ship** — strict two-layer architecture: **AYReplay foundation** (`d:\Aliyat\AliyatEngine\AYFoundation\AYReplay\`, network-agnostic) + **AYNetwork Replay Adapter** (`d:\Aliyat\AliyatEngine\AYRuntime\AYNetwork\src\Replay\`, depends on foundation). Design lives in §15.10.<br>• **Why two layers (not direct write from ReplicationManager)**: single-player games need recording for rollback tests / bug reproduction / editor preview without faking GNS or PacketCodec; file format / timeline / compression / index / seek are network-agnostic and belong in a foundation module; Network adapter records **logical messages** (Snapshots, RPC, Spawn, Authority), NOT raw GNS packets — playback is independent of the transport library version at record time.<br>• **Foundation (`AYReplay`)**: `ReplayFileHeader` (108 B packed on MSVC; `sizeof(ReplayFileHeader)` at runtime is authoritative) + `ReplayEventHeader` (20 B) + `ReplayCheckpointHeader` (24 B), all `#pragma pack(1)`. `IReplayRecorder` interface (`beginSession / recordEvent / recordCheckpoint / flush / endSession`). `IReplayPlayer` interface stub — `open()` validates magic+version; `readNextEvent/seekToTick/seekToCheckpoint` return `Error::NotImplemented` (full impl in v2 playback release). `FileReplayRecorder` default impl: 64 MiB / 5 min rotation; LZ4 raw-block compression when body ≥ 256 B and the compressed size is smaller; crash-tolerant (truncated last rotation accepted by `open()` returning `Truncated`); `kEvtFoundation_SessionBegin=0x0001` / `SessionEnd=0x0002` / `TextMarker=0x0010` / `Checkpoint=0x0020`. Foundation reserves event-type range `[0, 0xFFFF]`; consumers get `[0x10000, 0xFFFFFFFF]` (AYNetwork claims `[0x10000, 0x1FFFF]`). Public helpers: `FileReplayRecorder::rotationPathFor(base, idx)` and `currentPath()` so tests/tools can read the actual on-disk file without re-implementing the `_NNN.ayrp` rotation suffix.<br>• **`Fnv1a64`** header-only state-hash: `kFnv1a64Offset = 0xcbf29ce484222325`, `kFnv1a64Prime = 0x00000100000001B3`, plus `fnv1a64Combine(prev, data, size)` for incremental hashing.<br>• **Network Adapter (`NetworkReplayRecorderAdapter`)**: implements `IReplayRecorder`. Wire-tap hooks at: `ReplicationManager.cpp` Initial-Full-Snapshot success path (line ~456), Delta success path (~487), Spawn/Despawn per-peer visibility flips + rebroadcast loop (~255/295/721/751); `AYNetworkSubSystem.cpp` `applySimulationInbound` switch — `kMsgTypeClientInput` case + `kMsgTypeRpcRequest/Response/Reject` cases (server-only, gated by `isAuthority()`); `Egress` arm calls `rec->flush()` after `_replicationManager.tick()`; `RpcHandler.cpp::emit` captures outbound RPC. **`isAuthority()` promoted from private to public** on `INetworkSubSystem` so the wire-tap helper can read it. Forward-declared `class IReplayRecorder` in `INetwork.h` + `RpcHandler.h` to avoid the header cycle (`NetworkReplayRecorderAdapter.h` → `INetwork.h`). 7 event types: `kEvtNet_InitialFullSnapshot=0x10001` / `kEvtNet_Spawn=0x10002` / `kEvtNet_Despawn=0x10003` / `kEvtNet_DeltaSnapshot=0x10004` / `kEvtNet_InputBatch=0x10005` / `kEvtNet_RpcBatch=0x10006` / `kEvtNet_AuthorityChange=0x10007`.<br>• **Authority gate**: the adapter holds an `_authorityGateOk` flag; wire-tap sites check `isAuthority()` before each call. Gate stays `false` on clients → all `recordXxx` calls no-op and return `true` (so existing caller behavior is unchanged). The recording is **opt-in** — `setReplayRecorder(nullptr)` (the default) means no recording, no overhead beyond the `if (rec)` short-circuit.<br>• **Periodic checkpoint**: `recordPeriodicCheckpoint(serverTick, registeredNetIds, provider)` invokes a `StateBytesProvider` per registered ghost, combines FNV-1a across all bytes in netId-iteration order, writes one `ReplayCheckpointHeader` (state hash, no snapshot bytes inline). Tick is incremented every `_checkpointIntervalTicks` (default 30 = 1 s at 30 Hz) inside `ReplicationManager::tick()`.<br>• **API additions**: `ReplicationManager::setReplayRecorder/getReplayRecorder/setCheckpointIntervalTicks`; `isAuthority()` promoted public; `INetworkSubSystem::setReplayRecorder/getReplayRecorder` virtual (default `nullptr`). All existing public API unchanged.<br>• **Wire-format payload layouts** (see §15.10 for full spec): `InitialFullSnapshot = [u32 connId][u8 frameFlags][sealed snapshot bytes]`; `Spawn = [u32 connId][u32 netId][u64 schemaHash][spawn payload]`; `Despawn = [u32 connId][u32 netId]`; `DeltaSnapshot = [u32 connId][u8 frameFlags][sealed delta bytes]`; `InputBatch = [u32 connId][u32 inputSeq][u32 serverTickAtSend][u32 payloadLen][bytes]`; `RpcBatch = [u16 messageType][u32 connId][u32 payloadLen][bytes]`; `AuthorityChange = [u32 netId][u8 oldKind][u8 newKind][u32 connId][u32 reserved]`.<br>• **Out of scope (v1)**: playback (v2 player release); deterministic re-simulation from inputs (v2+ alongside tick-level lockstep); background writer thread (v1 main-thread only); editor timeline UI (lives in `AYEditor`); network capture (raw GNS — not a replay source per design); connection lifecycle events (v1.1 — derivable from per-event `connectionId` field).<br>• **Tests**: 1063 R5.3 baseline + 5 foundation (`AYTest_ReplayFoundation.cpp`: HeaderMagicVersion / EventRoundTrip / CheckpointRoundTrip / Lz4CompressionShrinksZeros / Fnv1a64KnownVectors) + 5 network adapter (`AYTest_ReplayNetwork.cpp`: AdapterPureRecord / AuthorityGateRejectsClientMode / EndToEndGnsLoopback / AuthorityChangeEventCaptured / PeriodicCheckpointProduced) = **1073/1073 PASS**, `test exit=0; 2026-08-25 ship`. |
 
 ---
 

@@ -52,6 +52,18 @@ TEST_CASE(UdpSocketOptions) {
     socket.close();
 }
 
+TEST_CASE(UdpSocketRejectsInvalidIpv4Address) {
+    ayt::test::setCurrentCase("UdpSocketRejectsInvalidIpv4Address");
+
+    UdpSocket socket;
+    CHECK(socket.create());
+    const uint8_t payload = 7;
+    CHECK(!socket.bind("999.999.999.999", 0));
+    CHECK(!socket.connect("not-an-ip", 12345));
+    CHECK_INT_EQ(socket.sendTo("300.1.1.1", 12345, &payload, sizeof(payload)), -1);
+    socket.close();
+}
+
 TEST_CASE(GnsConnectionState) {
     ayt::test::setCurrentCase("GnsConnectionState");
 
@@ -60,6 +72,22 @@ TEST_CASE(GnsConnectionState) {
     CHECK(conn.getState() == GnsConnectionState::Disconnected);
     CHECK(!conn.isConnected());
     CHECK_INT_EQ(conn.getPing(), -1);  // no conn handle yet
+}
+
+TEST_CASE(GnsConnectionDropsTruncatedFramesBeforeDispatch) {
+    ayt::test::setCurrentCase("GnsConnectionDropsTruncatedFramesBeforeDispatch");
+
+    GnsConnection conn;
+    int dispatchCount = 0;
+    conn.onPacket([&](const PacketHeader&, const uint8_t*, size_t) {
+        ++dispatchCount;
+    });
+    uint8_t truncated[PacketCodec::kHeaderSize + PacketCodec::kCrcSize - 1]{};
+    for (size_t len = PacketCodec::kHeaderSize;
+         len < PacketCodec::kHeaderSize + PacketCodec::kCrcSize; ++len) {
+        conn.onRawData(truncated, len);
+    }
+    CHECK_INT_EQ(dispatchCount, 0);
 }
 
 TEST_CASE(GnsInitShutdown) {

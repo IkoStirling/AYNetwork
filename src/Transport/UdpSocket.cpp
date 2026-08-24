@@ -90,11 +90,12 @@ bool UdpSocket::bind(uint16_t port) {
 }
 
 bool UdpSocket::bind(const char* address, uint16_t port) {
+    if (_sockfd < 0 || !address) return false;
     struct sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, address, &addr.sin_addr);
+    if (inet_pton(AF_INET, address, &addr.sin_addr) != 1) return false;
 
     if (::bind(_sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         return false;
@@ -103,11 +104,12 @@ bool UdpSocket::bind(const char* address, uint16_t port) {
 }
 
 bool UdpSocket::connect(const char* address, uint16_t port) {
+    if (_sockfd < 0 || !address) return false;
     struct sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, address, &addr.sin_addr);
+    if (inet_pton(AF_INET, address, &addr.sin_addr) != 1) return false;
 
     if (::connect(_sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         return false;
@@ -116,11 +118,12 @@ bool UdpSocket::connect(const char* address, uint16_t port) {
 }
 
 int UdpSocket::sendTo(const char* address, uint16_t port, const void* data, size_t len) {
+    if (_sockfd < 0 || !address || (!data && len != 0)) return -1;
     struct sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, address, &addr.sin_addr);
+    if (inet_pton(AF_INET, address, &addr.sin_addr) != 1) return -1;
 
     return sendto(_sockfd, (const char*)data, (int)len, 0,
                   (struct sockaddr*)&addr, sizeof(addr));

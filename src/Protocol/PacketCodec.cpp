@@ -58,8 +58,8 @@ inline uint32_t crc32cUpdate(uint32_t crc, const uint8_t* data, size_t len) {
     return crc;
 }
 
-// Little-endian helpers (host is x64 little-endian; written defensively
-// in case of future big-endian port).
+// The wire format is fixed little-endian; these helpers make that contract
+// explicit and keep it stable on every host architecture.
 inline void writeU16LE(uint8_t* dst, uint16_t v) {
     dst[0] = static_cast<uint8_t>(v & 0xFF);
     dst[1] = static_cast<uint8_t>((v >> 8) & 0xFF);

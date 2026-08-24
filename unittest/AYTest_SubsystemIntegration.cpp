@@ -234,18 +234,8 @@ TEST_CASE(OneServerTwoClientsRpcAndReplicate) {
     delete client2;
 }
 
-TEST_CASE(LateJoinClientReceivesRebroadcastedEntitySpawn) {
-    // Regression test for the late-join fix (fe21587): when a second client
-    // connects AFTER an entity is already registered on the server, the new
-    // client must still receive an EntitySpawn. Without the fix the late-
-    // join client would never see existing entities until the next field
-    // change bubbled up via dirty-tracking.
-    //
-    // Audit (2026-08-02): rebroadcastEntitySpawn(netId, targetConn) must
-    // honour the `targetConn` argument when a network subsystem is present
-    // (issue 1: sink path ignored targetConn; issue 2: sealed bytes were
-    // constructed before any authority/network guard).
-    ayt::test::setCurrentCase("LateJoinClientReceivesRebroadcastedEntitySpawn");
+TEST_CASE(LateJoinClientAutomaticallyReceivesSpawnAndFull) {
+    ayt::test::setCurrentCase("LateJoinClientAutomaticallyReceivesSpawnAndFull");
 
     INetworkSubSystem* server = createNetworkSubSystemForTest();
     INetworkSubSystem* client1 = createNetworkSubSystemForTest();
@@ -282,50 +272,23 @@ TEST_CASE(LateJoinClientReceivesRebroadcastedEntitySpawn) {
         return client1->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash1);
     }));
 
-    // Now connect client2 (the late joiner). fe21587 wires the synthetic
-    // Connected callback; verify the server's onConnectionChange fires AND
-    // the rebroadcast delivers an EntitySpawn to client2.
-    //
-    // Design note (audit 2026-08-02): fe21587 provides rebroadcastEntitySpawn
-    // as an API but does NOT auto-call it — the integration is the user
-    // iterating registered netIds inside the onConnectionChange handler. The
-    // test mirrors that pattern: iterate the server's replicated objects
-    // and rebroadcast to the late joiner on connect.
-    ReplicationManager* rm = server->getReplicationManager();
-    CHECK(rm != nullptr);
-    std::atomic<bool> client2ConnFired{false};
-    server->onConnectionChange([&](NetConnection* conn, bool connected, DisconnectReason) {
-        if (!connected || !conn) return;
-        client2ConnFired.store(true);
-        // Late-join rebroadcast loop: walk all registered entities on
-        // the server and resend EntitySpawn + forceReplicate for each.
-        // Tests exercise one netId only (kNetId=4711) so iterate by hand
-        // rather than copy the entire _objects map.
-        if (rm->findType(kNetId) != nullptr) {
-            (void)rm->rebroadcastEntitySpawn(kNetId, conn);
-        }
-    });
+    // Pre-register the late joiner's destination slot. The authority must
+    // discover the new peer by itself and send Spawn + Full on its next tick;
+    // no connection callback or manual rebroadcast is allowed.
+    ReplObj client2Obj;
+    client2Obj.score = -1;
+    client2->getReplicationManager()->registerObject(&client2Obj, replType, kNetId);
 
     client2->connect("127.0.0.1", kPort);
     std::vector<INetworkSubSystem*> all{server, client1, client2};
+    uint64_t typeHash2 = 0;
     CHECK(pumpUntil(std::chrono::seconds(8), [&]() {
         pumpAll(all);
-        return client2->isConnected();
+        return client2->isConnected() && client2Obj.score == 11 &&
+               client2->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash2);
     }));
-    CHECK(client2ConnFired.load());
-
-    // After onConnectionChange fires, the late-join logic must deliver an
-    // EntitySpawn announcement to client2 for the already-registered kNetId.
-    uint64_t typeHash2 = 0;
-    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
-        pumpAll(all);
-        return client2->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash2);
-    }));
-
-    // Sanity: client2 must NOT have received the field value (no Full
-    // Snapshot unless interest/forceReplicate sends one) — the minimum
-    // invariant is the spawn announcement + the late-joiner entry in
-    // server->getConnections().
+    CHECK_INT_EQ(client2Obj.score, 11);
+    CHECK(typeHash2 == ReflectSerializer::hashTypeSchema(replType));
     CHECK(server->getConnections().size() >= 2);
 
     server->disconnect();
@@ -337,6 +300,61 @@ TEST_CASE(LateJoinClientReceivesRebroadcastedEntitySpawn) {
     delete server;
     delete client1;
     delete client2;
+}
+
+TEST_CASE(ApplicationHandlerReceivesDecodedBodyExactlyOnce) {
+    ayt::test::setCurrentCase("ApplicationHandlerReceivesDecodedBodyExactlyOnce");
+
+    INetworkSubSystem* server = createNetworkSubSystemForTest();
+    INetworkSubSystem* client = createNetworkSubSystemForTest();
+    CHECK(server && client);
+    CHECK(server->initialize());
+    CHECK(client->initialize());
+
+    int deliveryCount = 0;
+    std::vector<uint8_t> received;
+    server->onMessage(CHANNEL_RELIABLE,
+        [&](NetConnection* from, uint8_t channel, const void* data, size_t size) {
+            CHECK(from != nullptr);
+            CHECK_INT_EQ(channel, CHANNEL_RELIABLE);
+            ++deliveryCount;
+            const auto* bytes = static_cast<const uint8_t*>(data);
+            received.assign(bytes, bytes + size);
+        });
+
+    constexpr uint16_t kPort = 27556;
+    server->listen(kPort);
+    client->connect("127.0.0.1", kPort);
+    std::vector<INetworkSubSystem*> systems{server, client};
+    CHECK(pumpUntil(std::chrono::seconds(8), [&]() {
+        pumpAll(systems);
+        return client->isConnected() && !server->getConnections().empty();
+    }));
+
+    const std::vector<uint8_t> payload{0x10, 0x20, 0x30, 0x40, 0x50};
+    client->send(CHANNEL_RELIABLE, payload.data(), payload.size());
+    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
+        pumpAll(systems);
+        return deliveryCount == 1;
+    }));
+    CHECK(received == payload);
+
+    // A host that still invokes the legacy fixedUpdate adapter after update
+    // must not advance transport/RPC processing a second time.
+    for (int i = 0; i < 10; ++i) {
+        server->update(0.016f);
+        server->fixedUpdate(0.016f);
+        client->update(0.016f);
+        client->fixedUpdate(0.016f);
+    }
+    CHECK_INT_EQ(deliveryCount, 1);
+
+    server->disconnect();
+    client->disconnect();
+    server->shutdown();
+    client->shutdown();
+    delete server;
+    delete client;
 }
 
 TEST_CASE(ProductionDefaultsAndAdmissionGate) {

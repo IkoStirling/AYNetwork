@@ -510,6 +510,12 @@ TEST_CASE(SnapshotBroadcast) {
         DecodedPacket decoded = PacketCodec::decode(static_cast<const uint8_t*>(data), size);
         if (!decoded.ok || decoded.header.msgType != kMsgTypeReplication) return;
         BitStream bs(decoded.body.data(), decoded.body.size());
+        // R5.0 (2026-08-24): the server tick() now prefixes each frame with a
+        // u32 serverTick. The production onReceive path consumes it via
+        // readServerTick + R5.0/R3.x fallback; this test bypasses onReceive
+        // and reads the wire directly, so we must consume the prefix here.
+        uint32_t serverTick = 0;
+        ReflectSerializer::readServerTick(bs, serverTick);
         ReflectSerializer::FrameHeader hdr;
         if (!ReflectSerializer::readReplicationFrameHeader(bs, hdr)) return;
         ReflectSerializer::deserializeObject(type, &received, bs, hdr.fieldCount);
@@ -944,13 +950,7 @@ TEST_CASE(DeltaFrameHeaderFormatMatchesFullSnapshot) {
     ReflectSerializer::FrameHeader hdrFull;
     full.resetForRead();
     CHECK(ReflectSerializer::readReplicationFrameHeader(full, hdrFull));
-    const uint8_t typeHashLowByte =
-        static_cast<uint8_t>(type->getId() & 0xFFu);
-    const uint8_t typeHashHighByte =
-        static_cast<uint8_t>((type->getId() >> 8) & 0xFFu);
-    // First two bytes of the frame header are typeHash little-endian.
-    // (Wire format starts with netId then typeHash.)
-    // We'll just check the read header matches what serialize wrote.
+    // Check that the decoded header matches what serializeObject wrote.
     CHECK_INT_EQ(static_cast<uint32_t>(hdrFull.netId), 7u);
     CHECK_INT_EQ(static_cast<int>(hdrFull.fieldCount), 12);
     CHECK_INT_EQ(static_cast<int>(hdrFull.reserved), 0);
@@ -965,9 +965,8 @@ TEST_CASE(DeltaFrameHeaderFormatMatchesFullSnapshot) {
     CHECK_INT_EQ(static_cast<uint32_t>(hdrDelta.netId), 7u);
     CHECK_INT_EQ(static_cast<int>(hdrDelta.fieldCount), 1);
     CHECK_INT_EQ(static_cast<int>(hdrDelta.reserved), 0);
-    // typeHash same value as full.
+    // The stable 64-bit schema fingerprint is identical in full and delta.
     CHECK(hdrDelta.schemaHash == hdrFull.schemaHash);
-    (void)typeHashLowByte; (void)typeHashHighByte;
 }
 TEST_SUITE_END
 
@@ -980,7 +979,7 @@ TEST_SUITE_END
 //
 // We observe two distinct signals from the wire:
 //   - The channel arg passed to _broadcastSink (RELIABLE vs UNRELIABLE)
-//   - The inner u16 msgType prefix in the body (Replication vs Delta vs Spawn)
+//   - PacketHeader.msgType (Replication vs Delta vs Spawn)
 //
 // Tracking atoms (`std::atomic<...>`) capture per-frame counts so the test
 // can pump until an expected mix arrives.
@@ -991,7 +990,7 @@ namespace
 
 // Test fixture scaffolding for the e2e tests. Builds two managers connected
 // via the test sink / onRawData path, sets up handlers that count frames by
-// (channel, innerMsgType). The caller pumps update() + tick() in a loop.
+// (channel, PacketHeader.msgType). The caller pumps update() + tick() in a loop.
 struct E2EScaffold {
     GnsConnection server;
     GnsConnection client;
@@ -1050,8 +1049,8 @@ bool pumpE2E(GnsConnection& server, GnsConnection& client,
 
 // =============================================================================
 // Case 13 — Initial tick after registerObject emits a Full Snapshot on
-// CHANNEL_RELIABLE (R3.0 compatibility). Until the first tick completes,
-// _initialized is false so the gate forces Full regardless of dirty state.
+// CHANNEL_RELIABLE. The synthetic sink peer starts uninitialized, so its
+// first relevant tick emits Spawn + Full regardless of dirty state.
 // =============================================================================
 TEST_SUITE(E2EInitialTick)
 TEST_CASE(InitialTickSendsFullSnapshotNotDelta) {
@@ -1657,8 +1656,8 @@ TEST_SUITE_END
 
 // =============================================================================
 // Case 26 — Delta frame minimal: 1 dirty int32 field should produce a
-// frame of at most ~25 B sealed (8B ReplicationFrame header + 3B record
-// header + 4B value + 12B PacketHeader + 4B CRC + 2B inner msgType).
+// frame of at most 39 B sealed (14B ReplicationFrame header + 5B record
+// header + 4B value + 12B PacketHeader + 4B CRC).
 // =============================================================================
 TEST_SUITE(E2EByteBudget)
 TEST_CASE(DeltaFrameHeaderSizeMinimal) {
@@ -1785,6 +1784,50 @@ TEST_CASE(NestedStructRoundTrip) {
     CHECK(dst.inner.x == 7);
     CHECK(dst.inner.label == "hi");
 }
+
+TEST_CASE(NestedSchemaMismatchDoesNotMutateNestedObject) {
+    ayt::test::setCurrentCase("NestedSchemaMismatchDoesNotMutateNestedObject");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<NestedOuter>();
+    CHECK(type != nullptr);
+
+    NestedOuter src{};
+    src.top = 42;
+    src.inner.x = 7;
+    src.inner.y = 11;
+    src.inner.label = "source";
+    src.bottom = 99;
+
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &src, 1, wire));
+
+    // Locate the nested schema prefix without relying on a hard-coded frame
+    // offset: skip the top-level header and the first primitive field record,
+    // then stop immediately after the nested field's wire type byte.
+    ReflectSerializer::FrameHeader header;
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, header));
+    (void)wire.readUInt32();
+    CHECK(static_cast<WireTypeId>(wire.readUInt8()) == WireTypeId::Int32);
+    (void)wire.readInt32Raw();
+    (void)wire.readUInt32();
+    CHECK(static_cast<WireTypeId>(wire.readUInt8()) == WireTypeId::NestedStruct);
+    const size_t nestedSchemaOffset = wire.getBitPosition() / 8;
+    CHECK(nestedSchemaOffset + sizeof(uint64_t) <= wire.getSize());
+    static_cast<uint8_t*>(wire.getData())[nestedSchemaOffset] ^= 0x80;
+
+    NestedOuter dst{};
+    dst.top = -1;
+    dst.bottom = -2;
+    dst.inner.x = -3;
+    dst.inner.y = -4;
+    dst.inner.label = "sentinel";
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, header));
+    CHECK(!ReflectSerializer::deserializeObject(type, &dst, wire, header.fieldCount));
+    CHECK_INT_EQ(dst.inner.x, -3);
+    CHECK_INT_EQ(dst.inner.y, -4);
+    CHECK(dst.inner.label == "sentinel");
+}
 TEST_SUITE_END
 
 TEST_SUITE(FixedArrayPure)
@@ -1812,6 +1855,37 @@ TEST_CASE(FixedArrayRoundTrip) {
     CHECK(dst.ints[3] == 40);
     CHECK(dst.coords[0] == 1.5f);
     CHECK(dst.coords[2] == 3.5f);
+}
+
+TEST_CASE(FixedArrayRejectsWireCountMismatchBeforeMutation) {
+    ayt::test::setCurrentCase("FixedArrayRejectsWireCountMismatchBeforeMutation");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ArrayOuter>();
+    CHECK(type != nullptr);
+    ArrayOuter src{};
+    src.tag = 5;
+    src.ints = {10, 20, 30, 40};
+
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &src, 7, wire));
+    ReflectSerializer::FrameHeader header;
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, header));
+    (void)wire.readUInt32();
+    CHECK(static_cast<WireTypeId>(wire.readUInt8()) == WireTypeId::Int32);
+    (void)wire.readInt32Raw();
+    (void)wire.readUInt32();
+    CHECK(static_cast<WireTypeId>(wire.readUInt8()) == WireTypeId::FixedArray);
+    (void)wire.readUInt8();
+    const size_t countOffset = wire.getBitPosition() / 8;
+    static_cast<uint8_t*>(wire.getData())[countOffset] = 3;
+
+    ArrayOuter dst{};
+    dst.ints.fill(-99);
+    wire.resetForRead();
+    CHECK(ReflectSerializer::readReplicationFrameHeader(wire, header));
+    CHECK(!ReflectSerializer::deserializeObject(type, &dst, wire, header.fieldCount));
+    CHECK_INT_EQ(dst.ints[0], -99);
+    CHECK_INT_EQ(dst.ints[3], -99);
 }
 TEST_SUITE_END
 

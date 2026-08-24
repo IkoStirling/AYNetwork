@@ -246,6 +246,11 @@ public:
     }
     void setResponseCompressMinBytesForTesting(size_t bytes) { _responseCompressMinBytes = bytes; }
 
+    // R5.3 (2026-08-24) Replay wire-tap: AYReplay's IReplayRecorder is
+    // included transitively via INetwork.h (line 12 of this header).
+    void setReplayRecorder(ayt::replay::IReplayRecorder* r) { _replay = r; }
+    ayt::replay::IReplayRecorder* getReplayRecorder() const { return _replay; }
+
     // ===== Registry access (for tests + downstream RpcSerializer callers) =====
     //
     // Map of methodHash(FNV-1a-32 low-16) → IMethodInfo for every
@@ -328,6 +333,7 @@ private:
     uint32_t _maxRetries = RpcDefaultMaxRetries;
     uint32_t _retryBaseMs = RpcDefaultRetryBaseMs;
     size_t _responseCompressMinBytes = RpcResponseCompressMinBytes;
+    ayt::replay::IReplayRecorder* _replay = nullptr;
     std::unique_ptr<RpcAsyncPool> _asyncPool;
 };
 
