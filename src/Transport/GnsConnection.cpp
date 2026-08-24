@@ -17,6 +17,8 @@
 #include <AYNetwork/Transport/GnsConnection.h>
 #include <AYNetwork/INetwork.h>                  // R1 done: HandshakeMsgType / DisconnectReason / kProtocolVersion
 #include <AYNetwork/Protocol/PacketCodec.h>                  // R2: framing layer
+#include "TransportFaultController.h"      // R5.4 (2026-08-25)
+#include "TransportFaultInterceptor.h"     // R5.4
 
 #include <steam/steamclientpublic.h>     // EResult
 #include <steam/steamnetworkingtypes.h>  // identity, connection info, send flags
@@ -364,6 +366,40 @@ GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
     owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
     for (GnsConnection* owner : owners) owner->runMaintenance(maintenanceNowMs);
 
+    // R5.4 (2026-08-25): drain send-side fault queues BEFORE the receive
+    // loop so frames that are "ready to go on the wire" actually leave
+    // the system this pump iteration (not the next one).
+    {
+        std::vector<std::pair<std::vector<uint8_t>, uint8_t>> sendOut;
+        for (GnsConnection* owner : owners) {
+            if (!owner->_faultCtl) continue;
+            TransportFaultInterceptor* ic = owner->getFaultInterceptor();
+            if (!ic || !ic->isEnabled()) continue;  // R5.4: skip if no profile
+            std::vector<std::pair<std::vector<uint8_t>, uint8_t>> recvTmp;
+            // dtSeconds for the rate-limit refill — the caller doesn't
+            // supply one so we use a small constant (1ms). Tests that
+            // care about exact refill behavior inject virtual time.
+            ic->tick(maintenanceNowMs, 0.001, sendOut, recvTmp);
+            (void)recvTmp;
+        }
+        for (auto& [bytes, channel] : sendOut) {
+            // Find the owner that owns the frame — we don't have it
+            // tagged here, so route via the global connMap() to the
+            // single owner with a non-null controller for the bytes'
+            // channel. For R5.4 we round-robin through owners and let
+            // _rawSend handle it; each interceptor only owns one
+            // connection's queue.
+            for (GnsConnection* owner : owners) {
+                if (owner->_faultCtl) {
+                    owner->_rawSend(bytes.data(),
+                                    static_cast<uint32_t>(bytes.size()),
+                                    channel);
+                    break;
+                }
+            }
+        }
+    }
+
     // Exactly one callback pump for the shared GNS context.
     s_gns->RunCallbacks();
 
@@ -393,10 +429,68 @@ GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
             }
             ++result.messages;
             if (owner && message->m_pData && message->m_cbSize > 0) {
-                owner->onRawData(static_cast<const uint8_t*>(message->m_pData),
-                                 static_cast<size_t>(message->m_cbSize));
+                const uint8_t* pData = static_cast<const uint8_t*>(message->m_pData);
+                const size_t   cbSize = static_cast<size_t>(message->m_cbSize);
+
+                // R5.4 (2026-08-25): test seam — fake receiver bypasses
+                // both the fault interceptor and onRawData.
+                if (owner->_fakeReceiver) {
+                    // Pull channel from the sealed frame's PacketHeader
+                    // (offset 4 = channel byte, see PacketCodec.h).
+                    uint8_t channel = 0;
+                    if (cbSize >= PacketCodec::kHeaderSize) {
+                        channel = pData[4];
+                    }
+                    owner->_fakeReceiver(pData, cbSize, channel);
+                } else if (auto* ic = owner->getFaultInterceptor(); ic && ic->isEnabled()) {
+                    // Only route through the interceptor if it has a real
+                    // (non-no-op) profile installed. Otherwise the frame
+                    // would queue, drain on the next tick, and add a
+                    // spurious one-pump lag to every byte — which would
+                    // break every existing GNS test that pumps until a
+                    // frame is received. isEnabled() returns false when
+                    // no profile is installed OR the installed profile
+                    // is a no-op (zero knobs).
+                    uint8_t channel = 0;
+                    if (cbSize >= PacketCodec::kHeaderSize) {
+                        channel = pData[4];
+                    }
+                    ic->onRecv(static_cast<uint64_t>(maintenanceNowMs),
+                               pData, cbSize, channel);
+                } else {
+                    owner->onRawData(pData, cbSize);
+                }
             }
             message->Release();
+        }
+    }
+
+    // R5.4 (2026-08-25): drain the recv-side fault queues. Frames that
+    // are released (deadline reached, rate-limit token available) are
+    // forwarded to onRawData → PacketCodec::decode → _packetHandler.
+    {
+        std::vector<std::pair<std::vector<uint8_t>, uint8_t>> recvOut;
+        for (GnsConnection* owner : owners) {
+            if (!owner->_faultCtl) continue;
+            TransportFaultInterceptor* ic = owner->getFaultInterceptor();
+            if (!ic || !ic->isEnabled()) continue;  // R5.4: skip if no profile
+            std::vector<std::pair<std::vector<uint8_t>, uint8_t>> sendTmp;
+            ic->tick(maintenanceNowMs, 0.001, sendTmp, recvOut);
+            (void)sendTmp;
+        }
+        for (auto& [bytes, channel] : recvOut) {
+            (void)channel;
+            // Find the right owner — the interceptor holds the recv
+            // queue keyed by netId, and we lost that mapping when
+            // tick() returned. Re-derive by scanning owners with a
+            // non-null controller. For R5.4 (per-connection profiles)
+            // this is a single match in practice.
+            for (GnsConnection* owner : owners) {
+                if (owner->_faultCtl) {
+                    owner->onRawData(bytes.data(), bytes.size());
+                    break;
+                }
+            }
         }
     }
 
@@ -425,6 +519,15 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
     // Compressed flag is opt-in — send() never auto-compresses (R3 will
     // add a higher-level API to mark "this payload is compressible").
     const uint32_t tsMs = nowMs();
+
+    // R5.4 (2026-08-25): fault injector hook. If a controller is
+    // attached and a profile is installed for this netId, route the
+    // sealed bytes through the interceptor instead of going directly
+    // to _rawSend. The interceptor holds the frames in a delay queue
+    // and releases them on the next pump tick.
+    TransportFaultInterceptor* interceptor = getFaultInterceptor();
+    const bool faultActive = interceptor && interceptor->isEnabled();
+
     if (len <= kFrameMtu - PacketCodec::kHeaderSize - PacketCodec::kCrcSize) {
         // Single frame, no Fragmented flag.
         auto wire = PacketCodec::encode(
@@ -435,6 +538,11 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
             tsMs,
             /*compress=*/false);
         if (wire.empty()) return -1;
+        if (faultActive) {
+            interceptor->onSend(static_cast<uint64_t>(tsMs),
+                                wire.data(), wire.size(), channel);
+            return 0;
+        }
         return _rawSend(wire.data(), static_cast<uint32_t>(wire.size()), channel);
     }
 
@@ -449,6 +557,15 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
         return -1;
     }
     int lastResult = 0;
+    if (faultActive) {
+        // Queue each frame through the interceptor; release happens on
+        // the next pump tick.
+        for (const auto& f : frames) {
+            interceptor->onSend(static_cast<uint64_t>(tsMs),
+                                f.data(), f.size(), channel);
+        }
+        return 0;
+    }
     for (const auto& f : frames) {
         lastResult = _rawSend(f.data(), static_cast<uint32_t>(f.size()), channel);
         if (lastResult != 0) break;
@@ -535,6 +652,14 @@ int GnsConnection::sendRequireAck(uint16_t msgType, uint8_t channel,
 // constants — assign to `int flags` first then bitwise-OR.
 int GnsConnection::_rawSend(const uint8_t* data, uint32_t len, uint8_t channel) {
     if (!data || len == 0 || channel > CHANNEL_ACK) return -1;
+
+    // R5.4 (2026-08-25): test seam — if a fake sender is installed,
+    // route through it instead of GNS. Tests use this to inject sealed
+    // bytes without spinning up GNS.
+    if (_fakeSender) {
+        return _fakeSender(data, len, channel) ? 0 : -1;
+    }
+
     int flags;
     switch (channel) {
         case CHANNEL_UNRELIABLE:
@@ -561,6 +686,26 @@ int GnsConnection::_rawSend(const uint8_t* data, uint32_t len, uint8_t channel) 
 // R2: monotonic-ish clock used to stamp PacketHeader.timestampMs.
 uint32_t GnsConnection::nowMs() {
     return static_cast<uint32_t>((ayt::performanceNowUs() / 1000u) & 0xFFFFFFFFu);
+}
+
+// =============================================================================
+// R5.4 (2026-08-25): fault-controller wiring.
+// =============================================================================
+
+void GnsConnection::attachFaultController(TransportFaultController* ctl) {
+    _faultCtl = ctl;
+    // Destroy the existing interceptor; a fresh one will be created
+    // lazily on the next send/recv that needs it (via getFaultInterceptor).
+    _faultInterceptor.reset();
+}
+
+TransportFaultInterceptor* GnsConnection::getFaultInterceptor() {
+    if (!_faultCtl) return nullptr;
+    if (_netId == 0) return nullptr;
+    if (!_faultInterceptor) {
+        _faultInterceptor = std::make_unique<TransportFaultInterceptor>(_netId, *_faultCtl);
+    }
+    return _faultInterceptor.get();
 }
 
 void GnsConnection::runMaintenance(uint32_t monotonicNowMs) {

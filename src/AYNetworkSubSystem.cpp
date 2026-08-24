@@ -13,6 +13,7 @@
 // (which includes INetwork.h → would create a cycle).
 #include <AYReplay/IReplayRecorder.h>
 #include <AYNetwork/Replay/NetworkReplayTypes.h>
+#include "TransportFaultController.h"    // R5.4 (2026-08-25)
 // R1.A (2026-07-27): pull in EResult + AcceptConnection signature. The
 // GnsConnection.cpp TU-private includes are sufficient because s_gns is a
 // fully-typed pointer in this TU — we just need the constants.
@@ -198,7 +199,10 @@ public:
 
         // R1.A: route onData to the registered message handler (if any).
         GnsConnection* rawChild = child.get();
-        auto netConn = std::make_unique<NetConnectionImpl>(rawChild, allocateNetId());
+        const uint32_t netId = allocateNetId();
+        rawChild->setNetId(netId);                         // R5.4
+        rawChild->attachFaultController(&_faultCtl);        // R5.4
+        auto netConn = std::make_unique<NetConnectionImpl>(rawChild, netId);
         NetConnectionImpl* netPtr = netConn.get();
 
         // Both public admission APIs participate in the same atomic gate.
@@ -567,8 +571,11 @@ public:
         _clientConn = std::make_unique<GnsConnection>();
         _clientConn->setProtocolVersion(_protocolVersion);
         _clientConn->initClient(address, port);
+        const uint32_t clientNetId = allocateNetId();
+        _clientConn->setNetId(clientNetId);                    // R5.4
+        _clientConn->attachFaultController(&_faultCtl);       // R5.4
         _clientNetConn = std::make_unique<NetConnectionImpl>(
-            _clientConn.get(), allocateNetId());
+            _clientConn.get(), clientNetId);
         _mode = ConnectionMode::Client;
         installInboundRoutes();
         if (_connectionHandler) {
@@ -827,6 +834,18 @@ public:
         return _replicationManager.getReplayRecorder();
     }
 
+    // ===== R5.4 (2026-08-25) transport-fault profile =====
+    void setTransportFaultProfile(uint32_t netId,
+                                  const TransportFaultProfile& profile) override {
+        _faultCtl.setProfile(netId, profile);
+    }
+    void clearTransportFaultProfile(uint32_t netId) override {
+        _faultCtl.clearProfile(netId);
+    }
+    const TransportFaultProfile* getTransportFaultProfile(uint32_t netId) const override {
+        return _faultCtl.getProfile(netId);
+    }
+
     // ===== R4.0 RPC =====
     RpcHandler* getRpcHandler() override {
         return &_rpcHandler;
@@ -869,6 +888,10 @@ private:
     // R4.0 (2026-07-29): mirrors _replicationManager ownership. Routed by
     // onMessage via PacketHeader.msgType envelope kind.
     RpcHandler _rpcHandler{this};
+    // R5.4 (2026-08-25): per-connection fault-profile store. Owns the
+    // RNG map keyed by netId. GnsConnection instances pull profiles
+    // through it on every send/recv tick.
+    TransportFaultController _faultCtl;
     std::mutex _simulationInboundMutex;
     std::deque<PendingSimulationInbound> _simulationInbound;
     size_t _simulationInboundBytes = 0;

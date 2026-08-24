@@ -15,6 +15,14 @@
 // has no AYNetwork dependency — so we can safely include it here.
 #include <AYReplay/IReplayRecorder.h>
 
+// R5.4 (2026-08-25): TransportFaultProfile is a header-only struct
+// declared inside ayt::net — no transitive AYNetwork deps. Included here
+// so callers can pass a profile to setTransportFaultProfile without an
+// extra include. The profile's channel masks are hardcoded values (0x01,
+// 0x02, 0x04, 0x08, 0x0F) — they intentionally do NOT depend on the
+// CHANNEL_* constants below — so this include is safe to put BEFORE them.
+#include <AYNetwork/TransportFaultProfile.h>
+
 namespace ayt::net
 {
 
@@ -329,6 +337,26 @@ public:
     // ReplicationManager and RpcHandler.
     virtual void setReplayRecorder(ayt::replay::IReplayRecorder* rec) = 0;
     virtual ayt::replay::IReplayRecorder* getReplayRecorder() const   = 0;
+
+    // R5.4 (2026-08-25): per-connection transport-fault profile. Pass an
+    // `isNoOp()` profile or call `clearTransportFaultProfile(netId)` to
+    // disable. Profiles are pure data — the actual fault logic lives in
+    // `TransportFaultInterceptor` (per-`GnsConnection`, see src/Transport/).
+    // NetId is the AYNetwork connection id (NOT the GNS handle). Profiles
+    // can be installed/cleared any time after subsystem init; they take
+    // effect on the next send/recv tick. Not thread-safe; main-thread only.
+    // RNG is seeded from `profile.randomSeed` if non-zero, otherwise from
+    // a per-process default — the seed is what makes loss/dup/reorder
+    // draws reproducible across runs.
+    //
+    // Non-pure default impls (no-op) so existing test stubs that inherit
+    // `INetworkSubSystem` don't need to override them. Production
+    // (`AYNetworkSubSystem`) overrides all three to forward to its
+    // internal `TransportFaultController`.
+    virtual void setTransportFaultProfile(uint32_t /*netId*/,
+                                          const TransportFaultProfile& /*profile*/) {}
+    virtual void clearTransportFaultProfile(uint32_t /*netId*/) {}
+    virtual const TransportFaultProfile* getTransportFaultProfile(uint32_t /*netId*/) const { return nullptr; }
 };
 
 // =============================================================================

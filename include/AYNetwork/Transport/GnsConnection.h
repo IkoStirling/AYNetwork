@@ -31,7 +31,9 @@
 #include <AYNetwork/Protocol/AckPipeline.h>      // R4.1-B: CHANNEL_ACK pipeline
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
 // Forward-decl GNS types so we don't pollute global namespace with the Steam
 // headers. The full definitions are only pulled into GnsConnection.cpp.
@@ -42,6 +44,12 @@ typedef uint32_t HSteamNetPollGroup;
 
 namespace ayt::net
 {
+
+// R5.4 (2026-08-25): fault-injection forward declarations. The full
+// definitions live in src/Transport/. We need pointers in the header so
+// the per-`GnsConnection` interceptor field can be a `unique_ptr`.
+class TransportFaultController;
+class TransportFaultInterceptor;
 
 // =============================================================================
 // GnsConnection state (mirrors AYConnection::ConnectionState)
@@ -177,6 +185,15 @@ public:
     void setProtocolVersion(uint32_t version) { _protocolVersion = version; }
     uint32_t getProtocolVersion() const { return _protocolVersion; }
 
+    // R5.4 (2026-08-25): attach the fault controller. Called once by
+    // NetworkSubSystem at startup. The interceptor is created lazily on
+    // the first send/recv tick if the controller has a profile for this
+    // netId. Safe to call with nullptr to detach (interceptor is
+    // destroyed).
+    void attachFaultController(TransportFaultController* ctl);
+    TransportFaultController* getFaultController() const { return _faultCtl; }
+    TransportFaultInterceptor* getFaultInterceptor(); // lazy-creates
+
     // R1 done: reason for the last disconnect (Unknown if none / not yet).
     // After a peer-initiated disconnect this carries the wire-encoded
     // DisconnectReason; for local-initiated disconnect it's Unknown.
@@ -209,6 +226,34 @@ public:
 
     // Test seams for AckPipeline integration.
     size_t pendingAckCountForTesting() const { return _ackTracker.pendingCount(); }
+
+    // ===== R5.4 test seam: FakeTransport =====
+    // Mirrors `ReplicationManager::setBroadcastSinkForTesting` (INetwork.h).
+    // When a non-null `FakeTransportSender` is installed, `_rawSend` calls
+    // the fake instead of `s_gns->SendMessageToConnection`. When a non-null
+    // `FakeTransportReceiver` is installed, the receive pump calls the fake
+    // receiver with each incoming message's raw payload, INSTEAD of running
+    // `onRawData` (i.e. bypassing PacketCodec::decode → _packetHandler).
+    // Pass nullptr to clear either side. Default (both null) = real GNS
+    // transport. Either fake can be installed independently.
+    //
+    // The fake receiver IS expected to call back into `onRawData(data, len)`
+    // if the test wants to exercise the decode path — the seam exists so
+    // tests can interpose fault injectors without spinning up GNS.
+    using FakeTransportSender = std::function<bool(const uint8_t* data, size_t len,
+                                                   uint8_t channel)>;
+    using FakeTransportReceiver = std::function<void(const uint8_t* data, size_t len,
+                                                     uint8_t channel)>;
+    void setFakeTransportSender(FakeTransportSender s)   { _fakeSender   = std::move(s); }
+    void setFakeTransportReceiver(FakeTransportReceiver r) { _fakeReceiver = std::move(r); }
+    bool hasFakeTransportSender() const   { return static_cast<bool>(_fakeSender); }
+    bool hasFakeTransportReceiver() const { return static_cast<bool>(_fakeReceiver); }
+
+    // R5.4 (2026-08-25): AYNetwork netId for this connection (assigned by
+    // NetworkSubSystem when a GnsConnection is created / adopted). Used as
+    // the fault-profile lookup key. 0 = unassigned (legacy connections).
+    void    setNetId(uint32_t netId) { _netId = netId; }
+    uint32_t getNetId() const        { return _netId; }
 
 private:
     void setState(GnsConnectionState newState);
@@ -255,6 +300,22 @@ private:
 
     // R2: low-overhead current-time helper used by PacketCodec::encode.
     static uint32_t nowMs();
+
+    // R5.4 (2026-08-25): AYNetwork netId for fault-profile lookup. 0 =
+    // unassigned. Set by NetworkSubSystem when the GnsConnection is
+    // created / adopted.
+    uint32_t _netId = 0;
+
+    // R5.4 (2026-08-25): fault injection. `attachFaultController` is
+    // called by NetworkSubSystem once at startup; the interceptor itself
+    // is created on first use (and re-created if the netId changes).
+    TransportFaultController* _faultCtl = nullptr;
+    std::unique_ptr<TransportFaultInterceptor> _faultInterceptor;
+
+    // R5.4 (2026-08-25): test seams (FakeTransport). When set, they
+    // short-circuit _rawSend and the receive pump respectively.
+    FakeTransportSender   _fakeSender;
+    FakeTransportReceiver _fakeReceiver;
 };
 
 // =============================================================================

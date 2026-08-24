@@ -30,6 +30,11 @@ set(CORE_SRC_FILES
     AYTest_SnapshotInterpolation.cpp
     AYTest_ClientInput.cpp        # R5.2 (2026-08-24)
     AYTest_ReplayNetwork.cpp      # R5.3 (2026-08-24)
+    AYTest_TransportFaultProfile.cpp   # R5.4 (2026-08-25)
+    AYTest_TokenBucket.cpp             # R5.4
+    AYTest_DelayedFrameQueue.cpp       # R5.4
+    AYTest_TransportFaultInterceptor.cpp # R5.4
+    AYTest_FakeTransport.cpp           # R5.4
 )
 
 add_executable(${MODULE_NAME} ${CORE_SRC_FILES})
@@ -43,6 +48,7 @@ target_link_libraries(${MODULE_NAME} PRIVATE AYNetwork AYTest AYCore)
 target_include_directories(${MODULE_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Transport  # R5.4 (2026-08-25): TransportFault* headers
 )
 
 ay_add_test(${MODULE_NAME})
