@@ -428,6 +428,52 @@ TEST_CASE(FiltersNonReplicated) {
 }
 TEST_SUITE_END
 
+TEST_SUITE(ReflectSerializerSchemaHardening)
+
+TEST_CASE(FieldHashCollisionIsRejectedBeforeWriting) {
+    ayt::test::setCurrentCase("FieldHashCollisionIsRejectedBeforeWriting");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<FieldHashCollisionObject>();
+    CHECK(type != nullptr);
+    CHECK(ReflectSerializer::hashFieldName("f6059") ==
+          ReflectSerializer::hashFieldName("f264602"));
+    FieldHashCollisionObject object;
+    BitStream wire;
+    CHECK(!ReflectSerializer::serializeObject(type, &object, 1, wire));
+    CHECK_INT_EQ(wire.getSize(), 0u);
+    CHECK_INT_EQ(ReflectSerializer::hashTypeSchema(type), 0u);
+}
+
+TEST_CASE(CustomNamedMapUsesMapMetadata) {
+    ayt::test::setCurrentCase("CustomNamedMapUsesMapMetadata");
+    ayt::reflect::MapTypeInfo<int32_t> alias(
+        "InventoryAlias", ayt::reflect::TypeRegistryImpl::instance().findType<int32_t>());
+    WireTypeId wireType = WireTypeId::NestedStruct;
+    CHECK(ReflectSerializer::resolveWireTypeId(&alias, wireType));
+    CHECK(wireType == WireTypeId::StringMap);
+}
+
+TEST_CASE(TopLevelSchemaMismatchDoesNotMutateObject) {
+    ayt::test::setCurrentCase("TopLevelSchemaMismatchDoesNotMutateObject");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+    ReplicationNoNet source;
+    source.score = 999;
+    ReplicationNoNet destination;
+    destination.score = 17;
+
+    ReplicationManager manager(nullptr);
+    manager.registerObject(&destination, type, 77);
+    BitStream wire;
+    CHECK(ReflectSerializer::serializeObject(type, &source, 77, wire));
+    auto* bytes = static_cast<uint8_t*>(wire.getData());
+    bytes[4] ^= 0x80;
+    wire.resetForRead();
+    CHECK(!manager.onReceive(kMsgTypeReplication, wire, nullptr));
+    CHECK_INT_EQ(destination.score, 17);
+}
+
+TEST_SUITE_END
+
 // =============================================================================
 // Case 3 — End-to-end GNS loopback: server register → tick → client receives.
 // =============================================================================
