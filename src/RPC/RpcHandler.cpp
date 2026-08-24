@@ -555,15 +555,15 @@ bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream
     }
     if (!_network) return false;
     if (target) {
-        _network->sendTo(target, channel, sealed.data(), sealed.size());
+        _network->sendEncodedTo(target, channel, sealed.data(), sealed.size());
         return true;
     }
     const ConnectionMode mode = getEffectiveMode();
     if (mode == ConnectionMode::Client) {
-        _network->send(channel, sealed.data(), sealed.size());
+        _network->sendEncoded(channel, sealed.data(), sealed.size());
         return true;
     }
-    _network->broadcast(channel, sealed.data(), sealed.size());
+    _network->broadcastEncoded(channel, sealed.data(), sealed.size());
     return true;
 }
 

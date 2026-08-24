@@ -195,11 +195,11 @@ bool ReplicationManager::sendSealedToTargets(
 
     const size_t allCount = collectConnectedTargets(_network).size();
     if (_interestRadiusSq <= 0.f && targets.size() == allCount) {
-        _network->broadcast(channel, data, size);
+        _network->broadcastEncoded(channel, data, size);
         return true;
     }
     for (NetConnection* conn : targets) {
-        _network->sendTo(conn, channel, data, size);
+        _network->sendEncodedTo(conn, channel, data, size);
     }
     return true;
 }
@@ -212,7 +212,7 @@ bool ReplicationManager::sendSealedToConnection(NetConnection* target, uint8_t c
         return true;
     }
     if (!_network || !target || !target->isConnected()) return false;
-    _network->sendTo(target, channel, data, size);
+    _network->sendEncodedTo(target, channel, data, size);
     return true;
 }
 
@@ -290,7 +290,7 @@ void ReplicationManager::registerObject(IReplicable* obj, uint32_t netId) {
             CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
             /*compress=*/ false);
         if (_broadcastSink) _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
-        else                _network->broadcast(CHANNEL_RELIABLE, sealed.data(), sealed.size());
+        else                _network->broadcastEncoded(CHANNEL_RELIABLE, sealed.data(), sealed.size());
     }
 }
 

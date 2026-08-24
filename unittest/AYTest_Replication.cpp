@@ -73,6 +73,11 @@ struct ReplicationNoNet {
     int32_t score = 42;        // NetReplicate — MUST appear on wire
 };
 
+struct FieldHashCollisionObject {
+    int32_t first = 1;
+    int32_t second = 2;
+};
+
 // =============================================================================
 // R3.2 (2026-07-28): nested wire type fixtures.
 // =============================================================================
@@ -167,6 +172,20 @@ struct ReplicationFixtureRegistrar {
             info->addField(new FieldInfoImpl("hp",    reg.findType<int32_t>(), offsetof(T, hp),    FA::Serialize));
             info->addField(new FieldInfoImpl("score", reg.findType<int32_t>(), offsetof(T, score), FA::Serialize | FA::NetReplicate));
             reg.registerTypeInfo("ReplicationNoNet", info);
+        }
+
+        if (!reg.findType("FieldHashCollisionObject")) {
+            auto* info = new TypeInfoImpl<FieldHashCollisionObject>(
+                "FieldHashCollisionObject",
+                defaultCreate<FieldHashCollisionObject>,
+                defaultDestroy<FieldHashCollisionObject>,
+                defaultCopy<FieldHashCollisionObject>);
+            using T = FieldHashCollisionObject;
+            const auto NR = FieldAttribute::Serialize | FieldAttribute::NetReplicate;
+            // Known full FNV-1a 32 collision.
+            info->addField(new FieldInfoImpl("f6059", reg.findType<int32_t>(), offsetof(T, first), NR));
+            info->addField(new FieldInfoImpl("f264602", reg.findType<int32_t>(), offsetof(T, second), NR));
+            reg.registerTypeInfo("FieldHashCollisionObject", info);
         }
 
         // R3.2 nested struct fixtures.
@@ -2108,8 +2127,6 @@ TEST_CASE(R32FrameSurvivesPacketCodec) {
     DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
     CHECK(dec.ok);
     BitStream bs(dec.body.data(), dec.body.size());
-    const uint16_t inner = bs.readUInt16();
-    CHECK_INT_EQ(static_cast<int>(inner), static_cast<int>(kMsgTypeReplication));
     ReflectSerializer::FrameHeader hdr;
     CHECK(ReflectSerializer::readReplicationFrameHeader(bs, hdr));
     NestedOuter clientSide{};

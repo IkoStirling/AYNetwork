@@ -456,6 +456,15 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
     return lastResult;
 }
 
+int GnsConnection::sendEncoded(uint8_t channel, const void* data, size_t len) {
+    if (!s_gns || _conn == k_HSteamNetConnection_Invalid || !data || len == 0 ||
+        len > UINT32_MAX ||
+        (_state != GnsConnectionState::Connected &&
+         _state != GnsConnectionState::Handshaking &&
+         _state != GnsConnectionState::Ready)) return -1;
+    return _rawSend(static_cast<const uint8_t*>(data), static_cast<uint32_t>(len), channel);
+}
+
 int GnsConnection::sendRequireAck(uint16_t msgType, uint8_t channel,
                                   const void* data, size_t len,
                                   AckTracker::Callback onAck) {

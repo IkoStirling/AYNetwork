@@ -610,6 +610,33 @@ public:
         }
     }
 
+    void sendEncoded(uint8_t channel, const void* data, size_t size) override {
+        if (_clientConn) _clientConn->sendEncoded(channel, data, size);
+    }
+
+    void sendEncodedTo(NetConnection* conn, uint8_t channel,
+                       const void* data, size_t size) override {
+        if (!conn) return;
+        if (_clientNetConn.get() == conn && _clientConn) {
+            _clientConn->sendEncoded(channel, data, size);
+            return;
+        }
+        for (auto& record : _serverClients) {
+            if (record.facade.get() == conn && record.transport) {
+                record.transport->sendEncoded(channel, data, size);
+                return;
+            }
+        }
+    }
+
+    void broadcastEncoded(uint8_t channel, const void* data, size_t size) override {
+        for (auto& record : _serverClients) {
+            if (record.transport && record.transport->isConnected()) {
+                record.transport->sendEncoded(channel, data, size);
+            }
+        }
+    }
+
     // ===== 消息接收 =====
     void onMessage(uint8_t channel, MessageHandler handler) override {
         _messageHandlers[channel] = handler;

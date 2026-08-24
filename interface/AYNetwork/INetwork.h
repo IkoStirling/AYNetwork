@@ -233,6 +233,20 @@ public:
     virtual void broadcast(uint8_t channel, const void* data, size_t size) = 0;
     virtual void broadcastExcept(NetConnection* exclude, uint8_t channel, const void* data, size_t size) = 0;
 
+    // Internal protocol path for bytes already sealed by PacketCodec. Default
+    // adapters preserve source compatibility; the GNS subsystem overrides
+    // these to avoid wrapping a second kMsgTypeApp envelope.
+    virtual void sendEncoded(uint8_t channel, const void* data, size_t size) {
+        send(channel, data, size);
+    }
+    virtual void sendEncodedTo(NetConnection* conn, uint8_t channel,
+                               const void* data, size_t size) {
+        sendTo(conn, channel, data, size);
+    }
+    virtual void broadcastEncoded(uint8_t channel, const void* data, size_t size) {
+        broadcast(channel, data, size);
+    }
+
     // ===== 消息接收 =====
     // Application handlers always receive the decoded PacketCodec body. The
     // transport envelope (header and CRC) is validated and removed before
