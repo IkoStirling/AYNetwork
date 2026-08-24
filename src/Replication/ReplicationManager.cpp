@@ -34,10 +34,15 @@ struct ReplicationManager::ReflectedEntry {
     const ayt::reflect::ITypeInfo* type = nullptr;  // metadata for serializer
     IReplicable*                   iface = nullptr; // optional IReplicable adapter
 
-    // ---- R3.1 dirty-tracking ----
-    std::vector<uint32_t> _fieldHashes;            // dense-indexed CRC32C cache
+    struct PeerState {
+        std::vector<uint32_t> fieldHashes;
+        bool visible = false;
+        bool initialized = false;
+    };
+
+    // ---- per-connection dirty tracking ----
     std::vector<uint32_t> _netFieldSparseIndex;   // dense → type->getField() sparse
-    bool                  _initialized = false;   // false until first Full Snapshot emitted
+    std::unordered_map<uint32_t, PeerState> _peers;
 
     // ---- R4.1-B interest ----
     NetVec3 _location{};
@@ -199,6 +204,26 @@ bool ReplicationManager::sendSealedToTargets(
     return true;
 }
 
+bool ReplicationManager::sendSealedToConnection(NetConnection* target, uint8_t channel,
+                                                const void* data, size_t size) {
+    if (!data || size == 0) return false;
+    if (_broadcastSink) {
+        _broadcastSink(channel, data, size);
+        return true;
+    }
+    if (!_network || !target || !target->isConnected()) return false;
+    _network->sendTo(target, channel, data, size);
+    return true;
+}
+
+NetConnection* ReplicationManager::findConnectedTarget(uint32_t connectionId) const {
+    if (!_network || connectionId == 0) return nullptr;
+    for (NetConnection* conn : _network->getConnections()) {
+        if (conn && conn->isConnected() && conn->getId() == connectionId) return conn;
+    }
+    return nullptr;
+}
+
 void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId) {
     if (!obj || !type || netId == 0) return;
 
@@ -211,53 +236,31 @@ void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo
     // comparison forces a Full Snapshot (every field's current hash != 0
     // sentinel, OR _initialized==false gate below — see tick()).
     buildNetFieldMap(type, e._netFieldSparseIndex);
-    e._fieldHashes.assign(e._netFieldSparseIndex.size(), 0u);
-    e._initialized = false;
-
     _objects[netId] = e;
     _spawnAnnouncements.erase(netId);
-
-    // R3.0: server authority also broadcasts an EntitySpawn announcement so
-    // the client can allocate a matching slot. On a client (no active
-    // connections or no server mode), this is a no-op — local registration
-    // only.
-    if (isAuthority() && (_network || _broadcastSink)) {
-        BitStream body;
-        body.writeUInt16(kMsgTypeEntitySpawn);
-        ReflectSerializer::writeEntitySpawn(body, netId,
-            static_cast<uint16_t>(type->getId() & 0xFFFFu));
-        std::vector<uint8_t> sealed = PacketCodec::encode(
-            static_cast<const uint8_t*>(body.getData()), body.getSize(),
-            kMsgTypeEntitySpawn, kSchemaVersion,
-            CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
-            /*compress=*/ false);
-        sendSealedToTargets(obj, type, netId,
-                            _objects[netId]._location, _objects[netId]._hasLocation,
-                            CHANNEL_RELIABLE, sealed.data(), sealed.size());
-    }
 }
 
 void ReplicationManager::unregisterObject(uint32_t netId) {
     auto it = _objects.find(netId);
     if (it == _objects.end()) return;
-    void* obj = it->second.obj;
-    const ayt::reflect::ITypeInfo* type = it->second.type;
-    NetVec3 loc = it->second._location;
-    const bool hasLoc = it->second._hasLocation;
-    _objects.erase(it);
-
+    ReflectedEntry& entry = it->second;
     if (isAuthority() && (_network || _broadcastSink)) {
         BitStream body;
-        body.writeUInt16(kMsgTypeEntityDespawn);
         ReflectSerializer::writeEntityDespawn(body, netId);
         std::vector<uint8_t> sealed = PacketCodec::encode(
             static_cast<const uint8_t*>(body.getData()), body.getSize(),
             kMsgTypeEntityDespawn, kSchemaVersion,
             CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
             /*compress=*/ false);
-        sendSealedToTargets(obj, type, netId, loc, hasLoc,
-                            CHANNEL_RELIABLE, sealed.data(), sealed.size());
+        for (const auto& [connectionId, peer] : entry._peers) {
+            if (!peer.visible) continue;
+            NetConnection* target = findConnectedTarget(connectionId);
+            if (connectionId == 0 || target) {
+                sendSealedToConnection(target, CHANNEL_RELIABLE, sealed.data(), sealed.size());
+            }
+        }
     }
+    _objects.erase(it);
 }
 
 // =============================================================================
@@ -280,8 +283,7 @@ void ReplicationManager::registerObject(IReplicable* obj, uint32_t netId) {
     // netId, but with typeHash=0 (client treats this as "untyped").
     if (isAuthority() && (_network || _broadcastSink)) {
         BitStream body;
-        body.writeUInt16(kMsgTypeEntitySpawn);
-        ReflectSerializer::writeEntitySpawn(body, netId, /*typeHash=*/ 0);
+        ReflectSerializer::writeEntitySpawn(body, netId, /*schemaHash=*/ 0);
         std::vector<uint8_t> sealed = PacketCodec::encode(
             static_cast<const uint8_t*>(body.getData()), body.getSize(),
             kMsgTypeEntitySpawn, kSchemaVersion,
@@ -333,8 +335,8 @@ void ReplicationManager::tick(float /*deltaTime*/) {
     // isAuthority() helper.
     if (!isAuthority()) return;
 
-    // Snapshot the keys to allow register/unregister during iteration without
-    // invalidating iterators (we don't, but defensive).
+    // Snapshot keys so callbacks may register/unregister without invalidating
+    // this traversal.
     std::vector<uint32_t> netIds;
     netIds.reserve(_objects.size());
     for (const auto& kv : _objects) netIds.push_back(kv.first);
@@ -344,102 +346,131 @@ void ReplicationManager::tick(float /*deltaTime*/) {
         if (it == _objects.end()) continue;
         ReflectedEntry& e = it->second;
 
-        // Skip legacy IReplicable entries (type==nullptr). R3.0 sends only
-        // EntitySpawn for them — full Snapshot frames require AYReflect metadata.
+        // Legacy entries have no reflected payload.
         if (!e.type) continue;
 
-        // R4.1: FrameKind 提到循环顶部 (避免在 if-block 内定义然后下面引用
-        // 超出 scope 编译错)。None = 稳态不广播；Full/Delta = 需要 emit。
-        enum class FrameKind { None, Full, Delta };
-        FrameKind frameKind = FrameKind::None;
-
-        // Compute current CRC32C for each NetReplicate field. We always walk
-        // every field even in steady state because we need the hash to compare
-        // against _fieldHashes.
+        // Compute current field hashes once; each peer compares them against
+        // its own acknowledged/sent baseline.
         const uint32_t nFields = static_cast<uint32_t>(e._netFieldSparseIndex.size());
         std::vector<uint32_t> currentHashes(nFields);
-        std::vector<uint32_t> dirtyIndices; dirtyIndices.reserve(nFields);
         for (uint32_t k = 0; k < nFields; ++k) {
             const auto* field = e.type->getField(e._netFieldSparseIndex[k]);
-            if (!field) continue; // shouldn't happen, but defensive
+            if (!field) continue;
             WireTypeId wid;
             if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
-            // R3.2: hashFieldValueEx walks nested types (NestedStruct /
-            // FixedArray / DynamicArray / StringMap). For primitives it
-            // returns the same hash as hashFieldValue.
             currentHashes[k] = ReflectSerializer::hashFieldValueEx(wid, field->getType(), field->get(e.obj));
-            if (!e._initialized || currentHashes[k] != e._fieldHashes[k]) {
-                dirtyIndices.push_back(k);
+        }
+
+        std::vector<NetConnection*> targets = buildInterestTargets(
+            e.obj, e.type, netId, e._location, e._hasLocation);
+        if (_extension) _extension->onPreReplicate(e.obj, e.type, netId, targets);
+
+        std::unordered_map<uint32_t, NetConnection*> targetById;
+        for (NetConnection* target : targets) {
+            if (target && target->isConnected()) targetById[target->getId()] = target;
+        }
+        if (targetById.empty() && _broadcastSink) targetById.emplace(0u, nullptr);
+
+        // Interest/relevancy exit: a peer that previously saw the object gets
+        // a targeted Despawn. Disconnected peers are simply forgotten.
+        for (auto peerIt = e._peers.begin(); peerIt != e._peers.end();) {
+            if (targetById.contains(peerIt->first)) {
+                ++peerIt;
+                continue;
+            }
+            NetConnection* previousTarget = findConnectedTarget(peerIt->first);
+            if (peerIt->second.visible && (peerIt->first == 0 || previousTarget)) {
+                BitStream despawnBody;
+                ReflectSerializer::writeEntityDespawn(despawnBody, netId);
+                auto wire = PacketCodec::encode(
+                    static_cast<const uint8_t*>(despawnBody.getData()), despawnBody.getSize(),
+                    kMsgTypeEntityDespawn, kSchemaVersion, CHANNEL_RELIABLE,
+                    0, 0, false);
+                sendSealedToConnection(previousTarget, CHANNEL_RELIABLE, wire.data(), wire.size());
+            }
+            peerIt = e._peers.erase(peerIt);
+        }
+
+        bool replicatedToAny = false;
+        for (const auto& [connectionId, target] : targetById) {
+            ReflectedEntry::PeerState& peer = e._peers[connectionId];
+
+            if (!peer.visible) {
+                BitStream spawnBody;
+                ReflectSerializer::writeEntitySpawn(
+                    spawnBody, netId, ReflectSerializer::hashTypeSchema(e.type));
+                auto spawnWire = PacketCodec::encode(
+                    static_cast<const uint8_t*>(spawnBody.getData()), spawnBody.getSize(),
+                    kMsgTypeEntitySpawn, kSchemaVersion, CHANNEL_RELIABLE,
+                    0, 0, false);
+                if (!sendSealedToConnection(target, CHANNEL_RELIABLE,
+                                            spawnWire.data(), spawnWire.size())) {
+                    continue;
+                }
+                peer.visible = true;
+                peer.initialized = false;
+                peer.fieldHashes.clear();
+            }
+
+            if (!peer.initialized) {
+                BitStream fullBody;
+                if (!ReflectSerializer::serializeObject(e.type, e.obj, netId, fullBody)) continue;
+                auto fullWire = PacketCodec::encode(
+                    static_cast<const uint8_t*>(fullBody.getData()), fullBody.getSize(),
+                    kMsgTypeReplication, kSchemaVersion, CHANNEL_RELIABLE,
+                    0, 0, false);
+                if (sendSealedToConnection(target, CHANNEL_RELIABLE,
+                                           fullWire.data(), fullWire.size())) {
+                    peer.initialized = true;
+                    peer.fieldHashes = currentHashes;
+                    replicatedToAny = true;
+                }
+                continue;
+            }
+
+            std::vector<uint32_t> dirtyIndices;
+            dirtyIndices.reserve(nFields);
+            if (peer.fieldHashes.size() != currentHashes.size()) {
+                peer.initialized = false;
+                continue;
+            }
+            for (uint32_t k = 0; k < nFields; ++k) {
+                if (currentHashes[k] != peer.fieldHashes[k]) dirtyIndices.push_back(k);
+            }
+            if (dirtyIndices.empty()) continue;
+
+            BitStream deltaBody;
+            if (!ReflectSerializer::serializeDirtyFields(
+                    e.type, e.obj, netId, dirtyIndices, deltaBody)) continue;
+            auto deltaWire = PacketCodec::encode(
+                static_cast<const uint8_t*>(deltaBody.getData()), deltaBody.getSize(),
+                kMsgTypeDelta, kSchemaVersion, CHANNEL_UNRELIABLE,
+                0, 0, false);
+            if (sendSealedToConnection(target, CHANNEL_UNRELIABLE,
+                                       deltaWire.data(), deltaWire.size())) {
+                for (uint32_t k : dirtyIndices) peer.fieldHashes[k] = currentHashes[k];
+                replicatedToAny = true;
             }
         }
 
-        // Decision:
-        //   - Not yet initialized → emit Full Snapshot (R3.0 path, RELIABLE)
-        //   - No dirty fields (steady state) → emit nothing
-        //   - Some dirty fields → emit Delta (R3.1 path, UNRELIABLE)
-        //   - forceReplicate → set _initialized=false → next tick goes Full
-        //
-        // R4.1: 提取到 FrameKind enum 以便 tick 末尾按是否 emit 决定是否
-        // 触发 onPostReplicate。Full 路径里先不直接 emit（把序列化 + emit
-        // 提到外层统一处理），但保留 set/unset _initialized 语义。
-        // (frameKind + FrameKind 已在循环顶部定义)
-        BitStream body;
-        if (!e._initialized) {
-            body.writeUInt16(kMsgTypeReplication);
-            if (ReflectSerializer::serializeObject(e.type, e.obj, netId, body)) {
-                frameKind = FrameKind::Full;
-            }
-        }
-        else if (!dirtyIndices.empty()) {
-            body.writeUInt16(kMsgTypeDelta);
-            if (ReflectSerializer::serializeDirtyFields(e.type, e.obj, netId, dirtyIndices, body)) {
-                frameKind = FrameKind::Delta;
-            }
-        }
-
-        if (frameKind != FrameKind::None) {
-            const uint8_t channel = (frameKind == FrameKind::Full) ? CHANNEL_RELIABLE : CHANNEL_UNRELIABLE;
-            const uint16_t envMsgType = (frameKind == FrameKind::Full) ? kMsgTypeReplication : kMsgTypeDelta;
-            std::vector<uint8_t> sealed = PacketCodec::encode(
-                static_cast<const uint8_t*>(body.getData()), body.getSize(),
-                envMsgType, kSchemaVersion,
-                channel, /*flags=*/ 0, /*timestampMs=*/ 0,
-                /*compress=*/ false);
-            const bool delivered = sendSealedToTargets(
-                e.obj, e.type, netId, e._location, e._hasLocation,
-                channel, sealed.data(), sealed.size());
-            if (delivered) {
-                if (frameKind == FrameKind::Full) {
-                    e._initialized = true;
-                    e._fieldHashes = currentHashes;
-                } else {
-                    for (uint32_t k : dirtyIndices) e._fieldHashes[k] = currentHashes[k];
-                }
-                if (_extension) {
-                    _extension->onPostReplicate(e.obj, e.type, netId);
-                }
-            }
+        if (replicatedToAny && _extension) {
+            _extension->onPostReplicate(e.obj, e.type, netId);
         }
     }
 }
 
 // =============================================================================
-// onReceive — body-level dispatch by inner msgType. Authority gate: if this
+// onReceive — body-level dispatch by PacketHeader msgType. Authority gate: if this
 // end is the server AND the sender is a client, replicate/spawn frames are
 // dropped (§6.6 v1 = Server 权威). Client→server EntitySpawn/Replicate frames
 // are silently logged at debug verbosity.
 //
-// The body has already been unsealed by GnsConnection (CRC checked, lz4
-// decompressed, fragments reassembled). What's left is the inner [u16
-// msgType][payload] prefix.
+// The body has already been unsealed by PacketCodec (CRC checked, lz4
+// decompressed, fragments reassembled). The envelope msgType is passed
+// separately so the body contains payload only.
 // =============================================================================
-bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
-    // Need at least 2 bytes for inner msgType
-    if (stream.getBitPosition() + 16 > stream.getBitCount()) return false;
-
-    const uint16_t innerMsg = stream.readUInt16();
-
-    switch (innerMsg) {
+bool ReplicationManager::onReceive(uint16_t messageType, BitStream& stream, NetConnection* /*from*/) {
+    switch (messageType) {
         case kMsgTypeReplication:
         case kMsgTypeDelta: {
             // R3.1: Delta frames share the wire format with Full Snapshots
@@ -456,6 +487,8 @@ bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
             }
             void* obj = findObject(hdr.netId);
             if (!obj) return false;
+            const uint64_t expectedSchema = ReflectSerializer::hashTypeSchema(type);
+            if (expectedSchema == 0 || hdr.schemaHash != expectedSchema) return false;
             ReflectSerializer::FieldAppliedFn onFieldApplied;
             if (_extension) {
                 onFieldApplied = [this, obj, type, netId = hdr.netId](const ayt::reflect::IFieldInfo* field) {
@@ -467,13 +500,13 @@ bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
             return ReflectSerializer::deserializeObject(type, obj, stream, hdr.fieldCount, onFieldApplied);
         }
         case kMsgTypeEntitySpawn: {
-            uint32_t netId; uint16_t typeHash;
-            if (!ReflectSerializer::readEntitySpawn(stream, netId, typeHash)) return false;
+            uint32_t netId; uint64_t schemaHash;
+            if (!ReflectSerializer::readEntitySpawn(stream, netId, schemaHash)) return false;
             if (isAuthority()) {
                 // Clients must not spawn authoritative objects on the server.
                 return false;
             }
-            _spawnAnnouncements[netId] = typeHash;
+            _spawnAnnouncements[netId] = schemaHash;
             return true;
         }
         case kMsgTypeEntityDespawn: {
@@ -501,7 +534,10 @@ bool ReplicationManager::onReceive(BitStream& stream, NetConnection* /*from*/) {
 void ReplicationManager::forceReplicate(uint32_t netId) {
     auto it = _objects.find(netId);
     if (it == _objects.end()) return;
-    it->second._initialized = false;
+    for (auto& [connectionId, peer] : it->second._peers) {
+        (void)connectionId;
+        peer.initialized = false;
+    }
 }
 
 bool ReplicationManager::rebroadcastEntitySpawn(uint32_t netId, NetConnection* targetConn) {
@@ -531,55 +567,50 @@ bool ReplicationManager::rebroadcastEntitySpawn(uint32_t netId, NetConnection* t
         return false;
     }
 
-    // R4.1-A late-join: when targetConn points at a disconnected peer, fall
-    // back to the broadcast path so a transient peer still gets a chance.
-    if (targetConn && !targetConn->isConnected()) {
-        targetConn = nullptr;
-    }
-
-    const ReflectedEntry& e = it->second;
+    if (targetConn && !targetConn->isConnected()) return false;
+    ReflectedEntry& e = it->second;
 
     // Build the spawn frame AFTER the guards pass — saves the CRC + alloc
     // on misrouted calls (the common hot path; see design §6.6 v1).
     BitStream body;
-    body.writeUInt16(kMsgTypeEntitySpawn);
-    ReflectSerializer::writeEntitySpawn(body, netId,
-        static_cast<uint16_t>(e.type->getId() & 0xFFFFu));
+    ReflectSerializer::writeEntitySpawn(body, netId, ReflectSerializer::hashTypeSchema(e.type));
     std::vector<uint8_t> sealed = PacketCodec::encode(
         static_cast<const uint8_t*>(body.getData()), body.getSize(),
         kMsgTypeEntitySpawn, kSchemaVersion,
         CHANNEL_RELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
         /*compress=*/ false);
 
-    bool delivered = false;
+    std::vector<NetConnection*> targets;
     if (targetConn) {
-        // Single-target late-join send. Sink path is per-target so test
-        // captures (broadcastSink setup) see exactly one delivery tagged
-        // with this netId, matching what _network->sendTo would do.
-        if (hasNetwork) {
-            _network->sendTo(targetConn, CHANNEL_RELIABLE,
-                             sealed.data(), sealed.size());
-            delivered = true;
-        } else {
-            // Test-only fallback when no live subsystem exists.
-            _broadcastSink(CHANNEL_RELIABLE, sealed.data(), sealed.size());
-            delivered = true;
-        }
+        targets.push_back(targetConn);
     } else {
-        // Broadcast to all in-interest-radius (and _extension-relevant)
-        // connections, with a sink fallback when no live network exists.
-        delivered = sendSealedToTargets(e.obj, e.type, netId,
-                                        e._location, e._hasLocation,
-                                        CHANNEL_RELIABLE,
-                                        sealed.data(), sealed.size());
+        targets = buildInterestTargets(e.obj, e.type, netId, e._location, e._hasLocation);
     }
-    if (delivered) {
-        // forceReplicate schedules a Full Snapshot on the next tick — but
-        // INTEREST CULL still applies, so the late-joiner (out of radius)
-        // does NOT receive the Full. Callers that need an unconditional
-        // Full Snapshot for the late-joiner must call forceReplicate +
-        // bypass-interest themselves. See design §6.6 v1 follow-up note.
-        forceReplicate(netId);
+    if (targets.empty() && hasSink) targets.push_back(nullptr);
+
+    BitStream fullBody;
+    if (!ReflectSerializer::serializeObject(e.type, e.obj, netId, fullBody)) return false;
+    auto fullWire = PacketCodec::encode(
+        static_cast<const uint8_t*>(fullBody.getData()), fullBody.getSize(),
+        kMsgTypeReplication, kSchemaVersion, CHANNEL_RELIABLE, 0, 0, false);
+
+    bool delivered = false;
+    for (NetConnection* target : targets) {
+        if (!sendSealedToConnection(target, CHANNEL_RELIABLE, sealed.data(), sealed.size())) continue;
+        if (!sendSealedToConnection(target, CHANNEL_RELIABLE, fullWire.data(), fullWire.size())) continue;
+        const uint32_t connectionId = target ? target->getId() : 0u;
+        auto& peer = e._peers[connectionId];
+        peer.visible = true;
+        peer.initialized = true;
+        peer.fieldHashes.resize(e._netFieldSparseIndex.size());
+        for (uint32_t k = 0; k < e._netFieldSparseIndex.size(); ++k) {
+            const auto* field = e.type->getField(e._netFieldSparseIndex[k]);
+            WireTypeId wid;
+            if (!field || !ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
+            peer.fieldHashes[k] = ReflectSerializer::hashFieldValueEx(
+                wid, field->getType(), field->get(e.obj));
+        }
+        delivered = true;
     }
     return delivered;
 }
@@ -596,7 +627,7 @@ size_t ReplicationManager::getDirtyFieldCount(uint32_t netId) const {
     if (it == _objects.end()) return SIZE_MAX;
     const ReflectedEntry& e = it->second;
     if (!e.type) return SIZE_MAX;
-    if (!e._initialized) return e._fieldHashes.size(); // first tick = full
+    if (e._peers.empty()) return e._netFieldSparseIndex.size();
 
     size_t dirtyCount = 0;
     const uint32_t nFields = static_cast<uint32_t>(e._netFieldSparseIndex.size());
@@ -606,7 +637,13 @@ size_t ReplicationManager::getDirtyFieldCount(uint32_t netId) const {
         WireTypeId wid;
         if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
         const uint32_t cur = ReflectSerializer::hashFieldValueEx(wid, field->getType(), field->get(e.obj));
-        if (cur != e._fieldHashes[k]) ++dirtyCount;
+        for (const auto& [connectionId, peer] : e._peers) {
+            (void)connectionId;
+            if (!peer.initialized || peer.fieldHashes.size() != nFields || cur != peer.fieldHashes[k]) {
+                ++dirtyCount;
+                break;
+            }
+        }
     }
     return dirtyCount;
 }
@@ -628,10 +665,10 @@ bool ReplicationManager::isAuthority() const {
     return m == ConnectionMode::Server || m == ConnectionMode::ListenServer;
 }
 
-bool ReplicationManager::peekSpawnAnnouncement(uint32_t netId, uint16_t& typeHashOut) const {
+bool ReplicationManager::peekSpawnAnnouncement(uint32_t netId, uint64_t& schemaHashOut) const {
     auto it = _spawnAnnouncements.find(netId);
     if (it == _spawnAnnouncements.end()) return false;
-    typeHashOut = it->second;
+    schemaHashOut = it->second;
     return true;
 }
 

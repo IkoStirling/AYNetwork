@@ -97,6 +97,7 @@ class GnsConnection {
 public:
     using StateHandler = std::function<void(GnsConnectionState oldState, GnsConnectionState newState)>;
     using DataHandler  = std::function<void(const uint8_t* data, size_t len)>;
+    using PacketHandler = std::function<void(const PacketHeader& header, const uint8_t* body, size_t len)>;
 
     // R1.A: factory invoked by the global status callback when an incoming
     // connection arrives on a server listen socket. Returns a fresh
@@ -183,6 +184,7 @@ public:
     // ===== Callback registration =====
     void onStateChange(StateHandler handler) { _stateHandler = std::move(handler); }
     void onData(DataHandler handler)         { _dataHandler  = std::move(handler); }
+    void onPacket(PacketHandler handler)     { _packetHandler = std::move(handler); }
 
     // ===== Opaque GNS handles (for NetworkSubSystem bookkeeping) =====
     HSteamNetConnection getInnerConnection() const { return _conn; }
@@ -229,6 +231,7 @@ private:
 
     StateHandler _stateHandler;
     DataHandler  _dataHandler;
+    PacketHandler _packetHandler;
 
     // R1 done: 0 = no handshake (legacy). Non-zero enables HELLO/WELCOME.
     uint32_t _protocolVersion = 0;

@@ -893,7 +893,9 @@ void GnsConnection::onRawData(const uint8_t* data, size_t len) {
     // when handshake is disabled (Connected with version=0).
     if (_state == GnsConnectionState::Ready ||
         (_protocolVersion == 0 && _state == GnsConnectionState::Connected)) {
-        if (_dataHandler) {
+        if (_packetHandler) {
+            _packetHandler(decoded.header, decoded.body.data(), decoded.body.size());
+        } else if (_dataHandler) {
             _dataHandler(decoded.body.data(), decoded.body.size());
         }
     } else {

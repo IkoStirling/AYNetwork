@@ -202,8 +202,8 @@ TEST_CASE(OneServerTwoClientsRpcAndReplicate) {
     constexpr uint32_t kNetId = 501;
     server->getReplicationManager()->registerObject(&serverObj, replType, kNetId);
 
-    uint16_t typeHash1 = 0;
-    uint16_t typeHash2 = 0;
+    uint64_t typeHash1 = 0;
+    uint64_t typeHash2 = 0;
     CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
         pumpAll(all);
         return client1->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash1) &&
@@ -276,7 +276,7 @@ TEST_CASE(LateJoinClientReceivesRebroadcastedEntitySpawn) {
     constexpr uint32_t kNetId = 4711;
     server->getReplicationManager()->registerObject(&serverObj, replType, kNetId);
 
-    uint16_t typeHash1 = 0;
+    uint64_t typeHash1 = 0;
     CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
         pumpAll(pre);
         return client1->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash1);
@@ -316,7 +316,7 @@ TEST_CASE(LateJoinClientReceivesRebroadcastedEntitySpawn) {
 
     // After onConnectionChange fires, the late-join logic must deliver an
     // EntitySpawn announcement to client2 for the already-registered kNetId.
-    uint16_t typeHash2 = 0;
+    uint64_t typeHash2 = 0;
     CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
         pumpAll(all);
         return client2->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash2);

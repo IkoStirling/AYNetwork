@@ -4,6 +4,7 @@
 #include <AYCore.h>
 #include <AYGameLoop.h>   // P0 audit fix (2026-07-26): ISubSystem lives in AYGameLoop's IAYGameLoop.h, not in a separate ISubSystem.h
 #include <functional>
+#include <bit>
 #include <vector>
 #include <cstdint>
 #include <unordered_map>
@@ -164,7 +165,7 @@ constexpr uint16_t kMsgTypeAppAck       = 0x0013;
 // R2: schema version stamped into every PacketHeader. Bump on breaking
 // wire-format changes (rare; major version bumps imply a parallel header
 // migration). 1 = R2 baseline.
-constexpr uint16_t kSchemaVersion = 1;
+constexpr uint16_t kSchemaVersion = 2;
 
 // =============================================================================
 // R3.0 (2026-07-27): WireTypeId — closed enumeration of primitive field types
@@ -233,6 +234,9 @@ public:
     virtual void broadcastExcept(NetConnection* exclude, uint8_t channel, const void* data, size_t size) = 0;
 
     // ===== 消息接收 =====
+    // Application handlers always receive the decoded PacketCodec body. The
+    // transport envelope (header and CRC) is validated and removed before
+    // this callback runs.
     using MessageHandler = std::function<void(NetConnection* conn, uint8_t channel, const void* data, size_t size)>;
     virtual void onMessage(uint8_t channel, MessageHandler handler) = 0;
 
@@ -399,8 +403,8 @@ public:
     void writeUInt16(uint16_t v)      { writeByte(static_cast<uint8_t>(v & 0xFF)); writeByte(static_cast<uint8_t>((v >> 8) & 0xFF)); }
     void writeUInt32(uint32_t v)      { writeByte(static_cast<uint8_t>(v)); writeByte(static_cast<uint8_t>(v >> 8)); writeByte(static_cast<uint8_t>(v >> 16)); writeByte(static_cast<uint8_t>(v >> 24)); }
     void writeUInt64(uint64_t v)      { for (int i = 0; i < 8; ++i) writeByte(static_cast<uint8_t>(v >> (i * 8))); }
-    void writeFloatRaw(float v)       { writeUInt32(*reinterpret_cast<uint32_t*>(&v)); }
-    void writeDouble(double v)        { writeUInt64(*reinterpret_cast<uint64_t*>(&v)); }
+    void writeFloatRaw(float v)       { writeUInt32(std::bit_cast<uint32_t>(v)); }
+    void writeDouble(double v)        { writeUInt64(std::bit_cast<uint64_t>(v)); }
 
     // 读取
     void readBits(void* data, size_t bitCount);
@@ -419,8 +423,8 @@ public:
     uint16_t readUInt16()             { uint16_t v = readByte(); v |= (uint16_t(readByte()) << 8); return v; }
     uint32_t readUInt32()             { uint32_t v = readByte(); v |= (uint32_t(readByte()) << 8); v |= (uint32_t(readByte()) << 16); v |= (uint32_t(readByte()) << 24); return v; }
     uint64_t readUInt64()             { uint64_t v = 0; for (int i = 0; i < 8; ++i) v |= (uint64_t(readByte()) << (i * 8)); return v; }
-    float    readFloatRaw()           { uint32_t bits = readUInt32(); return *reinterpret_cast<float*>(&bits); }
-    double   readDouble()             { uint64_t bits = readUInt64(); return *reinterpret_cast<double*>(&bits); }
+    float    readFloatRaw()           { return std::bit_cast<float>(readUInt32()); }
+    double   readDouble()             { return std::bit_cast<double>(readUInt64()); }
 
     // 操作
     void reset();
@@ -510,7 +514,7 @@ public:
     // identical, only the fieldCount differs.
     // Returns true if the frame was consumed (registered object exists), false
     // otherwise (frame dropped — e.g. client→server authority gate).
-    bool onReceive(BitStream& stream, NetConnection* from);
+    bool onReceive(uint16_t messageType, BitStream& stream, NetConnection* from);
 
     // R3.1 real implementation: marks the entry as not-yet-initialized so
     // the next tick() emits a Full Snapshot regardless of dirty state.
@@ -552,7 +556,7 @@ public:
     // R4.1-A: client-side EntitySpawn announcements (netId → typeHash) received
     // from the authority. Game code calls registerObject after allocating the
     // local object; until then replicate frames for that netId are dropped.
-    bool peekSpawnAnnouncement(uint32_t netId, uint16_t& typeHashOut) const;
+    bool peekSpawnAnnouncement(uint32_t netId, uint64_t& schemaHashOut) const;
     size_t spawnAnnouncementCount() const { return _spawnAnnouncements.size(); }
 
     // Authority-only: resend EntitySpawn for an already-registered netId.
@@ -585,6 +589,9 @@ private:
     bool sendSealedToTargets(void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId,
                              NetVec3 objLoc, bool hasObjLoc,
                              uint8_t channel, const void* data, size_t size);
+    bool sendSealedToConnection(NetConnection* target, uint8_t channel,
+                                const void* data, size_t size);
+    NetConnection* findConnectedTarget(uint32_t connectionId) const;
 
     // Test-only seam fields (see public setModeForTesting / setBroadcastSinkForTesting).
     ConnectionMode _forcedMode = ConnectionMode::Disconnected;
@@ -595,7 +602,7 @@ private:
     // Forward-declared below; single map shared by both register paths.
     struct ReflectedEntry;
     std::unordered_map<uint32_t, ReflectedEntry> _objects;
-    std::unordered_map<uint32_t, uint16_t>        _spawnAnnouncements;
+    std::unordered_map<uint32_t, uint64_t>        _spawnAnnouncements;
 };
 
 #if defined(AYNETWORK_BUILD_TESTS)

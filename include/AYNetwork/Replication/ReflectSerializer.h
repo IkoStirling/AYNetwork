@@ -15,18 +15,18 @@
 //
 //   ReplicationFrame / DeltaFrame body (one entity per frame):
 //     [u32 netId]                       // 4 B
-//     [u16 typeHash]                    // 2 B — ayt::reflect::ITypeInfo::getId()
+//     [u64 schemaHash]                  // 8 B — stable reflected wire schema fingerprint
 //     [u8  fieldCount]                  // 1 B — number of fields in this frame
 //     [u8  reserved]                    // 1 B — 0
 //     [field records × fieldCount]
 //
 //   Field record:
-//     [u16 fieldNameHash]               // 2 B — ayt::reflect::IFieldInfo::getName() hashed (FNV-1a 32, low 16 bits)
+//     [u32 fieldNameHash]               // 4 B — full FNV-1a 32 field-name hash
 //     [u8  fieldTypeId]                 // 1 B — WireTypeId
 //     [value bytes]                     // per WireTypeId (see BitStream raw helpers)
 //
 //   EntitySpawn body (server announces new replicated entity):
-//     [u32 netId] [u16 typeHash]
+//     [u32 netId] [u64 schemaHash]
 //
 //   EntityDespawn body:
 //     [u32 netId]
@@ -129,15 +129,15 @@ public:
 
     // Write ReplicationFrame header. After return, the BitStream cursor is
     // positioned just past the 8-byte header, ready for field records.
-    static void writeReplicationFrameHeader(BitStream& s, uint32_t netId, uint16_t typeHash, uint8_t fieldCount);
+    static void writeReplicationFrameHeader(BitStream& s, uint32_t netId, uint64_t schemaHash, uint8_t fieldCount);
 
-    // Read ReplicationFrame header. Returns false if stream has < 8 bytes left.
-    struct FrameHeader { uint32_t netId; uint16_t typeHash; uint8_t fieldCount; uint8_t reserved; };
+    // Read ReplicationFrame header. Returns false if stream has < 14 bytes left.
+    struct FrameHeader { uint32_t netId; uint64_t schemaHash; uint8_t fieldCount; uint8_t reserved; };
     static bool readReplicationFrameHeader(BitStream& s, FrameHeader& out);
 
-    // Write/read EntitySpawn / EntityDespawn bodies (compact 6B / 4B).
-    static void writeEntitySpawn(BitStream& s, uint32_t netId, uint16_t typeHash);
-    static bool  readEntitySpawn(BitStream& s, uint32_t& netId, uint16_t& typeHash);
+    // Write/read EntitySpawn / EntityDespawn bodies (12B / 4B).
+    static void writeEntitySpawn(BitStream& s, uint32_t netId, uint64_t schemaHash);
+    static bool  readEntitySpawn(BitStream& s, uint32_t& netId, uint64_t& schemaHash);
     static void writeEntityDespawn(BitStream& s, uint32_t netId);
     static bool  readEntityDespawn(BitStream& s, uint32_t& netId);
 
@@ -148,10 +148,14 @@ public:
     // switch inside resolveWireTypeId.
     static bool resolveWireTypeId(const ayt::reflect::ITypeInfo* fieldType, WireTypeId& outId);
 
-    // FNV-1a 32-bit hash of a C-string, returned low-16-bits (so it fits in
-    // the wire's 2-byte fieldNameHash slot). Stable across runs on the same
-    // platform; not cryptographic.
-    static uint16_t hashFieldName(const char* name);
+    // Full FNV-1a 32-bit field-name hash. Serializers reject a reflected type
+    // when two NetReplicate fields collide instead of routing ambiguously.
+    static uint32_t hashFieldName(const char* name);
+
+    // Stable 64-bit fingerprint of the wire-visible schema: declared type
+    // name/version plus every NetReplicate field name, WireTypeId and nested
+    // element schema. It intentionally does not use typeid/hash_code.
+    static uint64_t hashTypeSchema(const ayt::reflect::ITypeInfo* type);
 };
 
 } // namespace ayt::net

@@ -42,6 +42,12 @@ class NetworkSubSystem : public INetworkSubSystem {
         Shutdown,
     };
 
+    enum class DriverMode : uint8_t {
+        Unknown,
+        LegacyUpdate,
+        Phased,
+    };
+
     struct DeferredControl {
         DeferredControlType type = DeferredControlType::None;
         std::string address;
@@ -76,11 +82,14 @@ public:
             return false;
         }
         _initialized = true;
+        _driverMode = DriverMode::Unknown;
         ::printf("[Network] Initialized (GNS ready)\n");
         return true;
     }
 
     void update(float deltaTime) override {
+        if (_driverMode == DriverMode::Phased) return;
+        _driverMode = DriverMode::LegacyUpdate;
         // P0 audit fix (2026-07-26): no longer empty.
         // R1 (2026-07-26): forward every per-frame callback to the active
         // GnsConnection. ReplicationManager tick stays here so its deltaTime
@@ -95,6 +104,8 @@ public:
 
     void tick(::ayt::game::FramePhase phase,
               const ::ayt::game::FrameContext& context) override {
+        if (_driverMode == DriverMode::LegacyUpdate) return;
+        _driverMode = DriverMode::Phased;
         if (phase == ::ayt::game::FramePhase::Ingress) {
             _ingressTargetSimTick = context.simTick + 1;
             _stagedIngress = true;
@@ -115,7 +126,7 @@ public:
     // Legacy direct-call compatibility. The staged loop uses tick() above and
     // never enters this adapter for an explicitly phased subsystem.
     void fixedUpdate(float fixedDeltaTime) override {
-        update(fixedDeltaTime);
+        (void)fixedDeltaTime;
     }
 
     void shutdown() override {
@@ -137,6 +148,7 @@ public:
         _ingressTargetSimTick = 0;
         gns::shutdown();
         _initialized = false;
+        _driverMode = DriverMode::Unknown;
         ::printf("[Network] Shutdown\n");
     }
 
@@ -182,7 +194,7 @@ public:
             return nullptr;
         }
 
-        child->onData(makeDataHandler(netPtr));
+        child->onPacket(makePacketHandler(netPtr));
 
         if (_connectionHandler) {
             rawChild->onStateChange([this, rawChild, netPtr](GnsConnectionState /*oldS*/,
@@ -222,28 +234,16 @@ public:
         return raw;
     }
 
-    GnsConnection::DataHandler makeDataHandler(NetConnection* from) {
-        return [this, from](const uint8_t* data, size_t len) {
-            dispatchIncoming(from, data, len);
+    GnsConnection::PacketHandler makePacketHandler(NetConnection* from) {
+        return [this, from](const PacketHeader& header, const uint8_t* body, size_t len) {
+            dispatchIncoming(from, header, body, len);
         };
     }
 
-    void dispatchIncoming(NetConnection* from, const uint8_t* data, size_t len) {
-        if (!data || len < PacketCodec::kHeaderSize) {
-            if (_messageHandlers[CHANNEL_RELIABLE]) {
-                _messageHandlers[CHANNEL_RELIABLE](from, CHANNEL_RELIABLE, data, len);
-            }
-            return;
-        }
-        auto decoded = PacketCodec::decode(data, len);
-        if (!decoded.ok) {
-            if (_messageHandlers[CHANNEL_RELIABLE]) {
-                _messageHandlers[CHANNEL_RELIABLE](from, CHANNEL_RELIABLE, data, len);
-            }
-            return;
-        }
-        const uint8_t channel = decoded.header.channel;
-        switch (decoded.header.msgType) {
+    void dispatchIncoming(NetConnection* from, const PacketHeader& header,
+                          const uint8_t* body, size_t len) {
+        const uint8_t channel = header.channel;
+        switch (header.msgType) {
             case kMsgTypeRpcRequest:
             case kMsgTypeRpcResponse:
             case kMsgTypeRpcReject:
@@ -252,17 +252,17 @@ public:
             case kMsgTypeEntitySpawn:
             case kMsgTypeEntityDespawn:
                 if (_stagedIngress) {
-                    queueSimulationInbound(decoded.header.msgType,
+                    queueSimulationInbound(header.msgType,
                                            from != nullptr ? from->getId() : 0,
-                                           decoded.body.data(), decoded.body.size());
+                                           body, len);
                 } else {
-                    applySimulationInbound(decoded.header.msgType, from,
-                                           decoded.body.data(), decoded.body.size());
+                    applySimulationInbound(header.msgType, from,
+                                           const_cast<uint8_t*>(body), len);
                 }
                 return;
             default:
                 if (_messageHandlers[channel]) {
-                    _messageHandlers[channel](from, channel, data, len);
+                    _messageHandlers[channel](from, channel, body, len);
                 }
                 return;
         }
@@ -334,7 +334,7 @@ public:
         case kMsgTypeDelta:
         case kMsgTypeEntitySpawn:
         case kMsgTypeEntityDespawn:
-            (void)_replicationManager.onReceive(bodyStream, from);
+            (void)_replicationManager.onReceive(messageType, bodyStream, from);
             break;
         default:
             break;
@@ -363,7 +363,7 @@ public:
 
     void installInboundRoutes() {
         if (_clientConn && _clientNetConn) {
-            _clientConn->onData(makeDataHandler(_clientNetConn.get()));
+            _clientConn->onPacket(makePacketHandler(_clientNetConn.get()));
         }
     }
 
@@ -691,6 +691,7 @@ public:
 private:
     ConnectionMode _mode = ConnectionMode::Disconnected;
     bool _initialized = false;
+    DriverMode _driverMode = DriverMode::Unknown;
     bool _connected = false;
     uint32_t _hostId = 0;
 

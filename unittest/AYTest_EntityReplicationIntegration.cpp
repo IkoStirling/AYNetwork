@@ -9,8 +9,10 @@
 #include <AYEntity/EntityModule.h>
 
 #include <AYNetwork/Replication/EntityReplicationAdapter.h>
+#include <AYNetwork/Replication/EntityReplicationWorldBinder.h>
 #include <AYEntity/components/HealthComponent.h>
 #include <AYEntity/components/NetworkComponent.h>
+#include <AYReflect/detail/ReflectImpl.h>
 
 #include <chrono>
 #include <functional>
@@ -25,6 +27,32 @@ using ayt::entity::World;
 
 namespace
 {
+
+struct SecondaryReplicatedComponent : ayt::entity::IComponent {
+    int32_t value = 0;
+    const char* getName() const override { return "SecondaryReplicatedComponent"; }
+};
+
+struct SecondaryReplicatedRegistrar {
+    SecondaryReplicatedRegistrar() {
+        auto& registry = ayt::reflect::TypeRegistryImpl::instance();
+        if (registry.findType("SecondaryReplicatedComponent")) return;
+        using Info = ayt::reflect::TypeInfoImpl<SecondaryReplicatedComponent>;
+        auto* info = new Info(
+            "SecondaryReplicatedComponent",
+            ayt::reflect::detail::defaultCreate<SecondaryReplicatedComponent>,
+            ayt::reflect::detail::defaultDestroy<SecondaryReplicatedComponent>,
+            ayt::reflect::detail::defaultCopy<SecondaryReplicatedComponent>);
+        info->addField(new ayt::reflect::FieldInfoImpl(
+            "value", registry.findType<int32_t>(),
+            offsetof(SecondaryReplicatedComponent, value),
+            ayt::reflect::FieldAttribute::Serialize |
+                ayt::reflect::FieldAttribute::NetReplicate));
+        registry.registerTypeInfo("SecondaryReplicatedComponent", info);
+    }
+};
+
+SecondaryReplicatedRegistrar g_secondaryReplicatedRegistrar;
 
 bool pumpUntil(std::chrono::milliseconds timeout, const std::function<bool()>& pred) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -81,7 +109,7 @@ TEST_CASE(HealthComponentReplicatesViaAdapter) {
     CHECK(EntityReplicationAdapter::registerEntityComponent<HealthComponent>(
         *server->getReplicationManager(), serverEntity, kNetId));
 
-    uint16_t typeHash = 0;
+    uint64_t typeHash = 0;
     CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
         pumpAll(all);
         return client->getReplicationManager()->peekSpawnAnnouncement(kNetId, typeHash);
@@ -115,6 +143,49 @@ TEST_CASE(HealthComponentReplicatesViaAdapter) {
     client->shutdown();
     delete server;
     delete client;
+
+    World::instance().shutdown();
+}
+
+TEST_CASE(WorldBinderDiscoversMultipleComponentsAndRemovals) {
+    ayt::test::setCurrentCase("WorldBinderDiscoversMultipleComponentsAndRemovals");
+
+    World::instance().initialize();
+    ayt::entity::registerEntityComponents();
+
+    ReplicationManager manager(nullptr);
+    Entity* entity = Entity::create();
+    constexpr uint32_t kEntityNetId = 8123;
+    entity->addComponent<NetworkComponent>()->setNetId(kEntityNetId);
+    auto* health = entity->addComponent<HealthComponent>();
+    auto* secondary = entity->addComponent<SecondaryReplicatedComponent>();
+    CHECK(health != nullptr);
+    CHECK(secondary != nullptr);
+
+    EntityReplicationWorldBinder binder(manager, World::instance());
+    CHECK_INT_EQ(binder.synchronize(), 2u);
+    CHECK_INT_EQ(manager.getRegisteredCount(), 2u);
+
+    auto* healthType = ayt::reflect::TypeRegistryImpl::instance().findType<HealthComponent>();
+    auto* secondaryType = ayt::reflect::TypeRegistryImpl::instance().findType<SecondaryReplicatedComponent>();
+    CHECK(healthType != nullptr);
+    CHECK(secondaryType != nullptr);
+    const uint32_t healthNetId = EntityReplicationWorldBinder::makeComponentNetId(
+        kEntityNetId, ReflectSerializer::hashTypeSchema(healthType));
+    const uint32_t secondaryNetId = EntityReplicationWorldBinder::makeComponentNetId(
+        kEntityNetId, ReflectSerializer::hashTypeSchema(secondaryType));
+    CHECK(healthNetId != secondaryNetId);
+    CHECK(manager.findObject(healthNetId) == health);
+    CHECK(manager.findObject(secondaryNetId) == secondary);
+
+    entity->removeComponent<SecondaryReplicatedComponent>();
+    CHECK_INT_EQ(binder.synchronize(), 1u);
+    CHECK(manager.findObject(secondaryNetId) == nullptr);
+
+    Entity::destroy(entity);
+    CHECK_INT_EQ(binder.synchronize(), 0u);
+    CHECK_INT_EQ(manager.getRegisteredCount(), 0u);
+    CHECK_INT_EQ(binder.collisionCount(), 0u);
 
     World::instance().shutdown();
 }

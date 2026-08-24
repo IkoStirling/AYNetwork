@@ -68,7 +68,6 @@ public:
 
 BitStream makeReplicationBody(const ayt::reflect::ITypeInfo* type, void* obj, uint32_t netId) {
     BitStream body;
-    body.writeUInt16(kMsgTypeReplication);
     CHECK(ReflectSerializer::serializeObject(type, obj, netId, body));
     body.resetForRead();
     return body;
@@ -95,7 +94,7 @@ TEST_CASE(RepNotifyFieldFiresOnReceive) {
     mgr.registerObject(&clientObj, type, 77);
 
     BitStream body = makeReplicationBody(type, &serverObj, 77);
-    CHECK(mgr.onReceive(body, nullptr));
+    CHECK(mgr.onReceive(kMsgTypeReplication, body, nullptr));
 
     CHECK_INT_EQ(clientObj.score, 99);
     CHECK_INT_EQ(clientObj.lives, 1);
@@ -123,12 +122,11 @@ TEST_CASE(NonRepNotifyFieldDoesNotFire) {
     mgr.registerObject(&clientObj, type, 88);
 
     BitStream body;
-    body.writeUInt16(kMsgTypeDelta);
     std::vector<uint32_t> dirty{1}; // dense index 1 = "lives"
     ReflectSerializer::serializeDirtyFields(type, &serverObj, 88, dirty, body);
     body.resetForRead();
 
-    CHECK(mgr.onReceive(body, nullptr));
+    CHECK(mgr.onReceive(kMsgTypeDelta, body, nullptr));
 
     CHECK_INT_EQ(clientObj.lives, 5);
     CHECK_INT_EQ(static_cast<int>(ext.events.size()), 0);
@@ -150,12 +148,11 @@ TEST_CASE(RepNotifyFiresOnDeltaForTaggedField) {
     mgr.registerObject(&clientObj, type, 99);
 
     BitStream body;
-    body.writeUInt16(kMsgTypeDelta);
     std::vector<uint32_t> dirty{0}; // dense index 0 = "score"
     ReflectSerializer::serializeDirtyFields(type, &serverObj, 99, dirty, body);
     body.resetForRead();
 
-    CHECK(mgr.onReceive(body, nullptr));
+    CHECK(mgr.onReceive(kMsgTypeDelta, body, nullptr));
     CHECK_INT_EQ(clientObj.score, 42);
     CHECK_INT_EQ(static_cast<int>(ext.events.size()), 1);
     if (ext.events.size() >= 1) {
@@ -177,7 +174,7 @@ TEST_CASE(NoExtensionSkipsRepNotify) {
     mgr.registerObject(&clientObj, type, 55);
 
     BitStream body = makeReplicationBody(type, &serverObj, 55);
-    CHECK(mgr.onReceive(body, nullptr));
+    CHECK(mgr.onReceive(kMsgTypeReplication, body, nullptr));
     CHECK_INT_EQ(clientObj.score, 7);
 }
 

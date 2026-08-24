@@ -439,21 +439,12 @@ TEST_CASE(SnapshotBroadcast) {
     auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();
     CHECK(type != nullptr);
 
-    // Test seam: route the server-side broadcast directly to the client's
-    // onRawData (bypassing PacketCodec seal — we already pass sealed bytes).
-    serverMgr.setBroadcastSinkForTesting([&](uint8_t /*ch*/, const void* data, size_t size) {
-        client.onRawData(static_cast<const uint8_t*>(data), size);
-    });
-
-    // Hook a client-side data sink: parse Replication frames and apply.
     ReplicationAllPrimitives received{};
     std::atomic<bool> gotFrame{false};
-    client.onData([&](const uint8_t* data, size_t size) {
-        BitStream bs(const_cast<uint8_t*>(data), size);
-        // Body prefix: [u16 innerMsgType] — ReplicationManager added this.
-        if (bs.getBitPosition() + 16 > bs.getBitCount()) return;
-        uint16_t inner = bs.readUInt16();
-        if (inner != kMsgTypeReplication) return;
+    serverMgr.setBroadcastSinkForTesting([&](uint8_t /*ch*/, const void* data, size_t size) {
+        DecodedPacket decoded = PacketCodec::decode(static_cast<const uint8_t*>(data), size);
+        if (!decoded.ok || decoded.header.msgType != kMsgTypeReplication) return;
+        BitStream bs(decoded.body.data(), decoded.body.size());
         ReflectSerializer::FrameHeader hdr;
         if (!ReflectSerializer::readReplicationFrameHeader(bs, hdr)) return;
         ReflectSerializer::deserializeObject(type, &received, bs, hdr.fieldCount);
@@ -513,19 +504,14 @@ TEST_CASE(EntitySpawnAndDespawn) {
     std::atomic<int> spawnCount{0};
     std::atomic<int> despawnCount{0};
     uint32_t spawnedNetId = 0;
-    uint16_t spawnedTypeHash = 0;
+    uint64_t spawnedTypeHash = 0;
 
     serverMgr.setBroadcastSinkForTesting([&](uint8_t /*ch*/, const void* data, size_t size) {
-        client.onRawData(static_cast<const uint8_t*>(data), size);
-    });
-
-    client.onData([&](const uint8_t* data, size_t size) {
-        BitStream bs(const_cast<uint8_t*>(data), size);
-        // Body prefix: [u16 innerMsgType] then payload.
-        if (bs.getBitPosition() + 16 > bs.getBitCount()) return;
-        uint16_t inner = bs.readUInt16();
-        if (inner == kMsgTypeEntitySpawn) {
-            uint32_t nid; uint16_t th;
+        DecodedPacket decoded = PacketCodec::decode(static_cast<const uint8_t*>(data), size);
+        if (!decoded.ok) return;
+        BitStream bs(decoded.body.data(), decoded.body.size());
+        if (decoded.header.msgType == kMsgTypeEntitySpawn) {
+            uint32_t nid; uint64_t th;
             if (ReflectSerializer::readEntitySpawn(bs, nid, th)) {
                 spawnCount++;
                 spawnedNetId = nid;
@@ -533,7 +519,7 @@ TEST_CASE(EntitySpawnAndDespawn) {
             }
             return;
         }
-        if (inner == kMsgTypeEntityDespawn) {
+        if (decoded.header.msgType == kMsgTypeEntityDespawn) {
             uint32_t nid;
             if (ReflectSerializer::readEntityDespawn(bs, nid)) {
                 despawnCount++;
@@ -551,7 +537,7 @@ TEST_CASE(EntitySpawnAndDespawn) {
     }
     CHECK(spawnCount.load() >= 1);
     CHECK(spawnedNetId == 99u);
-    CHECK(spawnedTypeHash == static_cast<uint16_t>(type->getId() & 0xFFFFu));
+    CHECK(spawnedTypeHash == ReflectSerializer::hashTypeSchema(type));
 
     serverMgr.unregisterObject(99);
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -615,7 +601,6 @@ TEST_CASE(ServerDropsClientReplicate) {
     // we deliver it directly to serverMgr.onReceive, asserting the gate
     // rejects it because the server has no matching local registration.
     BitStream body;
-    body.writeUInt16(kMsgTypeReplication);
     ReplicationNoNet src;
     src.score = 42;
     ReflectSerializer::serializeObject(type, &src, /*netId=*/ 7, body);
@@ -630,7 +615,7 @@ TEST_CASE(ServerDropsClientReplicate) {
     DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
     CHECK(dec.ok);
     BitStream bs(dec.body.data(), dec.body.size());
-    bool consumed = serverMgr.onReceive(bs, /*from=*/ nullptr);
+    bool consumed = serverMgr.onReceive(kMsgTypeReplication, bs, /*from=*/ nullptr);
     serverOnReceiveReturned.store(true);
     serverOnReceiveConsumed.store(consumed);
 
@@ -916,7 +901,7 @@ TEST_CASE(DeltaFrameHeaderFormatMatchesFullSnapshot) {
     CHECK_INT_EQ(static_cast<int>(hdrDelta.fieldCount), 1);
     CHECK_INT_EQ(static_cast<int>(hdrDelta.reserved), 0);
     // typeHash same value as full.
-    CHECK_INT_EQ(static_cast<int>(hdrDelta.typeHash), static_cast<int>(hdrFull.typeHash));
+    CHECK(hdrDelta.schemaHash == hdrFull.schemaHash);
     (void)typeHashLowByte; (void)typeHashHighByte;
 }
 TEST_SUITE_END
@@ -965,14 +950,9 @@ struct E2EScaffold {
 
         serverMgr.setBroadcastSinkForTesting([this](uint8_t ch, const void* data, size_t size) {
             lastChannel.store(static_cast<int>(ch));
-            client.onRawData(static_cast<const uint8_t*>(data), size);
-        });
-
-        client.onData([this](const uint8_t* data, size_t size) {
-            BitStream bs(const_cast<uint8_t*>(data), size);
-            if (bs.getBitPosition() + 16 > bs.getBitCount()) return;
-            const uint16_t inner = bs.readUInt16();
-            switch (inner) {
+            DecodedPacket decoded = PacketCodec::decode(static_cast<const uint8_t*>(data), size);
+            if (!decoded.ok) return;
+            switch (decoded.header.msgType) {
                 case kMsgTypeReplication: fullCount++; break;
                 case kMsgTypeDelta:       deltaCount++; break;
                 case kMsgTypeEntitySpawn: spawnCount++; break;
@@ -1215,7 +1195,6 @@ TEST_CASE(DeltaDoesNotIncludeUnchangedFields) {
 
     // Hand-build a Delta frame with only `i32` dirty (dense idx 3).
     BitStream body;
-    body.writeUInt16(kMsgTypeDelta);
     std::vector<uint32_t> idx = { 3u };
     ReplicationAllPrimitives serverSide{};
     serverSide.i32 = 0xCAFEBABE;
@@ -1235,9 +1214,6 @@ TEST_CASE(DeltaDoesNotIncludeUnchangedFields) {
     DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
     CHECK(dec.ok);
     BitStream bs(dec.body.data(), dec.body.size());
-    // Skip [u16 innerMsgType] prefix.
-    const uint16_t innerMsg = bs.readUInt16();
-    CHECK_INT_EQ(static_cast<int>(innerMsg), static_cast<int>(kMsgTypeDelta));
     ReflectSerializer::FrameHeader hdr;
     CHECK(ReflectSerializer::readReplicationFrameHeader(bs, hdr));
     CHECK_INT_EQ(static_cast<uint32_t>(hdr.netId), 5u);
@@ -1529,7 +1505,6 @@ TEST_CASE(DeltaFrameAuthorityGate) {
 
     // Server has NO registered objects for netId=99 — gate must drop.
     BitStream body;
-    body.writeUInt16(kMsgTypeDelta);
     ReplicationNoNet src;
     src.score = 7;
     std::vector<uint32_t> idx = { 0u };
@@ -1543,7 +1518,7 @@ TEST_CASE(DeltaFrameAuthorityGate) {
     DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
     CHECK(dec.ok);
     BitStream bs(dec.body.data(), dec.body.size());
-    const bool consumed = serverMgr.onReceive(bs, /*from=*/ nullptr);
+    const bool consumed = serverMgr.onReceive(kMsgTypeDelta, bs, /*from=*/ nullptr);
     CHECK(!consumed); // gate: findType(99) == nullptr → drop
     CHECK_INT_EQ(static_cast<size_t>(serverMgr.getRegisteredCount()), 0u);
 
@@ -1582,7 +1557,6 @@ TEST_CASE(DeltaWireSmallerThanFull) {
     size_t fullSize = 0;
     {
         BitStream body;
-        body.writeUInt16(kMsgTypeReplication);
         CHECK(ReflectSerializer::serializeObject(type, &obj, 14, body));
         auto sealed = PacketCodec::encode(
             static_cast<const uint8_t*>(body.getData()), body.getSize(),
@@ -1598,7 +1572,6 @@ TEST_CASE(DeltaWireSmallerThanFull) {
     size_t deltaSize = 0;
     {
         BitStream body;
-        body.writeUInt16(kMsgTypeDelta);
         std::vector<uint32_t> idx = { 3u };
         ReplicationAllPrimitives src = obj;
         CHECK(ReflectSerializer::serializeDirtyFields(type, &src, 14, idx, body));
@@ -1633,7 +1606,6 @@ TEST_CASE(DeltaFrameHeaderSizeMinimal) {
 
     std::vector<uint32_t> idx = { 0u };
     BitStream body;
-    body.writeUInt16(kMsgTypeDelta);
     CHECK(ReflectSerializer::serializeDirtyFields(type, &obj, /*netId=*/ 1, idx, body));
     auto sealed = PacketCodec::encode(
         static_cast<const uint8_t*>(body.getData()), body.getSize(),
@@ -1641,17 +1613,14 @@ TEST_CASE(DeltaFrameHeaderSizeMinimal) {
         CHANNEL_UNRELIABLE, /*flags=*/ 0, /*timestampMs=*/ 0,
         /*compress=*/ false);
 
-    // Body: 2B inner msgType + 8B frame header + 3B record header + 4B i32 = 17 B
-    // PacketCodec seal adds 12B header + 4B CRC = 33 B total.
+    // Body: 14B frame header + 5B record header + 4B i32 = 23 B.
+    // PacketCodec seal adds 12B header + 4B CRC = 39 B total.
     CHECK(sealed.size() <= 40u);
 
     // Decode round-trip.
     DecodedPacket dec = PacketCodec::decode(sealed.data(), sealed.size());
     CHECK(dec.ok);
     BitStream bs(dec.body.data(), dec.body.size());
-    // Skip the [u16 innerMsgType] prefix written by ReplicationManager.
-    const uint16_t inner = bs.readUInt16();
-    CHECK_INT_EQ(static_cast<int>(inner), static_cast<int>(kMsgTypeDelta));
     ReflectSerializer::FrameHeader hdr;
     CHECK(ReflectSerializer::readReplicationFrameHeader(bs, hdr));
     CHECK_INT_EQ(static_cast<uint32_t>(hdr.netId), 1u);
@@ -2130,7 +2099,6 @@ TEST_CASE(R32FrameSurvivesPacketCodec) {
     serverSide.inner.label = "codec";
     serverSide.bottom = 200;
     BitStream body;
-    body.writeUInt16(kMsgTypeReplication);
     CHECK(ReflectSerializer::serializeObject(type, &serverSide, /*netId=*/ 300, body));
     auto sealed = PacketCodec::encode(
         static_cast<const uint8_t*>(body.getData()), body.getSize(),

@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 namespace ayt::net
 {
@@ -50,9 +52,9 @@ uint32_t fnv1a32(const char* s) {
 
 } // anonymous namespace
 
-uint16_t ReflectSerializer::hashFieldName(const char* name) {
+uint32_t ReflectSerializer::hashFieldName(const char* name) {
     if (!name) return 0;
-    return static_cast<uint16_t>(fnv1a32(name) & 0xFFFFu);
+    return fnv1a32(name);
 }
 
 // =============================================================================
@@ -88,8 +90,7 @@ bool ReflectSerializer::resolveWireTypeId(const ayt::reflect::ITypeInfo* fieldTy
         //   - Containers that ARE IContainerTypeInfo → FixedArray or DynamicArray
         //     depending on isFixedSize().
         //   - Anything else → NestedStruct (assumed registered struct).
-        const char* name = fieldType->getName();
-        if (name && std::strncmp(name, "std::map<std::string,", 21) == 0) {
+        if (dynamic_cast<const ayt::reflect::MapTypeInfoBase*>(fieldType)) {
             outId = WireTypeId::StringMap;
             return true;
         }
@@ -102,6 +103,98 @@ bool ReflectSerializer::resolveWireTypeId(const ayt::reflect::ITypeInfo* fieldTy
         return true;
     }
     return true;
+}
+
+namespace {
+
+constexpr uint64_t kFnv64OffsetBasis = 0xCBF29CE484222325ull;
+constexpr uint64_t kFnv64Prime = 0x100000001B3ull;
+
+void fnv1a64Append(uint64_t& hash, const void* data, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= kFnv64Prime;
+    }
+}
+
+void fnv1a64AppendString(uint64_t& hash, const char* text) {
+    if (!text) {
+        const uint8_t zero = 0;
+        fnv1a64Append(hash, &zero, sizeof(zero));
+        return;
+    }
+    fnv1a64Append(hash, text, std::strlen(text) + 1);
+}
+
+bool appendTypeSchema(uint64_t& hash, const ayt::reflect::ITypeInfo* type,
+                      std::unordered_set<const ayt::reflect::ITypeInfo*>& visiting) {
+    if (!type) return false;
+
+    WireTypeId typeWid;
+    if (!ReflectSerializer::resolveWireTypeId(type, typeWid)) return false;
+    const uint8_t typeWidByte = static_cast<uint8_t>(typeWid);
+    fnv1a64Append(hash, &typeWidByte, sizeof(typeWidByte));
+    fnv1a64AppendString(hash, type->getName());
+    const uint32_t version = type->getVersion();
+    fnv1a64Append(hash, &version, sizeof(version));
+
+    if (!visiting.insert(type).second) {
+        const uint8_t recursiveMarker = 0xFF;
+        fnv1a64Append(hash, &recursiveMarker, sizeof(recursiveMarker));
+        return true;
+    }
+
+    bool ok = true;
+    if (typeWid == WireTypeId::FixedArray || typeWid == WireTypeId::DynamicArray ||
+        typeWid == WireTypeId::StringMap) {
+        const auto* container = dynamic_cast<const ayt::reflect::IContainerTypeInfo*>(type);
+        ok = container && appendTypeSchema(hash, container->getElementType(), visiting);
+    } else if (typeWid == WireTypeId::NestedStruct) {
+        std::vector<const ayt::reflect::IFieldInfo*> fields;
+        for (uint32_t i = 0; i < type->getFieldCount(); ++i) {
+            const auto* field = type->getField(i);
+            if (!field || !field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
+            WireTypeId fieldWid;
+            if (ReflectSerializer::resolveWireTypeId(field->getType(), fieldWid)) fields.push_back(field);
+        }
+        std::sort(fields.begin(), fields.end(), [](const auto* lhs, const auto* rhs) {
+            return std::strcmp(lhs->getName(), rhs->getName()) < 0;
+        });
+        std::unordered_set<uint32_t> fieldHashes;
+        for (const auto* field : fields) {
+            const uint32_t fieldHash = ReflectSerializer::hashFieldName(field->getName());
+            if (!fieldHashes.insert(fieldHash).second) { ok = false; break; }
+            fnv1a64AppendString(hash, field->getName());
+            if (!appendTypeSchema(hash, field->getType(), visiting)) { ok = false; break; }
+        }
+    }
+
+    visiting.erase(type);
+    return ok;
+}
+
+bool collectNetFields(const ayt::reflect::ITypeInfo* type,
+                      std::vector<const ayt::reflect::IFieldInfo*>& fields) {
+    if (!type) return false;
+    std::unordered_set<uint32_t> hashes;
+    for (uint32_t i = 0; i < type->getFieldCount(); ++i) {
+        const auto* field = type->getField(i);
+        if (!field || !field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
+        WireTypeId wid;
+        if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
+        if (!hashes.insert(ReflectSerializer::hashFieldName(field->getName())).second) return false;
+        fields.push_back(field);
+    }
+    return fields.size() <= 255;
+}
+
+} // anonymous namespace
+
+uint64_t ReflectSerializer::hashTypeSchema(const ayt::reflect::ITypeInfo* type) {
+    uint64_t hash = kFnv64OffsetBasis;
+    std::unordered_set<const ayt::reflect::ITypeInfo*> visiting;
+    return appendTypeSchema(hash, type, visiting) ? hash : 0;
 }
 
 // =============================================================================
@@ -176,31 +269,31 @@ bool readFieldValue(BitStream& s, WireTypeId id, void* fieldPtr) {
 // =============================================================================
 // ReplicationFrame header writers/readers
 // =============================================================================
-void ReflectSerializer::writeReplicationFrameHeader(BitStream& s, uint32_t netId, uint16_t typeHash, uint8_t fieldCount) {
+void ReflectSerializer::writeReplicationFrameHeader(BitStream& s, uint32_t netId, uint64_t schemaHash, uint8_t fieldCount) {
     s.writeUInt32(netId);
-    s.writeUInt16(typeHash);
+    s.writeUInt64(schemaHash);
     s.writeUInt8(fieldCount);
     s.writeUInt8(0); // reserved
 }
 
 bool ReflectSerializer::readReplicationFrameHeader(BitStream& s, FrameHeader& out) {
-    if (s.getBitPosition() + 64 > s.getBitCount()) return false;
+    if (s.getBitPosition() + 112 > s.getBitCount()) return false;
     out.netId      = s.readUInt32();
-    out.typeHash   = s.readUInt16();
+    out.schemaHash = s.readUInt64();
     out.fieldCount = s.readUInt8();
     out.reserved   = s.readUInt8();
     return true;
 }
 
-void ReflectSerializer::writeEntitySpawn(BitStream& s, uint32_t netId, uint16_t typeHash) {
+void ReflectSerializer::writeEntitySpawn(BitStream& s, uint32_t netId, uint64_t schemaHash) {
     s.writeUInt32(netId);
-    s.writeUInt16(typeHash);
+    s.writeUInt64(schemaHash);
 }
 
-bool ReflectSerializer::readEntitySpawn(BitStream& s, uint32_t& netId, uint16_t& typeHash) {
-    if (s.getBitPosition() + 48 > s.getBitCount()) return false;
+bool ReflectSerializer::readEntitySpawn(BitStream& s, uint32_t& netId, uint64_t& schemaHash) {
+    if (s.getBitPosition() + 96 > s.getBitCount()) return false;
     netId    = s.readUInt32();
-    typeHash = s.readUInt16();
+    schemaHash = s.readUInt64();
     return true;
 }
 
@@ -221,43 +314,27 @@ bool ReflectSerializer::serializeObject(const ayt::reflect::ITypeInfo* type, con
                                          uint32_t netId, BitStream& s) {
     if (!type || !obj) return false;
 
-    uint32_t fieldCount = 0;
-    const uint32_t total = type->getFieldCount();
-
-    // Pre-scan: count supported NetReplicate fields. The wire fieldCount must
-    // reflect fields actually emitted, so unsupported types are skipped
-    // without incrementing.
-    for (uint32_t i = 0; i < total; ++i) {
-        const auto* field = type->getField(i);
-        if (!field) continue;
-        if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
-        WireTypeId wid;
-        if (!resolveWireTypeId(field->getType(), wid)) continue;
-        fieldCount++;
-    }
+    std::vector<const ayt::reflect::IFieldInfo*> fields;
+    if (!collectNetFields(type, fields)) return false;
+    const uint32_t fieldCount = static_cast<uint32_t>(fields.size());
 
     // Nothing to send — caller may skip broadcasting this entity.
     if (fieldCount == 0) return false;
 
-    const size_t typeHash = static_cast<size_t>(type->getId() & 0xFFFFu);
-    writeReplicationFrameHeader(s, netId, static_cast<uint16_t>(typeHash), static_cast<uint8_t>(fieldCount));
+    const uint64_t schemaHash = hashTypeSchema(type);
+    if (schemaHash == 0) return false;
+    writeReplicationFrameHeader(s, netId, schemaHash, static_cast<uint8_t>(fieldCount));
 
-    for (uint32_t i = 0; i < total; ++i) {
-        const auto* field = type->getField(i);
-        if (!field) continue;
-        if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
-
+    for (const auto* field : fields) {
         WireTypeId wid;
-        if (!resolveWireTypeId(field->getType(), wid)) {
-            continue;
-        }
+        if (!resolveWireTypeId(field->getType(), wid)) return false;
 
-        const uint16_t nameHash = hashFieldName(field->getName());
-        s.writeUInt16(nameHash);
+        const uint32_t nameHash = hashFieldName(field->getName());
+        s.writeUInt32(nameHash);
         s.writeUInt8(static_cast<uint8_t>(wid));
         // R3.2: writeWireValue handles 12..15 nested types recursively.
         // For 0..11 it delegates to writeFieldValue.
-        writeWireValue(s, wid, field->getType(), field->get(const_cast<void*>(obj)));
+        if (!writeWireValue(s, wid, field->getType(), field->get(const_cast<void*>(obj)))) return false;
     }
 
     return true;
@@ -268,12 +345,14 @@ bool ReflectSerializer::deserializeObject(const ayt::reflect::ITypeInfo* type, v
                                           FieldAppliedFn onFieldApplied) {
     if (!type || !obj) return false;
 
+    std::vector<const ayt::reflect::IFieldInfo*> netFields;
+    if (!collectNetFields(type, netFields)) return false;
     const uint32_t total = type->getFieldCount();
     for (uint8_t i = 0; i < expectedFieldCount; ++i) {
-        // Truncation guard: at least 3 bytes (u16 + u8) per record header.
-        if (s.getBitPosition() + 24 > s.getBitCount()) return false;
+        // Truncation guard: at least 5 bytes (u32 + u8) per record header.
+        if (s.getBitPosition() + 40 > s.getBitCount()) return false;
 
-        const uint16_t nameHash = s.readUInt16();
+        const uint32_t nameHash = s.readUInt32();
         const uint8_t  widByte  = s.readUInt8();
         const WireTypeId wid = static_cast<WireTypeId>(widByte);
 
@@ -287,6 +366,8 @@ bool ReflectSerializer::deserializeObject(const ayt::reflect::ITypeInfo* type, v
 
         if (!field) return false; // unknown field on this client build
         if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) return false;
+        WireTypeId expectedWid;
+        if (!resolveWireTypeId(field->getType(), expectedWid) || expectedWid != wid) return false;
 
         // R3.2: readWireValue handles 12..15 nested types recursively.
         // For 0..11 it delegates to readFieldValue.
@@ -361,32 +442,24 @@ bool ReflectSerializer::serializeDirtyFields(const ayt::reflect::ITypeInfo* type
     // For typical entity counts (a few per tick) and modest field counts
     // (≤32), this O(N+M) scan is cheaper than maintaining a side index.
     std::vector<const ayt::reflect::IFieldInfo*> netFields;
-    netFields.reserve(total);
-    for (uint32_t i = 0; i < total; ++i) {
-        const auto* f = type->getField(i);
-        if (!f) continue;
-        if (!f->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
-        WireTypeId wid;
-        if (!resolveWireTypeId(f->getType(), wid)) continue; // unsupported type → skip
-        netFields.push_back(f);
-    }
+    if (!collectNetFields(type, netFields)) return false;
 
     // Validate every requested dense index resolves to a supported field.
     for (uint32_t k = 0; k < fieldCount; ++k) {
         if (denseIndices[k] >= netFields.size()) return false;
     }
 
-    const size_t typeHash = static_cast<size_t>(type->getId() & 0xFFFFu);
-    writeReplicationFrameHeader(s, netId, static_cast<uint16_t>(typeHash),
-                                static_cast<uint8_t>(fieldCount));
+    const uint64_t schemaHash = hashTypeSchema(type);
+    if (schemaHash == 0) return false;
+    writeReplicationFrameHeader(s, netId, schemaHash, static_cast<uint8_t>(fieldCount));
 
     for (uint32_t k = 0; k < fieldCount; ++k) {
         const auto* field = netFields[denseIndices[k]];
         WireTypeId wid;
         resolveWireTypeId(field->getType(), wid); // already verified above
 
-        const uint16_t nameHash = hashFieldName(field->getName());
-        s.writeUInt16(nameHash);
+        const uint32_t nameHash = hashFieldName(field->getName());
+        s.writeUInt32(nameHash);
         s.writeUInt8(static_cast<uint8_t>(wid));
         // R3.2: writeWireValue handles 12..15 nested types recursively.
         writeWireValue(s, wid, field->getType(), field->get(const_cast<void*>(obj)));
@@ -426,20 +499,19 @@ uint8_t countNetReplicateFields(const ayt::reflect::ITypeInfo* type) {
 
 // Emit a single struct's NetReplicate fields recursively. Caller writes
 // [u16 nestedTypeHash][u8 fieldCount] before calling this.
-void serializeNestedStructFields(BitStream& s, const ayt::reflect::ITypeInfo* type, const void* obj) {
-    if (!type || !obj) return;
-    const uint32_t total = type->getFieldCount();
-    for (uint32_t i = 0; i < total; ++i) {
-        const auto* field = type->getField(i);
-        if (!field) continue;
-        if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) continue;
+bool serializeNestedStructFields(BitStream& s, const ayt::reflect::ITypeInfo* type, const void* obj) {
+    if (!type || !obj) return false;
+    std::vector<const ayt::reflect::IFieldInfo*> fields;
+    if (!collectNetFields(type, fields)) return false;
+    for (const auto* field : fields) {
         WireTypeId wid;
-        if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
-        const uint16_t nameHash = ReflectSerializer::hashFieldName(field->getName());
-        s.writeUInt16(nameHash);
+        if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) return false;
+        const uint32_t nameHash = ReflectSerializer::hashFieldName(field->getName());
+        s.writeUInt32(nameHash);
         s.writeUInt8(static_cast<uint8_t>(wid));
-        ReflectSerializer::writeWireValue(s, wid, field->getType(), field->get(const_cast<void*>(obj)));
+        if (!ReflectSerializer::writeWireValue(s, wid, field->getType(), field->get(const_cast<void*>(obj)))) return false;
     }
+    return true;
 }
 
 // Read [u8 fieldCount] then deserialize that many records into `obj`. Mirrors
@@ -449,8 +521,8 @@ bool deserializeNestedStructFields(const ayt::reflect::ITypeInfo* type, void* ob
     if (!type || !obj) return false;
     const uint32_t total = type->getFieldCount();
     for (uint8_t i = 0; i < expectedFieldCount; ++i) {
-        if (s.getBitPosition() + 24 > s.getBitCount()) return false;
-        const uint16_t nameHash = s.readUInt16();
+        if (s.getBitPosition() + 40 > s.getBitCount()) return false;
+        const uint32_t nameHash = s.readUInt32();
         const uint8_t  widByte  = s.readUInt8();
         const WireTypeId wid = static_cast<WireTypeId>(widByte);
 
@@ -461,6 +533,8 @@ bool deserializeNestedStructFields(const ayt::reflect::ITypeInfo* type, void* ob
         }
         if (!field) return false;
         if (!field->hasAttribute(ayt::reflect::FieldAttribute::NetReplicate)) return false;
+        WireTypeId expectedWid;
+        if (!ReflectSerializer::resolveWireTypeId(field->getType(), expectedWid) || expectedWid != wid) return false;
         if (!ReflectSerializer::readWireValue(s, wid, field->getType(), field->get(obj))) return false;
     }
     return true;
@@ -489,13 +563,13 @@ bool ReflectSerializer::writeWireValue(BitStream& s, WireTypeId wid,
 
         case WireTypeId::NestedStruct: {
             if (!type) return false;
-            // Wire prefix: [u16 nestedTypeHash][u8 fieldCount][records...]
-            const uint16_t nestedHash = static_cast<uint16_t>(type->getId() & 0xFFFFu);
+            // Wire prefix: [u64 schemaHash][u8 fieldCount][records...]
+            const uint64_t nestedHash = hashTypeSchema(type);
+            if (nestedHash == 0) return false;
             const uint8_t fc = countNetReplicateFields(type);
-            s.writeUInt16(nestedHash);
+            s.writeUInt64(nestedHash);
             s.writeUInt8(fc);
-            serializeNestedStructFields(s, type, fieldPtr);
-            return true;
+            return serializeNestedStructFields(s, type, fieldPtr);
         }
 
         case WireTypeId::FixedArray: {
@@ -589,15 +663,11 @@ bool ReflectSerializer::readWireValue(BitStream& s, WireTypeId wid,
 
         case WireTypeId::NestedStruct: {
             if (!type) return false;
-            // Wire prefix: [u16 nestedTypeHash][u8 fieldCount][records...]
-            if (s.getBitPosition() + 24 > s.getBitCount()) return false;
-            const uint16_t nestedHash = s.readUInt16();
+            // Validate before mutating any nested field.
+            if (s.getBitPosition() + 72 > s.getBitCount()) return false;
+            const uint64_t nestedHash = s.readUInt64();
             const uint8_t  fieldCount  = s.readUInt8();
-            // Look up nested type via the registry. R3.2 uses the
-            // expected type (passed in) directly — caller resolved it
-            // when reading the field's declared type. nestedHash is
-            // validated for debug/logging but not enforced here.
-            (void)nestedHash;
+            if (nestedHash == 0 || nestedHash != hashTypeSchema(type)) return false;
             return deserializeNestedStructFields(type, fieldPtr, s, fieldCount);
         }
 
