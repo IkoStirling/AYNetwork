@@ -8,6 +8,12 @@
 #include <vector>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
+
+// R5.3 (2026-08-24): IReplayRecorder lives in the AYReplay foundation
+// module; it transitively pulls in only <AYReplay/ReplayTypes.h> which
+// has no AYNetwork dependency — so we can safely include it here.
+#include <AYReplay/IReplayRecorder.h>
 
 namespace ayt::net
 {
@@ -23,6 +29,16 @@ class IReplicable;
 class INetworkExtension;
 class BitStream;
 class ReplicationManager;
+class SnapshotInterpolator;  // R5.0 forward declaration
+class ReflectSerializer;     // R5.2: AckTail re-uses ReflectSerializer::AckTail
+
+// R5.3 (2026-08-24): Replay recorder. We do NOT forward-declare
+// ayt::replay::IReplayRecorder here because doing so inside namespace
+// ayt::net creates `ayt::net::ayt::replay::IReplayRecorder`, which
+// collides with the real type once any consumer pulls in
+// <AYReplay/IReplayRecorder.h>. Same rationale as the comment below for
+// ayt::reflect::ITypeInfo. Callers must use the fully-qualified name
+// `::ayt::replay::IReplayRecorder*` (we cannot help it).
 
 // R3.0 (2026-07-27): ReplicationManager holds `const ayt::reflect::ITypeInfo*`.
 // We do NOT forward-declare ayt::reflect::ITypeInfo here — a forward
@@ -59,6 +75,17 @@ enum class ConnectionMode : uint8_t {
     Client,      // 连接到服务器
     Server,      // 监听服务器
     ListenServer // 监听服务器（也是客户端）
+};
+
+// R5.2 (2026-08-24): Per-entity proxy kind. Drives whether a ghost is
+// predicted (AutonomousProxy), interpolated (SimulatedProxy), or just
+// replicated. Default SimulatedProxy keeps R3-R5.1 behavior byte-for-byte.
+// Server kind is reserved for future use (e.g. server-only ghosts that
+// never replicate to clients).
+enum class ProxyKind : uint8_t {
+    Server           = 0,
+    AutonomousProxy  = 1,
+    SimulatedProxy   = 2,
 };
 
 // Hard runtime budgets for untrusted network input.  Defaults are deliberately
@@ -127,13 +154,14 @@ constexpr uint16_t kMsgTypeHandshake = 0xFFFF;
 constexpr uint16_t kMsgTypeApp       = 0;
 
 // R3.0 (2026-07-27): Replication msgType slots. Body format documented in
-// AYNetwork/Replication/AYNetwork/Replication/AYNetwork/Replication/ReflectSerializer.h. Sent over CHANNEL_RELIABLE via PacketCodec seal.
+// AYNetwork/Replication/ReflectSerializer.h. Sent over CHANNEL_RELIABLE via
+// PacketCodec seal.
 constexpr uint16_t kMsgTypeReplication  = 0x0001;  // server → clients: full snapshot of one registered entity
-constexpr uint16_t kMsgTypeEntitySpawn  = 0x0002;  // server → clients: register new replicated entity (carries typeHash)
+constexpr uint16_t kMsgTypeEntitySpawn  = 0x0002;  // server → clients: register entity (carries schemaHash)
 constexpr uint16_t kMsgTypeEntityDespawn = 0x0003;  // server → clients: unregister replicated entity
 
 // R3.1 (2026-07-27): Delta update msgType slot. Body wire format is identical
-// to kMsgTypeReplication (same 8B header + N field records) — the receiver
+// to kMsgTypeReplication (same 14B header + N field records) — the receiver
 // doesn't need to distinguish; deserialization uses the same path. The only
 // difference is which fields are included (only dirty ones, not all).
 constexpr uint16_t kMsgTypeDelta        = 0x0004;  // server → clients: dirty-fields-only delta update (R3.1)
@@ -161,6 +189,11 @@ constexpr uint16_t kMsgTypeRpcResponse  = 0x0011;
 constexpr uint16_t kMsgTypeRpcReject    = 0x0012;
 // R4.1-B: application-level ACK echo for RequiresAck frames (CHANNEL_ACK).
 constexpr uint16_t kMsgTypeAppAck       = 0x0013;
+// R5.2 (2026-08-24): per-connection client input batch (one msgType carries
+// N input records stacked contiguously). Body format documented in
+// AYNetwork/Prediction/ClientInputCodec.h. Sent client → server over
+// CHANNEL_UNRELIABLE for input traffic (loss tolerated; server reconciles).
+constexpr uint16_t kMsgTypeClientInput  = 0x0014;
 
 // R2: schema version stamped into every PacketHeader. Bump on breaking
 // wire-format changes (rare; major version bumps imply a parallel header
@@ -289,6 +322,13 @@ public:
     // RpcHandler in lock-step with the ReplicationManager). Returns the
     // same instance for the lifetime of the subsystem.
     virtual RpcHandler* getRpcHandler() = 0;
+
+    // R5.3 (2026-08-24): opt-in replay recorder. Pass nullptr to disable.
+    // Must be called from the main thread before listen()/connect() and
+    // before the first Egress tick. Internally forwarded to both the
+    // ReplicationManager and RpcHandler.
+    virtual void setReplayRecorder(ayt::replay::IReplayRecorder* rec) = 0;
+    virtual ayt::replay::IReplayRecorder* getReplayRecorder() const   = 0;
 };
 
 // =============================================================================
@@ -445,6 +485,11 @@ public:
     void resetForRead();
     size_t getBitPosition() const { return _bitPosition; }
     size_t getBitCount() const { return _bitCount; }
+    // R5.0 (2026-08-24): seek to a previously captured bit position. Used by
+    // the onReceive fallback path that probes both R5.0 (with prefix) and
+    // R3.x (no prefix) layouts before committing to one. Clamped to
+    // [0, getBitCount()] to keep callers safe.
+    void setBitPosition(size_t bits);
     void* getData() { return _data; }
     const void* getData() const { return _data; }
     size_t getSize() const { return (_bitCount + 7) / 8; }
@@ -488,9 +533,9 @@ public:
     // ---- R3.0 primary entry ----
     // Register an object for replication. `obj` must outlive the manager (or
     // until unregisterObject). `type` is the AYReflect ITypeInfo for T; use
-    // TypeRegistryImpl::findType<T>() to obtain. On the server this also
-    // broadcasts a kMsgTypeEntitySpawn frame to all clients so they allocate
-    // matching slots. On a client it just records the local mapping.
+    // TypeRegistryImpl::findType<T>() to obtain. On authority, tick() sends
+    // Spawn + Full independently to each newly visible peer. On a client this
+    // only records the local mapping.
     void registerObject(void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId);
     void unregisterObject(uint32_t netId);
 
@@ -513,7 +558,7 @@ public:
     //     field; emits a kMsgTypeDelta frame on CHANNEL_UNRELIABLE carrying
     //     ONLY the dirty fields. No frame is emitted if nothing changed.
     //   - forceReplicate(netId): the next tick after this call uses Full
-    //     Snapshot again (one-shot override via _initialized=false).
+    //     Snapshot again for every currently visible peer.
     //
     // On clients this is a no-op — the authority gate is enforced here
     // (§6.6 v1=Server 权威).
@@ -535,6 +580,17 @@ public:
     // Useful after a client reconnects, after a teleport, or after the user
     // explicitly changes a server-side field that all clients must observe.
     void forceReplicate(uint32_t netId);
+
+    // R5.1: tell the authority that `netId` teleported this tick. The next
+    // tick() emits a Full Snapshot with the kFlagTeleport flag set AND
+    // forces the per-peer init reset (so the Full is sent even when no
+    // fields are dirty). After emission the marker is cleared — callers
+    // that want a continuous teleport must call this every tick.
+    //
+    // Use this for: spawn resync, level transitions, position snapping,
+    // physics-driven hard cuts (ragdoll on, vehicle entry). Anything that
+    // would otherwise produce a visible lerp sweep across the world.
+    void markTeleported(uint32_t netId);
 
     // R3.1 debug: returns the count of dirty NetReplicate fields pending on
     // the next tick(). 0 means steady state (no frame will be emitted for
@@ -567,7 +623,7 @@ public:
     using BroadcastSink = std::function<void(uint8_t channel, const void* data, size_t size)>;
     void setBroadcastSinkForTesting(BroadcastSink sink) { _broadcastSink = std::move(sink); }
 
-    // R4.1-A: client-side EntitySpawn announcements (netId → typeHash) received
+    // R4.1-A: client-side EntitySpawn announcements (netId → schemaHash) received
     // from the authority. Game code calls registerObject after allocating the
     // local object; until then replicate frames for that netId are dropped.
     bool peekSpawnAnnouncement(uint32_t netId, uint64_t& schemaHashOut) const;
@@ -588,14 +644,125 @@ public:
     void setObjectLocation(uint32_t netId, NetVec3 location);
     bool getObjectLocation(uint32_t netId, NetVec3& out) const;
 
+    // R5.1 (teleport): debug/test seam. Returns true if `netId` currently
+    // has a pending teleport marker. Production code never calls this.
+    bool isTeleportPending(uint32_t netId) const {
+        return _teleportPending.count(netId) > 0;
+    }
+
+    // ---- R5.2 (2026-08-24) Client Prediction ----
+    // Authority-only: declares `netId` as client-owned (the client's
+    // AutonomousProxy predicts this ghost locally and uploads inputs).
+    // SimulatedProxy is the default — clients only interpolate.
+    // Calling on a client is a no-op (asserted via the comment; the
+    // setter still records the value but it has no wire effect).
+    void setObjectProxyKind(uint32_t netId, ProxyKind kind);
+    ProxyKind getObjectProxyKind(uint32_t netId) const;
+
+    // Sugar for game code: true on the locally-controlling client, false
+    // everywhere else. Equivalent to
+    //   getObjectProxyKind(id) == ProxyKind::AutonomousProxy && !isAuthority()
+    // but reads more naturally at the call site.
+    bool isLocallyControlled(uint32_t netId) const;
+
+    // Input ring capacity (default 32, drop-oldest). Matches SnapshotBuffer
+    // cap. Tests can shrink/extend to exercise overflow.
+    void     setInputRingCapacity(uint32_t cap) { _inputRingCapacity = cap; }
+    uint32_t getInputRingCapacity() const { return _inputRingCapacity; }
+
+    // Server-side: read-only peek of the last input seq that the server has
+    // acknowledged for `connectionId`. 0 means "no acks yet" or
+    // "unknown connection". Test-only surface.
+    uint32_t getLastAckedInputTick(uint32_t connectionId) const;
+
+    // Server-side: plug the gameplay-side input application callback. The
+    // callback is invoked once per consumed client input per fixed tick
+    // (FixedPrePhysics). Default is no-op.
+    // connectionId / inputSeq identify the record (one per client message);
+    // payload / payloadSize carry the opaque gameplay-decoded bytes.
+    using InputApplicationFn = std::function<void(uint32_t connectionId,
+                                                  uint32_t inputSeq,
+                                                  const uint8_t* payload,
+                                                  size_t payloadSize)>;
+    void setInputApplicationFn(InputApplicationFn fn) {
+        _inputApplicationFn = std::move(fn);
+    }
+
+    // Drives server-side consumption of queued client inputs for the
+    // current fixed tick. No-op on clients. Caller is the phased driver
+    // (AYNetworkSubSystem at FixedPrePhysics start).
+    void consumeClientInputs(uint32_t simTick);
+
+    // Server-side: receive a client input frame and queue it for the next
+    // consumeClientInputs. Called by the dispatch table when
+    // kMsgTypeClientInput arrives. Returns true on accept.
+    bool onClientInput(uint32_t connectionId,
+                       const uint8_t* body, size_t bodySize);
+
+    // Server-side: build an AckTail destined for `connectionId`. Returns
+    // AckTail{present=false} when no AutonomousProxy ghost owned by this
+    // connection is in the current frame, or when the manager isn't on
+    // the authority. Caller passes the result into the Full Snapshot
+    // emitter (ReflectSerializer::writeAckTail).
+    struct AckTailInfo {
+        uint32_t lastAckedInputTick = 0;
+        uint32_t serverCommandAge   = 0;
+        bool     present            = false;
+    };
+    AckTailInfo buildAckTailForConnection(uint32_t connectionId,
+                                          uint32_t serverCommandAge) const;
+
+    // Test seam: read-only access to the underlying prediction manager.
+    // Production code should not need this; tests use it to drive ring
+    // checks without going through the dispatch table.
+    class PredictionManager* getPredictionManagerForTesting() const { return _prediction; }
+
+    // ---- R5.0 Snapshot Interpolation ----
+    // Server side: tick(dt) increments an internal monotonic serverTick
+    // counter at the configured tick rate (default 30 Hz). The counter is
+    // stamped into every emitted Full Snapshot / Delta frame body so
+    // receivers can interpolate. Production callers invoke advanceServerTick
+    // once per frame; the accumulator carries the sub-tick fractional time
+    // so the count stays accurate when dtSec drifts.
+    void     setServerTickRate(double hz);
+    double   getServerTickRate() const { return _serverTickRate; }
+    void     advanceServerTick(double dtSec);
+    uint32_t getServerTick() const { return _serverTick; }
+    // Test-only seam: inject a deterministic tick value (used by tests to
+    // reproduce specific bracket positions). Production code paths never
+    // call this.
+    void     setServerTickForTesting(uint32_t t) { _serverTick = t; }
+
+    // Client side: hand the manager a SnapshotInterpolator instance so
+    // onReceive can push every successfully-deserialized snapshot into the
+    // interpolation buffer. The interpolator is externally owned (typically
+    // by the application or by INetworkSubSystem); lifetime must outlive
+    // the manager.
+    void setSnapshotInterpolator(SnapshotInterpolator* si);
+
 private:
     INetworkSubSystem* _network = nullptr;
     INetworkExtension* _extension = nullptr;
+    SnapshotInterpolator* _snapshotInterpolator = nullptr;  // R5.0 client sink
 
+public:
     // R4.1: authority gate. Server (dedicated) AND ListenServer (host) are
     // both server-authoritative. Returns true if the effective mode is one
-    // of those. Used by tick/spawn/despawn/register.
+    // of those. Promoted public in R5.3 (2026-08-24) so the Replay wire-tap
+    // hooks (NetworkReplayRecorderAdapter) can gate per-call; behavior is
+    // unchanged — callers outside this class are read-only observers.
     bool isAuthority() const;
+
+    // R5.3 (2026-08-24) Replay integration. Wire-tap hooks in tick()/register/
+    // unregister paths consult this pointer. Setting nullptr disables
+    // recording. Lifetime is managed by the caller (typically the subsystem);
+    // the recorder MUST outlive any tick that consults it. Foundation
+    // IReplayRecorder is included at file scope (line 14 of this header)
+    // so the unqualified name resolves to ::ayt::replay::IReplayRecorder.
+    void setReplayRecorder(ayt::replay::IReplayRecorder* r) { _replay = r; }
+    ayt::replay::IReplayRecorder* getReplayRecorder() const { return _replay; }
+
+private:
 
     std::vector<NetConnection*> buildInterestTargets(
         void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId,
@@ -613,10 +780,43 @@ private:
     float _interestRadius = 0.f;
     float _interestRadiusSq = 0.f;
 
+    // R5.0 server tick accounting. _serverTickAccumulator carries the
+    // sub-tick fractional time between calls so the tick count stays
+    // accurate even if dtSec drifts.
+    uint32_t _serverTick = 0;
+    double   _serverTickAccumulator = 0.0;
+    double   _serverTickRate = 30.0;
+
     // Forward-declared below; single map shared by both register paths.
     struct ReflectedEntry;
     std::unordered_map<uint32_t, ReflectedEntry> _objects;
     std::unordered_map<uint32_t, uint64_t>        _spawnAnnouncements;
+
+    // R5.1 (teleport): per-netId one-shot marker set by markTeleported().
+    // tick() drains the set: each marked netId emits a Full Snapshot with
+    // the kFlagTeleport flag and the marker is removed.
+    std::unordered_set<uint32_t> _teleportPending;
+
+    // R5.2 (2026-08-24) prediction scaffolding.
+    // Per-netId ProxyKind. Default SimulatedProxy keeps R3-R5.1 byte behavior.
+    std::unordered_map<uint32_t, ProxyKind> _proxyKinds;
+    // Default input ring capacity (32, drop-oldest). Mutable via
+    // setInputRingCapacity (test seam).
+    uint32_t _inputRingCapacity = 32;
+    // Server-side: per-connection last-acked input seq, copied out into Full
+    // Snapshot ack tail bytes. Cleared by the prediction manager on ack.
+    std::unordered_map<uint32_t, uint32_t> _lastAckedInputTick;
+    // Gameplay-side callback wired by the application; called once per
+    // consumed client input per fixed tick. Default no-op keeps server-only
+    // tests (no app) green.
+    InputApplicationFn _inputApplicationFn;
+    // Owns per-connection input rings + per-ghost predicted state. Set in
+    // the ctor; tests may swap via setPredictionManagerForTesting.
+    class PredictionManager* _prediction = nullptr;
+
+    // R5.3 (2026-08-24): Replay recorder pointer (non-owning). See public
+    // setter above for lifetime contract.
+    ayt::replay::IReplayRecorder* _replay = nullptr;
 };
 
 #if defined(AYNETWORK_BUILD_TESTS)

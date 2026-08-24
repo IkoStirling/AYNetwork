@@ -13,6 +13,8 @@
 #include <AYNetwork/Protocol/PacketCodec.h>
 #include <AYNetwork/Transport/GnsConnection.h>
 
+#include <AYReplay/IReplayRecorder.h>
+
 #include <AYReflect/IReflect.h>
 #include <AYReflect/ReflectRegistry.h>
 
@@ -551,19 +553,44 @@ bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream
         channel, /*flags=*/ 0, /*timestampMs=*/ 0, compress);
     if (_broadcastSink) {
         _broadcastSink(channel, sealed.data(), sealed.size());
-        return true;
-    }
-    if (!_network) return false;
-    if (target) {
+    } else if (!_network) {
+        return false;
+    } else if (target) {
         _network->sendEncodedTo(target, channel, sealed.data(), sealed.size());
-        return true;
+    } else {
+        const ConnectionMode mode = getEffectiveMode();
+        if (mode == ConnectionMode::Client) {
+            _network->sendEncoded(channel, sealed.data(), sealed.size());
+        } else {
+            _network->broadcastEncoded(channel, sealed.data(), sealed.size());
+        }
     }
-    const ConnectionMode mode = getEffectiveMode();
-    if (mode == ConnectionMode::Client) {
-        _network->sendEncoded(channel, sealed.data(), sealed.size());
-        return true;
+
+    // R5.3 (2026-08-24) Replay wire-tap: capture every outbound RPC.
+    // Payload layout: [u16 msgType][u32 connectionId][u32 bodyLen][bytes...].
+    // We pack here rather than going through the adapter so the emit
+    // path stays free of the adapter header (which would create a
+    // header cycle: NetworkReplayRecorderAdapter.h → INetwork.h → ...).
+    if (_replay) {
+        std::vector<uint8_t> hdrBuf(10 + bodyLen);
+        hdrBuf[0] = static_cast<uint8_t>(envelopeMsgType & 0xFF);
+        hdrBuf[1] = static_cast<uint8_t>((envelopeMsgType >> 8) & 0xFF);
+        const uint32_t targetConn = target ? target->getId() : 0u;
+        hdrBuf[2] = static_cast<uint8_t>(targetConn & 0xFF);
+        hdrBuf[3] = static_cast<uint8_t>((targetConn >> 8) & 0xFF);
+        hdrBuf[4] = static_cast<uint8_t>((targetConn >> 16) & 0xFF);
+        hdrBuf[5] = static_cast<uint8_t>((targetConn >> 24) & 0xFF);
+        const uint32_t blen = static_cast<uint32_t>(bodyLen);
+        hdrBuf[6] = static_cast<uint8_t>(blen & 0xFF);
+        hdrBuf[7] = static_cast<uint8_t>((blen >> 8) & 0xFF);
+        hdrBuf[8] = static_cast<uint8_t>((blen >> 16) & 0xFF);
+        hdrBuf[9] = static_cast<uint8_t>((blen >> 24) & 0xFF);
+        if (bodyLen > 0 && bodyBytes) {
+            std::memcpy(hdrBuf.data() + 10, bodyBytes, bodyLen);
+        }
+        _replay->recordEvent(/*tick=*/ 0, /*type=*/ 0x10006u /*kEvtNet_RpcBatch*/,
+                             hdrBuf.data(), hdrBuf.size());
     }
-    _network->broadcastEncoded(channel, sealed.data(), sealed.size());
     return true;
 }
 

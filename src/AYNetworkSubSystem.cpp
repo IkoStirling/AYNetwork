@@ -8,6 +8,11 @@
 #include <AYNetwork/Protocol/PacketCodec.h>
 #include <AYNetwork/RPC/RpcHandler.h>
 #include <AYNetwork/Transport/NetConnectionImpl.h>
+// R5.3 (2026-08-24): Replay wire-tap hooks. Use forward declaration + the
+// foundation interface only so we don't pull NetworkReplayRecorderAdapter.h
+// (which includes INetwork.h → would create a cycle).
+#include <AYReplay/IReplayRecorder.h>
+#include <AYNetwork/Replay/NetworkReplayTypes.h>
 // R1.A (2026-07-27): pull in EResult + AcceptConnection signature. The
 // GnsConnection.cpp TU-private includes are sufficient because s_gns is a
 // fully-typed pointer in this TU — we just need the constants.
@@ -112,6 +117,14 @@ public:
             pumpTransport();
             _stagedIngress = false;
         } else if (phase == ::ayt::game::FramePhase::FixedPrePhysics) {
+            // R5.2 (2026-08-24): drain queued client inputs first so the
+            // gameplay-side application callback fires before any
+            // replicated state arrives in the same tick. The order
+            // matters: the prediction loop runs predict→apply→read
+            // snapshot, and the snapshot deserialization (drainSimulationInbound)
+            // delivers server-authoritative state last. consumeClientInputs
+            // is server-side only; clients no-op.
+            _replicationManager.consumeClientInputs(static_cast<uint32_t>(context.simTick));
             // Apply packets assigned to this simulation tick once. All data
             // observed at this frame's Ingress belongs before its first
             // catch-up tick and is never replayed by later catch-up ticks.
@@ -120,6 +133,11 @@ public:
         } else if (phase == ::ayt::game::FramePhase::Egress) {
             // Observe the completed World state when producing replication.
             _replicationManager.tick(context.deltaTime);
+            // R5.3 (2026-08-24): flush replay recorder at end-of-tick so
+            // every captured frame is durable before the next tick starts.
+            if (auto* rec = _replicationManager.getReplayRecorder()) {
+                rec->flush();
+            }
         }
     }
 
@@ -320,15 +338,73 @@ public:
                                 size_t bodySize) {
         BitStream bodyStream(body, bodySize);
         bodyStream.resetForRead();
+        // R5.3 (2026-08-24) Replay wire-tap: server-only inbound capture.
+        // We pack payloads locally here so we don't need the adapter header
+        // (which would cycle back through INetwork.h). The recorder is
+        // opted-in; when not present, every call short-circuits.
+        ayt::replay::IReplayRecorder* rec = _replicationManager.getReplayRecorder();
+        const bool isAuth = _replicationManager.isAuthority();
+        const uint32_t fromId = from ? from->getId() : 0u;
         switch (messageType) {
         case kMsgTypeRpcRequest:
             (void)_rpcHandler.onRpcRequest(bodyStream, from);
+            if (rec && isAuth && body && bodySize > 0) {
+                std::vector<uint8_t> hdr(10 + bodySize);
+                hdr[0] = static_cast<uint8_t>(messageType & 0xFF);
+                hdr[1] = static_cast<uint8_t>((messageType >> 8) & 0xFF);
+                hdr[2] = static_cast<uint8_t>(fromId & 0xFF);
+                hdr[3] = static_cast<uint8_t>((fromId >> 8) & 0xFF);
+                hdr[4] = static_cast<uint8_t>((fromId >> 16) & 0xFF);
+                hdr[5] = static_cast<uint8_t>((fromId >> 24) & 0xFF);
+                const uint32_t blen = static_cast<uint32_t>(bodySize);
+                hdr[6] = static_cast<uint8_t>(blen & 0xFF);
+                hdr[7] = static_cast<uint8_t>((blen >> 8) & 0xFF);
+                hdr[8] = static_cast<uint8_t>((blen >> 16) & 0xFF);
+                hdr[9] = static_cast<uint8_t>((blen >> 24) & 0xFF);
+                std::memcpy(hdr.data() + 10, body, bodySize);
+                rec->recordEvent(_replicationManager.getServerTick(), ayt::net::replay::kEvtNet_RpcBatch,
+                                 hdr.data(), hdr.size());
+            }
             break;
         case kMsgTypeRpcResponse:
             (void)_rpcHandler.onRpcResponse(bodyStream, from);
+            if (rec && isAuth && body && bodySize > 0) {
+                std::vector<uint8_t> hdr(10 + bodySize);
+                hdr[0] = static_cast<uint8_t>(messageType & 0xFF);
+                hdr[1] = static_cast<uint8_t>((messageType >> 8) & 0xFF);
+                hdr[2] = static_cast<uint8_t>(fromId & 0xFF);
+                hdr[3] = static_cast<uint8_t>((fromId >> 8) & 0xFF);
+                hdr[4] = static_cast<uint8_t>((fromId >> 16) & 0xFF);
+                hdr[5] = static_cast<uint8_t>((fromId >> 24) & 0xFF);
+                const uint32_t blen = static_cast<uint32_t>(bodySize);
+                hdr[6] = static_cast<uint8_t>(blen & 0xFF);
+                hdr[7] = static_cast<uint8_t>((blen >> 8) & 0xFF);
+                hdr[8] = static_cast<uint8_t>((blen >> 16) & 0xFF);
+                hdr[9] = static_cast<uint8_t>((blen >> 24) & 0xFF);
+                std::memcpy(hdr.data() + 10, body, bodySize);
+                rec->recordEvent(_replicationManager.getServerTick(), ayt::net::replay::kEvtNet_RpcBatch,
+                                 hdr.data(), hdr.size());
+            }
             break;
         case kMsgTypeRpcReject:
             (void)_rpcHandler.onRpcReject(bodyStream, from);
+            if (rec && isAuth && body && bodySize > 0) {
+                std::vector<uint8_t> hdr(10 + bodySize);
+                hdr[0] = static_cast<uint8_t>(messageType & 0xFF);
+                hdr[1] = static_cast<uint8_t>((messageType >> 8) & 0xFF);
+                hdr[2] = static_cast<uint8_t>(fromId & 0xFF);
+                hdr[3] = static_cast<uint8_t>((fromId >> 8) & 0xFF);
+                hdr[4] = static_cast<uint8_t>((fromId >> 16) & 0xFF);
+                hdr[5] = static_cast<uint8_t>((fromId >> 24) & 0xFF);
+                const uint32_t blen = static_cast<uint32_t>(bodySize);
+                hdr[6] = static_cast<uint8_t>(blen & 0xFF);
+                hdr[7] = static_cast<uint8_t>((blen >> 8) & 0xFF);
+                hdr[8] = static_cast<uint8_t>((blen >> 16) & 0xFF);
+                hdr[9] = static_cast<uint8_t>((blen >> 24) & 0xFF);
+                std::memcpy(hdr.data() + 10, body, bodySize);
+                rec->recordEvent(_replicationManager.getServerTick(), ayt::net::replay::kEvtNet_RpcBatch,
+                                 hdr.data(), hdr.size());
+            }
             break;
         case kMsgTypeReplication:
         case kMsgTypeDelta:
@@ -336,6 +412,36 @@ public:
         case kMsgTypeEntityDespawn:
             (void)_replicationManager.onReceive(messageType, bodyStream, from);
             break;
+        case kMsgTypeClientInput: {
+            // R5.2 (2026-08-24): per-connection client input frame. Pass the
+            // raw body straight to ReplicationManager which delegates into
+            // its PredictionManager (decoded by ClientInputCodec). The
+            // manager is server-only; on a client this case drops silently.
+            (void)_replicationManager.onClientInput(fromId, body, bodySize);
+            // R5.3 (2026-08-24): record the authoritative input frame so
+            // playback can re-evaluate prediction during v2 deterministic
+            // replay. We re-derive inputSeq/serverTickAtSend by header
+            // inspection when the codec length matches; otherwise we
+            // record a fixed placeholder tick (serverTickAtSend = 0).
+            if (rec && isAuth && body && bodySize > 0) {
+                // ClientInputCodec::encode emits [u32 inputSeq][u32 serverTickAtSend][bytes].
+                uint32_t inputSeq = 0, serverTickAtSend = 0;
+                if (bodySize >= 8) {
+                    std::memcpy(&inputSeq,        body + 0, 4);
+                    std::memcpy(&serverTickAtSend, body + 4, 4);
+                }
+                std::vector<uint8_t> inBuf(16 + bodySize);
+                std::memcpy(inBuf.data() +  0, &fromId,            4);
+                std::memcpy(inBuf.data() +  4, &inputSeq,          4);
+                std::memcpy(inBuf.data() +  8, &serverTickAtSend,  4);
+                const uint32_t blen = static_cast<uint32_t>(bodySize);
+                std::memcpy(inBuf.data() + 12, &blen,              4);
+                std::memcpy(inBuf.data() + 16, body,               bodySize);
+                rec->recordEvent(_replicationManager.getServerTick(), ayt::net::replay::kEvtNet_InputBatch,
+                                 inBuf.data(), inBuf.size());
+            }
+            break;
+        }
         default:
             break;
         }
@@ -708,6 +814,17 @@ public:
     // ===== Replication =====
     ReplicationManager* getReplicationManager() override {
         return &_replicationManager;
+    }
+
+    // R5.3 (2026-08-24): opt-in replay recorder. Forwarded to the
+    // replication manager (which guards by isAuthority()) and to the RPC
+    // handler (which captures outbound RPCs).
+    void setReplayRecorder(ayt::replay::IReplayRecorder* rec) override {
+        _replicationManager.setReplayRecorder(rec);
+        _rpcHandler.setReplayRecorder(rec);
+    }
+    ayt::replay::IReplayRecorder* getReplayRecorder() const override {
+        return _replicationManager.getReplayRecorder();
     }
 
     // ===== R4.0 RPC =====

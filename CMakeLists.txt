@@ -17,6 +17,13 @@ set(SRC_FILES
     src/Replication/ReplicationSystem.cpp
     src/Replication/ReflectSerializer.cpp
     src/RPC/RpcHandler.cpp
+    src/Snapshot/NetworkTime.cpp
+    src/Snapshot/SnapshotBuffer.cpp
+    src/Snapshot/SnapshotInterpolator.cpp
+    src/Prediction/InputRing.cpp                # R5.2 (2026-08-24)
+    src/Prediction/PredictionManager.cpp       # R5.2
+    src/Prediction/MispredictionResolver.cpp   # R5.2
+    src/Replay/NetworkReplayRecorderAdapter.cpp  # R5.3 (2026-08-24)
 )
 
 # R1 (2026-07-26): wire up GameNetworkingSockets via vcpkg. See design.md §14.
@@ -37,6 +44,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
     AYGameLoop
     AYStorage                              # R2: Lz4Decompressor (decode side)
     AYReflect                              # R3.0: ITypeInfo + FieldAttribute::NetReplicate walk
+    AYReplay                               # R5.3 (2026-08-24): IReplayRecorder interface
     GameNetworkingSockets::GameNetworkingSockets   # R1: GNS shared variant
     lz4::lz4                               # R2: PacketCodec encode side
 )
@@ -74,7 +82,10 @@ target_include_directories(${MODULE_NAME} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Replication
     ${CMAKE_CURRENT_SOURCE_DIR}/include/RPC
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Transport
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Snapshot
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Prediction   # R5.2 (2026-08-24)
     ${CMAKE_CURRENT_SOURCE_DIR}/interface
+    ${CMAKE_CURRENT_SOURCE_DIR}/interface/AYNetwork/Replay  # R5.3 (2026-08-24)
     ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE
 )
