@@ -409,6 +409,33 @@ public:
         StatePlusProfiler = 1, // includes profiler counters
     };
     virtual uint64_t computeStateHash(HashKind /*kind*/ = HashKind::StateOnly) { return 0; }
+
+    // R6.5-3 (2026-08-25): replay-pump bridge seam. `tickRecordedEvent`
+    // is invoked by an external `NetworkReplayEventDecoder` driver to
+    // feed a single recorded event (in its raw adapter pack layout —
+    // see `NetworkReplayRecorderAdapter`) into the live subsystem. The
+    // implementation strips the adapter-prefix bytes and routes to the
+    // matching live seam (ReplicationManager::onReceive / onClientInput /
+    // setObjectProxyKind, RpcHandler::onRpcXxx). The default impl is a
+    // no-op so existing test stubs that inherit `INetworkSubSystem`
+    // don't need to override it. Production (`AYNetworkSubSystem`) wires
+    // the demux table at src/AYNetworkSubSystem.cpp.
+    //
+    // `installReplayRngSeed` is a companion seam for the replay
+    // pump: when a deterministic replay session installs an RNG seed
+    // (recorded in ReplayFileHeader.randomSeed) the live subsystem can
+    // latch it for future RngApi consumers. Today this is a stub — R7
+    // will route through `TransportFaultController::setSessionSeed`.
+    // `hasReplayRngSeed` / `getReplayRngSeed` are read-back accessors so
+    // tests can verify the recorded seed round-tripped through the
+    // subsystem. Default impls return false / 0 so test stubs stay
+    // non-abstract.
+    virtual void tickRecordedEvent(uint32_t /*eventType*/,
+                                   const uint8_t* /*payload*/,
+                                   size_t /*size*/) {}
+    virtual void installReplayRngSeed(uint64_t /*seed*/) {}
+    virtual bool     hasReplayRngSeed() const { return false; }
+    virtual uint64_t getReplayRngSeed() const { return 0; }
 };
 
 // =============================================================================

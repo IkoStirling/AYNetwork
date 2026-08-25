@@ -891,6 +891,179 @@ public:
         return &_replicationManager;
     }
 
+    // R6.5-3 (2026-08-25): replay-pump bridge. The recorded event arrives
+    // in the same byte layout that `NetworkReplayRecorderAdapter` wrote
+    // (see interface/AYNetwork/Replay/NetworkReplayRecorderAdapter.cpp
+    // for the per-event prefix sizes). The bridge strips the adapter
+    // prefix and routes the remaining body to the matching live seam:
+    //
+    //   kEvtNet_InitialFullSnapshot → _replicationManager.onReceive(kMsgTypeReplication, ...)
+    //   kEvtNet_DeltaSnapshot       → _replicationManager.onReceive(kMsgTypeDelta, ...)
+    //   kEvtNet_Spawn               → _replicationManager.onReceive(kMsgTypeEntitySpawn, ...)
+    //   kEvtNet_Despawn             → _replicationManager.onReceive(kMsgTypeEntityDespawn, ...)
+    //   kEvtNet_InputBatch          → _replicationManager.onClientInput(connectionId, body, len)
+    //   kEvtNet_RpcBatch            → _rpcHandler.onRpcRequest / onRpcResponse / onRpcReject
+    //                                  (demuxed on the recorded messageType)
+    //   kEvtNet_AuthorityChange     → _replicationManager.setObjectProxyKind(netId, newKind)
+    //
+    // `from` is null — replay events originate from the recording, not a
+    // live GnsConnection. Predicted-input records and Snapshot/Deltahave
+    // no transport peer, so we use nullptr here.
+    void tickRecordedEvent(uint32_t eventType,
+                           const uint8_t* payload,
+                           size_t size) override {
+        if (!payload && size != 0) return;
+        using ayt::net::replay::kEvtNet_AuthorityChange;
+        using ayt::net::replay::kEvtNet_DeltaSnapshot;
+        using ayt::net::replay::kEvtNet_Despawn;
+        using ayt::net::replay::kEvtNet_InitialFullSnapshot;
+        using ayt::net::replay::kEvtNet_InputBatch;
+        using ayt::net::replay::kEvtNet_RpcBatch;
+        using ayt::net::replay::kEvtNet_Spawn;
+
+        switch (eventType) {
+        case kEvtNet_InitialFullSnapshot: {
+            // Prefix: [u32 connId][u8 frameFlags]; body follows.
+            if (size < 5) return;
+            const uint8_t* body = payload + 5;
+            const size_t   bodySize = size - 5;
+            BitStream stream(const_cast<uint8_t*>(body), bodySize);
+            stream.resetForRead();
+            (void)_replicationManager.onReceive(kMsgTypeReplication, stream, nullptr);
+            return;
+        }
+        case kEvtNet_DeltaSnapshot: {
+            if (size < 5) return;
+            const uint8_t* body = payload + 5;
+            const size_t   bodySize = size - 5;
+            BitStream stream(const_cast<uint8_t*>(body), bodySize);
+            stream.resetForRead();
+            (void)_replicationManager.onReceive(kMsgTypeDelta, stream, nullptr);
+            return;
+        }
+        case kEvtNet_Spawn: {
+            // Prefix: [u32 connId][u32 netId][u64 schemaHash]; body follows.
+            if (size < 16) return;
+            const uint8_t* body = payload + 16;
+            const size_t   bodySize = size - 16;
+            BitStream stream(const_cast<uint8_t*>(body), bodySize);
+            stream.resetForRead();
+            (void)_replicationManager.onReceive(kMsgTypeEntitySpawn, stream, nullptr);
+            return;
+        }
+        case kEvtNet_Despawn: {
+            // Prefix: [u32 connId][u32 netId]; no body.
+            if (size < 8) return;
+            const uint32_t netId =
+                static_cast<uint32_t>(payload[4])        |
+                (static_cast<uint32_t>(payload[5]) <<  8) |
+                (static_cast<uint32_t>(payload[6]) << 16) |
+                (static_cast<uint32_t>(payload[7]) << 24);
+            uint8_t netIdBuf[4] = {
+                static_cast<uint8_t>(netId        & 0xFF),
+                static_cast<uint8_t>((netId >>  8) & 0xFF),
+                static_cast<uint8_t>((netId >> 16) & 0xFF),
+                static_cast<uint8_t>((netId >> 24) & 0xFF),
+            };
+            BitStream stream(netIdBuf, sizeof(netIdBuf));
+            stream.resetForRead();
+            (void)_replicationManager.onReceive(kMsgTypeEntityDespawn, stream, nullptr);
+            return;
+        }
+        case kEvtNet_InputBatch: {
+            // Prefix: [u32 connId][u32 inputSeq][u32 serverTickAtSend][u32 payloadLen]; body follows.
+            if (size < 16) return;
+            const uint32_t connId =
+                static_cast<uint32_t>(payload[0])        |
+                (static_cast<uint32_t>(payload[1]) <<  8) |
+                (static_cast<uint32_t>(payload[2]) << 16) |
+                (static_cast<uint32_t>(payload[3]) << 24);
+            const uint32_t declaredLen =
+                static_cast<uint32_t>(payload[12])        |
+                (static_cast<uint32_t>(payload[13]) <<  8) |
+                (static_cast<uint32_t>(payload[14]) << 16) |
+                (static_cast<uint32_t>(payload[15]) << 24);
+            const size_t avail = (size > 16) ? (size - 16) : 0;
+            const size_t take  = (declaredLen <= avail) ? declaredLen : avail;
+            (void)_replicationManager.onClientInput(connId, payload + 16, take);
+            return;
+        }
+        case kEvtNet_RpcBatch: {
+            // Prefix: [u16 messageType][u32 connId][u32 bodyLen]; body follows.
+            if (size < 10) return;
+            const uint16_t msgType =
+                static_cast<uint16_t>(payload[0])        |
+                (static_cast<uint16_t>(payload[1]) <<  8);
+            const uint32_t declaredLen =
+                static_cast<uint32_t>(payload[6])        |
+                (static_cast<uint32_t>(payload[7]) <<  8) |
+                (static_cast<uint32_t>(payload[8]) << 16) |
+                (static_cast<uint32_t>(payload[9]) << 24);
+            const size_t avail = (size > 10) ? (size - 10) : 0;
+            const size_t take  = (declaredLen <= avail) ? declaredLen : avail;
+            // Build a BitStream over the recorded body and route to the
+            // matching RPC handler. The body is captured as a side buffer
+            // because the decoder's payload pointer outlives this scope.
+            std::vector<uint8_t> body(take);
+            if (take > 0) std::memcpy(body.data(), payload + 10, take);
+            BitStream stream(body.data(), body.size());
+            stream.resetForRead();
+            switch (msgType) {
+            case kMsgTypeRpcRequest:
+                (void)_rpcHandler.onRpcRequest(stream, nullptr);
+                return;
+            case kMsgTypeRpcResponse:
+                (void)_rpcHandler.onRpcResponse(stream, nullptr);
+                return;
+            case kMsgTypeRpcReject:
+                (void)_rpcHandler.onRpcReject(stream, nullptr);
+                return;
+            default:
+                // Unknown RPC envelope kind — drop silently. R7 may surface
+                // a counter for diagnostics.
+                return;
+            }
+        }
+        case kEvtNet_AuthorityChange: {
+            // Prefix: [u32 netId][u8 oldKind][u8 newKind][u32 connId][u32 reserved].
+            if (size < 10) return;
+            const uint32_t netId =
+                static_cast<uint32_t>(payload[0])        |
+                (static_cast<uint32_t>(payload[1]) <<  8) |
+                (static_cast<uint32_t>(payload[2]) << 16) |
+                (static_cast<uint32_t>(payload[3]) << 24);
+            const uint8_t newKind = payload[5];
+            _replicationManager.setObjectProxyKind(
+                netId, static_cast<ProxyKind>(newKind));
+            return;
+        }
+        default:
+            // Foundation events (SessionBegin/SessionEnd/TextMarker) and
+            // future adapter event types in the AYNetwork range are
+            // intentionally dropped here — they are session-level markers,
+            // not per-tick state mutations.
+            return;
+        }
+    }
+
+    // R6.5-3 (2026-08-25): RNG seed install seam. The v2 replay player
+    // exposes `ReplayFileHeader.randomSeed` so a deterministic playback
+    // can latch the seed for downstream RNG consumers (RngApi, fault
+    // controller, RPC tie-break). Today this is a stub field; R7 will
+    // route through `TransportFaultController::setSessionSeed` and
+    // surface a public accessor.
+    void installReplayRngSeed(uint64_t seed) override {
+        _replayRngSeed = seed;
+        _replayRngSeedSet = true;
+    }
+
+    // R6.5-3 (2026-08-25): read-back accessors for the bridge state. The
+    // tests assert the recorded seed round-trips through the subsystem
+    // without going through a live RNG yet. `override` matches the
+    // virtuals on INetworkSubSystem.
+    bool     hasReplayRngSeed() const override { return _replayRngSeedSet; }
+    uint64_t getReplayRngSeed() const override { return _replayRngSeed; }
+
     // Wire the profiler hooks into ReplicationManager, RpcHandler, and any
     // GnsConnections that exist at the time of call. New connections built
     // later (connectNow / adoptIncomingClient) call hookGnsConnection()
@@ -1039,6 +1212,13 @@ private:
     // calls stay free of FNV mix details. Iteration is in sorted-key order
     // so the hash is bitwise stable across runs / compilers.
     uint64_t computeStateHashInternal(bool includeProfiler);
+
+    // R6.5-3 (2026-08-25): replay-pump RNG seed stub. Captured via
+    // installReplayRngSeed() so the recorded seed can be inspected by
+    // tests; full propagation into TransportFaultController /
+    // prediction RNG is R7+.
+    uint64_t _replayRngSeed    = 0;
+    bool     _replayRngSeedSet = false;
 };
 
 // 注册宏 — may be stripped from static libs; callers should also invoke
