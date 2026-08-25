@@ -175,6 +175,8 @@ These block state-equal replay. Fix all before claiming determinism.
 - **Fix category:** Deterministic ID — translation layer between AYNetwork netId and a per-recording stable ordinal.
 - **Effort:** 2 days. Requires v2 player-side remap.
 - **Note:** The v1 player is a stub (`readNextEvent` returns `NotImplemented`); this finding is forward-looking.
+- **R6.5-2 status (2026-08-25):** **FIXED.** `NetworkReplayEventDecoder::decodeNext` consults a `ConnectionIdRemap` (keyed by recorded `connectionId`) on every kEvtNet_* payload and substitutes the live id on output. Missing keys fall back to the literal id and append to `unmappedIds` for diagnostics. The R6 C5 stable allocation scheme (B-09 / `allocateNetId(acceptOrdinal, slotOrdinal)`) means the recorded id IS the accept-order ordinal, so the remap is identity when record and playback accept order match — and that is the dominant production case. R7+ may add full automatic translation for cross-server replay.
+- **R6.5-3 status (2026-08-25):** Bridge consumer landed — `NetworkSubSystem::tickRecordedEvent` is the live seam that drives replay-decoded events into `ReplicationManager::onReceive` / `onClientInput` / `setObjectProxyKind` / `RpcHandler::onRpcXxx`. End-to-end replay pump is now functional.
 
 ### B-11. `RpcAsyncPool` 2-thread worker pool dispatches user callbacks in OS order
 - **File:** `src/RPC/RpcHandler.cpp:102-110, 112-127, 129-135, 163-201, 206-208, 412-413, 648-681`
@@ -521,7 +523,9 @@ These are either single-process deterministic, observability-only, or covered by
 
 **R6.0 ship status:** ALL FIVE ITEMS GREEN. Engine pointer bump for C9 pending.
 
-**R6.5 (deferred):** v2 player `B-10` full remap table; AYEntity / AYPhysics cross-module determinism (out of scope per user 2026-08-25).
+**R6.5 ship status (2026-08-25):** `B-10` FIXED via the v2 player remap (`NetworkReplayEventDecoder::decodeNext`) and the pump bridge (`NetworkSubSystem::tickRecordedEvent`). Three commits (R6.5-1 foundation player, R6.5-2 decoder, R6.5-3 bridge) — engine pointer bump for `dd2fdec` pending.
+
+**R6.6+ (deferred):** AYEntity / AYPhysics cross-module determinism (out of scope per user 2026-08-25); full automatic accept-order translation for cross-server replay; snapshot deserialization / state restoration through the foundation checkpoint payload.
 
 ---
 
