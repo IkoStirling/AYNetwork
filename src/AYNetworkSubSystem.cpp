@@ -21,6 +21,7 @@
 #include <steam/steamclientpublic.h>
 #include <steam/isteamnetworkingsockets.h>
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -874,6 +875,22 @@ public:
         _profiler.setDumpEveryTicks(ticks);
     }
 
+    // R6 C9 (2026-08-25): state-equal hashing. FNV-1a 64-bit over the
+    // observable, post-decode state — replication objects (bytewise), the
+    // sorted set of pending RPC callIds, the current server tick, and the
+    // per-connection acknowledged-sequence cursors. HashKind::StatePlusProfiler
+    // also folds in profiler counter totals so tests can opt into stricter
+    // assertions when profiling is exercised in the same run.
+    uint64_t computeStateHash(HashKind kind) override {
+        return computeStateHashInternal(kind == HashKind::StatePlusProfiler);
+    }
+
+    // R6 C9 (2026-08-25): override the virtual test seam declared on
+    // INetworkSubSystem — see `interface/AYNetwork/INetwork.h`.
+    ReplicationManager* getReplicationManagerForTesting() override {
+        return &_replicationManager;
+    }
+
     // Wire the profiler hooks into ReplicationManager, RpcHandler, and any
     // GnsConnections that exist at the time of call. New connections built
     // later (connectNow / adoptIncomingClient) call hookGnsConnection()
@@ -1016,6 +1033,12 @@ private:
     size_t _simulationInboundBytes = 0;
     uint64_t _ingressTargetSimTick = 0;
     bool _stagedIngress = false;
+
+    // R6 C9 (2026-08-25): state-equal hashing — see computeStateHash().
+    // Implemented out-of-line below the class so the member functions it
+    // calls stay free of FNV mix details. Iteration is in sorted-key order
+    // so the hash is bitwise stable across runs / compilers.
+    uint64_t computeStateHashInternal(bool includeProfiler);
 };
 
 // 注册宏 — may be stripped from static libs; callers should also invoke
@@ -1046,5 +1069,88 @@ INetworkSubSystem* createNetworkSubSystemForTest() {
     return new NetworkSubSystem();
 }
 #endif
+
+// =============================================================================
+// R6 C9 (2026-08-25): state-equal hash helper. Out-of-line to keep the
+// class body focused on subsystem state. FNV-1a 64-bit (offset basis
+// 0xCBF29CE484222325; prime 0x100000001B3). Order-independent on the keys
+// it iterates (per-connection cursors are summed in netId order so the
+// hash is bitwise stable across runs).
+// =============================================================================
+namespace {
+
+constexpr uint64_t kFnv1aOffsetBasis = 0xCBF29CE484222325ULL;
+constexpr uint64_t kFnv1aPrime        = 0x100000001B3ULL;
+
+inline void fnv1aMix(uint64_t& h, const void* data, size_t bytes) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < bytes; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= kFnv1aPrime;
+    }
+}
+
+inline void fnv1aMixU32(uint64_t& h, uint32_t v) {
+    fnv1aMix(h, &v, sizeof(v));
+}
+
+inline void fnv1aMixU64(uint64_t& h, uint64_t v) {
+    fnv1aMix(h, &v, sizeof(v));
+}
+
+} // anonymous namespace
+
+uint64_t NetworkSubSystem::computeStateHashInternal(bool includeProfiler) {
+    uint64_t h = kFnv1aOffsetBasis;
+
+    // Server tick — fold the timeline first so two recordings of
+    // identical play at different baseline ticks differ.
+    fnv1aMixU32(h, _replicationManager.getServerTick());
+    // Server tick rate (double; bit-cast to uint64 for stable folding
+    // across compilers). Even though the value is configured at
+    // startup, two recordings that installed different rates would
+    // diverge here.
+    fnv1aMixU64(h, std::bit_cast<uint64_t>(_replicationManager.getServerTickRate()));
+
+    // Replication objects: pull the bytewise snapshot for every registered
+    // netId in sorted order. The records are bitwise-stable because the
+    // BitStream write paths use round-half-up (R6 C7) and the iteration
+    // here is sorted.
+    std::vector<uint32_t> netIds = _replicationManager.knownNetIdsForHash();
+    std::sort(netIds.begin(), netIds.end());
+    for (uint32_t n : netIds) {
+        fnv1aMixU32(h, n);
+        std::vector<uint8_t> bytes;
+        if (_replicationManager.serializeObjectForHash(n, bytes)) {
+            fnv1aMix(h, bytes.data(), bytes.size());
+        }
+    }
+
+    // Pending RPC call ids (sorted).
+    std::vector<uint64_t> rpcKeys = _rpcHandler.pendingCallIdsForHash();
+    std::sort(rpcKeys.begin(), rpcKeys.end());
+    for (uint64_t k : rpcKeys) fnv1aMixU64(h, k);
+
+    // Per-connection ack cursors (sorted by netId).
+    std::vector<uint32_t> ackKeys = _replicationManager.ackedSeqKeysForHash();
+    std::sort(ackKeys.begin(), ackKeys.end());
+    for (uint32_t n : ackKeys) {
+        fnv1aMixU32(h, n);
+        fnv1aMixU32(h, _replicationManager.ackedSeqForHash(n));
+    }
+
+    // Profiler counter totals (opt-in).
+    if (includeProfiler) {
+        std::vector<uint32_t> pkeys = _profiler.connectionKeysForHash();
+        std::sort(pkeys.begin(), pkeys.end());
+        for (uint32_t n : pkeys) {
+            fnv1aMixU32(h, n);
+            fnv1aMixU64(h, _profiler.cumulativeSendForHash(n));
+            fnv1aMixU64(h, _profiler.cumulativeRecvForHash(n));
+        }
+    }
+
+    return h;
+}
 
 } // namespace ayt::net

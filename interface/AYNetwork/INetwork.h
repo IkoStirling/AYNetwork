@@ -384,6 +384,31 @@ public:
     virtual void setProfilerSinkForTesting(
         std::function<void(const ProfilerSnapshot&)> /*sink*/) {}
     virtual void setProfilerDumpInterval(uint32_t /*ticks*/) {}
+
+    // R6 C9 (2026-08-25): test seam — direct access to the underlying
+    // ReplicationManager so the state-equal test suite can populate the
+    // object registry without going through a real GNS-driven broadcast.
+    // Default null impl keeps test stubs that don't need it non-abstract.
+    // Production code never calls this.
+    virtual ReplicationManager* getReplicationManagerForTesting() { return nullptr; }
+
+    // R6 C9 (2026-08-25): determinism contract — a single 64-bit hash that
+    // captures the observable state of the network subsystem after every
+    // public mutation. State-equal hashing: two runs with identical
+    // inputs (clock seam, RNG seed, RPC calls, replicated bytes) MUST
+    // produce identical hashes; failures of byte-equal wire records are
+    // acceptable as long as the post-decode state matches.
+    //
+    // Default impl returns 0 so existing test stubs that inherit
+    // `INetworkSubSystem` don't need to override it. Production
+    // (`AYNetworkSubSystem`) overrides with an FNV-1a 64-bit mix over
+    // `_objects` reflected bytes + `_pendingCalls` keys + the current
+    // `_serverTick` + per-connection `_ackedSeq` cursors + `_nextFragmentId`.
+    enum class HashKind : uint8_t {
+        StateOnly       = 0, // replication + cursors (default)
+        StatePlusProfiler = 1, // includes profiler counters
+    };
+    virtual uint64_t computeStateHash(HashKind /*kind*/ = HashKind::StateOnly) { return 0; }
 };
 
 // =============================================================================
@@ -794,6 +819,27 @@ public:
     // by the application or by INetworkSubSystem); lifetime must outlive
     // the manager.
     void setSnapshotInterpolator(SnapshotInterpolator* si);
+
+    // R6 C9 (2026-08-25): state-equal hash helpers. Read-only views onto
+    // the replicated-object registry. `knownNetIdsForHash` returns the
+    // set of registered netIds (callers sort for deterministic order).
+    // `serializeObjectForHash` writes the current reflected byte payload
+    // for `netId` into `out` and returns true on success; false means
+    // netId isn't registered, has no type info, or no longer has live
+    // memory. Both are public so the state-hash implementation can live
+    // outside this class without friending the implementation site.
+    std::vector<uint32_t> knownNetIdsForHash() const;
+    bool serializeObjectForHash(uint32_t netId, std::vector<uint8_t>& out) const;
+
+    // R6 C9 (2026-08-25): per-connection last-acked-input cursor (server-side
+    // only — clients always read 0). Returns the set of connectionIds that
+    // have ever had an input acknowledged, and the value each one is at.
+    // The state-equal hash folds (connectionId, lastAckedSeq) pairs in
+    // sorted connectionId order so two recordings of identical play
+    // produce the same hash regardless of the connection-accept order
+    // (connectionId itself is stable per C5 B-10 stub).
+    std::vector<uint32_t> ackedSeqKeysForHash() const;
+    uint32_t             ackedSeqForHash(uint32_t connectionId) const;
 
 private:
     INetworkSubSystem* _network = nullptr;

@@ -1155,4 +1155,57 @@ ReplicationManager::buildAckTailForConnection(uint32_t connectionId,
     return info;
 }
 
+// =============================================================================
+// R6 C9 (2026-08-25): state-equal hash helpers.
+// =============================================================================
+
+std::vector<uint32_t> ReplicationManager::knownNetIdsForHash() const {
+    // R6 C2: _objects is std::map<uint32_t, ReflectedEntry>, sorted by netId.
+    // We hand back the keys directly (caller sorts for cross-map safety,
+    // though here the natural order matches).
+    std::vector<uint32_t> out;
+    out.reserve(_objects.size());
+    for (const auto& [n, _] : _objects) {
+        (void)_;
+        out.push_back(n);
+    }
+    return out;
+}
+
+bool ReplicationManager::serializeObjectForHash(uint32_t netId,
+                                               std::vector<uint8_t>& out) const {
+    auto it = _objects.find(netId);
+    if (it == _objects.end()) return false;
+    const ReflectedEntry& entry = it->second;
+    if (!entry.obj || !entry.type) return false;
+    // Serialize with serverTick=0 / flags=0 so the hash depends only on
+    // the object's reflected byte payload (and the netId, which the caller
+    // already mixes in). Field quantization paths from R6 C7 make this
+    // bitwise-stable across compilers.
+    BitStream body;
+    if (!ReflectSerializer::serializeObject(entry.type, entry.obj, netId,
+                                            body, /*serverTick=*/ 0, /*flags=*/ 0)) {
+        return false;
+    }
+    const size_t bytes = body.getSize();
+    out.resize(bytes);
+    if (bytes > 0) std::memcpy(out.data(), body.getData(), bytes);
+    return true;
+}
+
+std::vector<uint32_t> ReplicationManager::ackedSeqKeysForHash() const {
+    std::vector<uint32_t> out;
+    out.reserve(_lastAckedInputTick.size());
+    for (const auto& [cid, _] : _lastAckedInputTick) {
+        (void)_;
+        out.push_back(cid);
+    }
+    return out;
+}
+
+uint32_t ReplicationManager::ackedSeqForHash(uint32_t connectionId) const {
+    auto it = _lastAckedInputTick.find(connectionId);
+    return it != _lastAckedInputTick.end() ? it->second : 0u;
+}
+
 } // namespace ayt::net

@@ -270,6 +270,22 @@ public:
     using ReplayTickSource = std::function<uint32_t()>;
     void setReplayTickSource(ReplayTickSource src) { _replayTickSource = std::move(src); }
 
+    // R6 C9 (2026-08-25): state-equal hash helper. Returns the set of
+    // callIds that currently have a pending callback (caller sorts for
+    // cross-iteration determinism). Excludes the deadline metadata
+    // deliberately — wall-clock timing would defeat the cross-run
+    // determinism guarantee. Only the callId set matters for state-equal
+    // replay.
+    std::vector<uint64_t> pendingCallIdsForHash() const {
+        std::vector<uint64_t> out;
+        out.reserve(_pendingCalls.size());
+        for (const auto& [k, _] : _pendingCalls) {
+            (void)_;
+            out.push_back(k);
+        }
+        return out;
+    }
+
     // ===== Registry access (for tests + downstream RpcSerializer callers) =====
     //
     // Map of methodHash(FNV-1a-32 low-16) → IMethodInfo for every

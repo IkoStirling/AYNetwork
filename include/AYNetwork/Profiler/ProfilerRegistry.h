@@ -78,6 +78,37 @@ public:
     using ConnAccessor = std::function<void(uint32_t connNetId, const GnsConnection*& out)>;
     void setConnAccessorForTesting(ConnAccessor accessor) { _connAccessor = std::move(accessor); }
 
+    // R6 C9 (2026-08-25): state-equal hash helpers. Read-only accessors
+    // for the cumulative per-connection byte totals. `connectionKeysForHash`
+    // returns the netIds currently known to the profiler; the corresponding
+    // `cumulativeSendForHash` / `cumulativeRecvForHash` return 0 for unknown
+    // netIds (defensive). Both cumulative counters are std::atomic<uint64_t>;
+    // we use relaxed loads here because the state-hash consumer is
+    // single-thread (subsystem main thread) and the cumulative counters don't
+    // need cross-thread synchronization beyond what the network thread's
+    // fetch_add already provides.
+    std::vector<uint32_t> connectionKeysForHash() const {
+        std::vector<uint32_t> out;
+        out.reserve(_conns.size());
+        for (const auto& [k, _] : _conns) {
+            (void)_;
+            out.push_back(k);
+        }
+        return out;
+    }
+    uint64_t cumulativeSendForHash(uint32_t connNetId) const {
+        auto it = _conns.find(connNetId);
+        return it != _conns.end()
+            ? it->second.cumulativeSend.load(std::memory_order_relaxed)
+            : 0ull;
+    }
+    uint64_t cumulativeRecvForHash(uint32_t connNetId) const {
+        auto it = _conns.find(connNetId);
+        return it != _conns.end()
+            ? it->second.cumulativeRecv.load(std::memory_order_relaxed)
+            : 0ull;
+    }
+
 private:
     struct ConnState {
         // Windowed (reset by tickWindow).

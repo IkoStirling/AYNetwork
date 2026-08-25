@@ -40,6 +40,7 @@ set(CORE_SRC_FILES
     AYTest_PerNetId.cpp                # R5.5
     AYTest_RttAndCongestion.cpp        # R5.5
     AYTest_ProfilerSubsystem.cpp       # R5.5
+    AYTest_StateEqual.cpp              # R6 C9 (2026-08-25)
 )
 
 add_executable(${MODULE_NAME} ${CORE_SRC_FILES})
