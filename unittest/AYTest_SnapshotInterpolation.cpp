@@ -12,7 +12,7 @@
 //   9. SnapshotBufferOutOfOrderPush     — older pushes insert, no eviction
 //  10. SnapshotInterpolatorEndToEnd     — full pipeline with reflected ghost
 //  11. SnapshotInterpolatorUnregister   — unregisterGhost drops the buffer
-//  12. SnapshotInterpolatorMixed        — mixed lerp/snap falls back to snap-to-lower
+//  12. SnapshotInterpolatorMixed        — per-field lerp with non-float hold
 //  13. ReplicationManagerTickStamps     — tick() emits u32 serverTick prefix
 //  14. WireCompatibilityZeroTick        — serverTick=0 keeps R3.x layout (no prefix)
 //  15. WireWithServerTickPrefixRoundTrip — explicit tick round-trips through the body
@@ -324,11 +324,9 @@ TEST_CASE(SnapshotInterpolatorUnregister) {
 
 TEST_CASE(SnapshotInterpolatorMixedSnapToLower) {
     ayt::test::setCurrentCase("SnapshotInterpolatorMixedSnapToLower");
-    // GhostStateMachine: int32_t state + float progress. When the field
-    // set is MIXED (lerpable + non-lerpable), the implementation falls
-    // back to bytewise snap-to-lower (Unreal/Unity convention) — integer
-    // transitions never blend mid-tick. We verify state stays at the
-    // lower bracket across the bracket pair.
+    // GhostStateMachine: int32_t state + float progress. The integer holds
+    // the lower bracket while the float is interpolated by its real field
+    // address (including the non-zero offset after state).
     const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<GhostStateMachine>();
     CHECK(type != nullptr);
 
@@ -343,11 +341,10 @@ TEST_CASE(SnapshotInterpolatorMixedSnapToLower) {
     interp.push(7, 10, &b);
 
     GhostStateMachine out{};
-    // Sample at midpoint. The mixed-field fallback should pick the
-    // lower bracket for both fields → state=1, progress=0.0.
+    // Sample at midpoint: state holds lower; progress lerps to 0.5.
     CHECK(interp.sample(7, 5.0/30.0, &out));
     CHECK_INT_EQ(out.state, 1);
-    CHECK(out.progress == 0.0f);
+    CHECK(out.progress == 0.5f);
 }
 
 // R5.1: a teleport snapshot in the buffer forces sample() to snap to the

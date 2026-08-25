@@ -22,5 +22,8 @@ constexpr uint32_t kEvtNet_DeltaSnapshot       = 0x10004u;
 constexpr uint32_t kEvtNet_InputBatch          = 0x10005u;
 constexpr uint32_t kEvtNet_RpcBatch            = 0x10006u;
 constexpr uint32_t kEvtNet_AuthorityChange     = 0x10007u;
+// Synthetic playback-only event emitted by NetworkReplayEventDecoder for a
+// foundation checkpoint. It is not written as a normal replay event.
+constexpr uint32_t kEvtNet_Checkpoint          = 0x10008u;
 
 } // namespace ayt::net::replay

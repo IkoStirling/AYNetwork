@@ -130,6 +130,7 @@ public:
     bool   tryGetPredictedBytes(uint32_t netId, std::vector<uint8_t>& out) const;
     uint64_t getLayoutHash(uint32_t netId) const;
     void   setLayoutHash(uint32_t netId, uint64_t h);
+    uint32_t lastPredictedInputSeq(uint32_t netId) const;
 
 private:
     uint32_t _ringCapacity;

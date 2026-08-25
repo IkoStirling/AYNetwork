@@ -5,13 +5,26 @@
 namespace ayt::net
 {
 
+void TransportFaultController::setSessionSeed(uint64_t seed) {
+    _sessionSeed = seed != 0 ? seed : kDefaultSessionSeed;
+    // Re-seat profiles that inherit the session seed. Explicit per-profile
+    // seeds remain untouched.
+    for (const auto& [netId, profile] : _profiles) {
+        if (profile.randomSeed != 0) continue;
+        _rngs.erase(netId);
+        _rngs.emplace(std::piecewise_construct,
+                      std::forward_as_tuple(netId),
+                      std::forward_as_tuple(_sessionSeed));
+    }
+}
+
 void TransportFaultController::setProfile(uint32_t netId,
                                           const TransportFaultProfile& profile,
                                           uint64_t sessionSeed) {
     _profiles[netId] = profile;
     const uint64_t seed = profile.randomSeed != 0
                         ? profile.randomSeed
-                        : (sessionSeed != 0 ? sessionSeed : kDefaultSessionSeed);
+                        : (sessionSeed != 0 ? sessionSeed : _sessionSeed);
     // std::mt19937_64 is not copy-assignable but is default-constructible,
     // so we re-seat the RNG in place via a fresh engine.
     _rngs.erase(netId);

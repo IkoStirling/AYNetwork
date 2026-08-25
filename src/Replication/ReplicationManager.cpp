@@ -3,6 +3,7 @@
 #include <AYNetwork/Replication/ReplicationManager.h>
 
 #include <AYNetwork/Replication/ReflectSerializer.h>
+#include <algorithm>
 #include <map>
 #include <AYNetwork/Snapshot/SnapshotInterpolator.h>
 #include <AYNetwork/Protocol/PacketCodec.h>
@@ -10,6 +11,7 @@
 #include <AYNetwork/INetwork.h>
 
 #include <AYNetwork/Prediction/PredictionManager.h>
+#include <AYNetwork/Prediction/MispredictionResolver.h>
 
 #include <AYReplay/IReplayRecorder.h>
 #include <AYNetwork/Replay/NetworkReplayTypes.h>
@@ -155,12 +157,12 @@ inline void packU32LE(uint8_t* dst, uint32_t v) {
 void recordFullSnapshot(ayt::replay::IReplayRecorder* rec,
                         uint32_t connectionId, uint32_t serverTick,
                         uint8_t frameFlags,
-                        const uint8_t* sealedPayload, size_t size) {
+                        const uint8_t* bodyPayload, size_t size) {
     if (!rec) return;
     std::vector<uint8_t> buf(5 + size);
     packU32LE(buf.data(), connectionId);
     buf[4] = frameFlags;
-    if (size > 0 && sealedPayload) std::memcpy(buf.data() + 5, sealedPayload, size);
+    if (size > 0 && bodyPayload) std::memcpy(buf.data() + 5, bodyPayload, size);
     rec->recordEvent(serverTick, ayt::net::replay::kEvtNet_InitialFullSnapshot,
                      buf.data(), buf.size());
 }
@@ -168,12 +170,12 @@ void recordFullSnapshot(ayt::replay::IReplayRecorder* rec,
 void recordDeltaSnapshot(ayt::replay::IReplayRecorder* rec,
                          uint32_t connectionId, uint32_t serverTick,
                          uint8_t frameFlags,
-                         const uint8_t* sealedPayload, size_t size) {
+                         const uint8_t* bodyPayload, size_t size) {
     if (!rec) return;
     std::vector<uint8_t> buf(5 + size);
     packU32LE(buf.data(), connectionId);
     buf[4] = frameFlags;
-    if (size > 0 && sealedPayload) std::memcpy(buf.data() + 5, sealedPayload, size);
+    if (size > 0 && bodyPayload) std::memcpy(buf.data() + 5, bodyPayload, size);
     rec->recordEvent(serverTick, ayt::net::replay::kEvtNet_DeltaSnapshot,
                      buf.data(), buf.size());
 }
@@ -349,6 +351,8 @@ void ReplicationManager::unregisterObject(uint32_t netId) {
         }
     }
     _objects.erase(it);
+    _proxyKinds.erase(netId);
+    _proxyOwnerConnections.erase(netId);
     // R5.0: drop the interpolator's per-ghost state too so we don't keep
     // an orphaned ring around. Safe even when the interpolator is null.
     if (_snapshotInterpolator) _snapshotInterpolator->unregisterGhost(netId);
@@ -385,7 +389,7 @@ void ReplicationManager::registerObject(IReplicable* obj, uint32_t netId) {
         // R5.3 (2026-08-24) Replay wire-tap: legacy broadcast EntitySpawn.
         recordSpawn(_replay, /*connectionId=*/ 0, _serverTick,
                     netId, /*schemaHash=*/ 0,
-                    sealed.data(), sealed.size());
+                    static_cast<const uint8_t*>(body.getData()), body.getSize());
     }
 }
 
@@ -525,7 +529,8 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                 // EntitySpawn. connectionId is per-peer (not 0).
                 recordSpawn(_replay, connectionId, _serverTick,
                             netId, ReflectSerializer::hashTypeSchema(e.type),
-                            spawnWire.data(), spawnWire.size());
+                            static_cast<const uint8_t*>(spawnBody.getData()),
+                            spawnBody.getSize());
                 // R5.5 (2026-08-25) profiler hook — EntitySpawn bytes.
                 if (_profilerHook) {
                     _profilerHook(connectionId, kMsgTypeEntitySpawn,
@@ -566,7 +571,8 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                     // normal) is preserved for v2 playback.
                     recordFullSnapshot(_replay, connectionId, _serverTick,
                                        frameFlags,
-                                       fullWire.data(), fullWire.size());
+                                       static_cast<const uint8_t*>(fullBody.getData()),
+                                       fullBody.getSize());
                     // R5.5 (2026-08-25) profiler hook — Full Snapshot.
                     if (_profilerHook) {
                         _profilerHook(connectionId, kMsgTypeReplication,
@@ -601,7 +607,8 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                 // R5.3 (2026-08-24) Replay wire-tap: capture Delta frame.
                 recordDeltaSnapshot(_replay, connectionId, _serverTick,
                                     /*frameFlags=*/ 0,
-                                    deltaWire.data(), deltaWire.size());
+                                    static_cast<const uint8_t*>(deltaBody.getData()),
+                                    deltaBody.getSize());
                 // R5.5 (2026-08-25) profiler hook — Delta frame.
                 if (_profilerHook) {
                     _profilerHook(connectionId, kMsgTypeDelta,
@@ -736,6 +743,53 @@ bool ReplicationManager::onReceive(uint16_t messageType, BitStream& stream, NetC
                 _prediction->onServerAck(hdr.netId,
                                          ackTail.lastAckedInputTick,
                                          ackTail.serverCommandAge);
+
+                // Reconcile the opaque predicted copy against the freshly
+                // decoded authoritative object. Field offsets are derived
+                // through reflection accessors on the live object, avoiding
+                // legacy getOffset()==0 metadata.
+                std::vector<uint8_t> predictedBytes;
+                if (_prediction->tryGetPredictedBytes(hdr.netId, predictedBytes)
+                    && type->getSize() != 0) {
+                    std::vector<uint8_t> serverBytes(type->getSize());
+                    std::memcpy(serverBytes.data(), obj, serverBytes.size());
+                    ResolverLayout layout;
+                    const auto objectBase = reinterpret_cast<uintptr_t>(obj);
+                    for (uint32_t i = 0; i < type->getFieldCount(); ++i) {
+                        const auto* field = type->getField(i);
+                        if (!field) continue;
+                        const void* rawFieldPtr = field->get(obj);
+                        if (!rawFieldPtr) continue;
+                        const auto fieldAddress = reinterpret_cast<uintptr_t>(rawFieldPtr);
+                        if (fieldAddress < objectBase) continue;
+                        const size_t offset = static_cast<size_t>(fieldAddress - objectBase);
+                        if (!field->getType()) continue;
+                        const size_t fieldSize = field->getType()->getSize();
+                        if (offset > serverBytes.size() ||
+                            fieldSize > serverBytes.size() - offset) continue;
+                        WireTypeId wireType;
+                        if (!ReflectSerializer::resolveWireTypeId(field->getType(), wireType)) continue;
+                        ResolverField rf;
+                        rf.name = field->getName();
+                        rf.byteOffset = static_cast<uint32_t>(offset);
+                        rf.byteSize = static_cast<uint32_t>(fieldSize);
+                        rf.numericKind = wireType == WireTypeId::Float ? 1u
+                            : (wireType == WireTypeId::Double ? 2u : 0u);
+                        rf.netReplicate = field->hasAttribute(
+                            ayt::reflect::FieldAttribute::NetReplicate);
+                        rf.serverAuthoritative = field->hasAttribute(
+                            ayt::reflect::FieldAttribute::ServerAuthoritative);
+                        layout.fields.push_back(rf);
+                    }
+                    (void)MispredictionResolver::reconcile(
+                        predictedBytes, serverBytes, layout,
+                        _prediction->lastPredictedInputSeq(hdr.netId),
+                        ackTail.lastAckedInputTick,
+                        static_cast<float>(1.0 / std::max(1.0, _serverTickRate)),
+                        0.1f);
+                    _prediction->setPredictedBytes(
+                        hdr.netId, predictedBytes.data(), predictedBytes.size());
+                }
             }
 
             // R5.0: hand the freshly-decoded object to the interpolator so
@@ -890,9 +944,10 @@ bool ReplicationManager::rebroadcastEntitySpawn(uint32_t netId, NetConnection* t
         // R5.3 (2026-08-24) Replay wire-tap: rebroadcast EntitySpawn.
         recordSpawn(_replay, connectionId, _serverTick,
                     netId, ReflectSerializer::hashTypeSchema(e.type),
-                    sealed.data(), sealed.size());
+                    static_cast<const uint8_t*>(body.getData()), body.getSize());
         recordFullSnapshot(_replay, connectionId, _serverTick, /*frameFlags=*/ 0,
-                           fullWire.data(), fullWire.size());
+                           static_cast<const uint8_t*>(fullBody.getData()),
+                           fullBody.getSize());
         // R5.5 (2026-08-25) profiler hook — rebroadcast Spawn + Full.
         if (_profilerHook) {
             _profilerHook(connectionId, kMsgTypeEntitySpawn,
@@ -1052,11 +1107,17 @@ void ReplicationManager::setSnapshotInterpolator(SnapshotInterpolator* si) {
 // setObjectProxyKind after registration. The setter is a no-op when the
 // netId isn't registered — prevents typos from creating phantom rows.
 // =============================================================================
-void ReplicationManager::setObjectProxyKind(uint32_t netId, ProxyKind kind) {
+void ReplicationManager::setObjectProxyKind(uint32_t netId, ProxyKind kind,
+                                            uint32_t ownerConnectionId) {
     auto it = _objects.find(netId);
     if (it == _objects.end()) return; // only valid for registered ghosts
     const ProxyKind old = getObjectProxyKind(netId);
     _proxyKinds[netId] = kind;
+    if (kind == ProxyKind::AutonomousProxy && ownerConnectionId != 0) {
+        _proxyOwnerConnections[netId] = ownerConnectionId;
+    } else {
+        _proxyOwnerConnections.erase(netId);
+    }
 
     // R5.3 (2026-08-24) Replay wire-tap: capture Ownership/Authority flips.
     // Authority gate is implicit — this method is meaningful on both
@@ -1068,11 +1129,7 @@ void ReplicationManager::setObjectProxyKind(uint32_t netId, ProxyKind kind) {
         packU32LE(buf + 0, netId);
         buf[4] = static_cast<uint8_t>(old);
         buf[5] = static_cast<uint8_t>(kind);
-        // connectionId field: we don't track per-kind owning conn here
-        // (would require expanding ReflectedEntry); emit 0 for the
-        // common "no specific owner" case. Future: plumb in the owning
-        // connection when setObjectProxyKind gains that parameter.
-        packU32LE(buf + 6, /*connectionId=*/ 0);
+        packU32LE(buf + 6, ownerConnectionId);
         buf[10] = buf[11] = buf[12] = buf[13] = 0;
         _replay->recordEvent(_serverTick,
                              ayt::net::replay::kEvtNet_AuthorityChange,
@@ -1135,14 +1192,14 @@ ReplicationManager::buildAckTailForConnection(uint32_t connectionId,
                                               uint32_t serverCommandAge) const {
     AckTailInfo info;
     if (!isAuthority()) return info; // present=false default
-    // Only emit the tail if at least one AutonomousProxy ghost is
-    // registered on the manager (server-side gating). Per-connection
-    // ownership metadata is intentionally not tracked in R5.2 — would
-    // require an extra map. Heuristic: any AutonomousProxy ghost ⇒ emit
-    // tail; clients ignore unknown tails safely.
+    // Emit only when this connection owns an AutonomousProxy ghost.
     bool ownsAutonomous = false;
     for (const auto& kv : _proxyKinds) {
         if (kv.second != ProxyKind::AutonomousProxy) continue;
+        auto owner = _proxyOwnerConnections.find(kv.first);
+        if (owner == _proxyOwnerConnections.end() || owner->second != connectionId) {
+            continue;
+        }
         ownsAutonomous = true;
         break;
     }

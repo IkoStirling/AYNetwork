@@ -109,11 +109,7 @@ bool SnapshotInterpolator::registerGhostKind(uint32_t netId,
         // (see how ReflectSerializer calls hashFieldName etc.). We check
         // for it dynamically via the field API. If absent, offset stays 0
         // and we fall back to field->get(obj) per sample.
-        spec.offset = 0;        // initial; set below if available
-        // We do NOT have a generic offset API exposed by the public
-        // IFieldInfo surface used here; left at 0 means "ask via
-        // field->get(obj)". The sample() loop handles both paths.
-        (void)field;
+        spec.field = field;
         g.fields.push_back(spec);
     }
 
@@ -216,117 +212,40 @@ bool SnapshotInterpolator::sample(uint32_t netId, double renderTimeSec, void* ou
         return true;
     }
     if (lowerIsSnap) {
-        // out already has lower bracket bytes from the memcpy below.
+        std::memcpy(out, aBuf.data(), g.recordBytes);
         return true;
     }
 
-    // Per-field blend. We don't know each field's exact byte offset
-    // through the public AYReflect surface used here; in practice the
-    // R3.0/R3.1 reflected structs are POD-ish and the records were
-    // bytewise-copied verbatim, so reading them as primitives at the
-    // offsets we DO know is incorrect. The robust path is:
-    //   - For Float/Double fields we use the bytewise snapshot records
-    //     IF we have an offset. We don't here, so we lerp across the WHOLE
-    //     bytewise blob's reinterpreted Float/Double pairs at the field
-    //     offset.
-    //
-    // To keep this implementation correct without a per-field offset API,
-    // we approximate: we treat the records as opaque bytes and run per-
-    // field lerp by reading sizeof(field) bytes from aBuf/bBuf at the
-    // offset the FieldInterpSpec claims.
-    //
-    // The caller is responsible for giving us offsets that line up with
-    // the wire record's byte layout. R5.0 ships with the bytewise
-    // recordBytes buffer for the WHOLE struct, so we leave the spec's
-    // offset field as a hint for future per-field extension (R5.1+).
-    //
-    // For now: with offset=0 (the only thing we can populate), we still
-    // produce a valid result by memcpy'ing the lower bracket into out and
-    // then overlaying lerped floats at byte 0 IF the first field is a
-    // Float/Double. That's degenerate, but it makes the interpolation
-    // contract testable end-to-end.
-    //
-    // The "correct" full-field offset API arrives with the next AYReflect
-    // release; in the meantime, the bytewise sample() on the buffer gives
-    // a coherent bytewise result, and per-field lerp for the common
-    // single-float "transform" case below.
-
+    // Start from the lower bracket, then blend each lerpable reflected
+    // field. Resolve the field address on the real output object and use its
+    // object-relative offset to read the byte snapshots. This supports
+    // accessor-backed/inherited fields without invoking typed accessors on
+    // raw storage where no object lifetime has begun.
     std::memcpy(out, aBuf.data(), g.recordBytes);
-
-    if (g.fields.empty()) return true;
-
-    // Common single-float-per-ghost fast path (the typical R5.0 use case:
-    // an entity's only NetReplicate field is a `NetVec3` transform whose
-    // x/y are floats). If the first field is a Float or Double, lerp it
-    // across the whole struct width so the caller gets a smooth position.
-    if (g.fields.size() == 1 && (g.fields[0].lerpable)) {
-        const size_t off = g.fields[0].offset; // 0 in our current spec
-        const size_t sz  = g.fields[0].sizeBytes;
-        if (off + sz <= g.recordBytes) {
-            if (sz == 4) {
-                // R6 C7 H-05: alpha is clamped to [0,1] before use
-                // (see earlier), but the lerp stays in float math — IEEE-754
-                // guarantees identical results across compilers for any
-                // fixed alpha + operand pair. Bit-determinism holds when
-                // the input buffers are bit-identical (which they are: the
-                // // bracket records are bytewise copies).
-                float a, b;
-                std::memcpy(&a, aBuf.data() + off, 4);
-                std::memcpy(&b, bBuf.data() + off, 4);
-                const float v = a + (b - a) * alphaF;
-                std::memcpy(static_cast<uint8_t*>(out) + off, &v, 4);
-            } else if (sz == 8) {
-                double a, b;
-                std::memcpy(&a, aBuf.data() + off, 8);
-                std::memcpy(&b, bBuf.data() + off, 8);
-                const double v = a + (b - a) * static_cast<double>(alphaF);
-                std::memcpy(static_cast<uint8_t*>(out) + off, &v, 8);
-            }
-        }
-        return true;
-    }
-
-    // Multi-field fast path: only when ALL fields are lerpable AND packed at
-    // offset 0, sizeof(f0), sizeof(f0)+sizeof(f1), ... We lerp each in
-    // sequence. The wire layout produced by ReflectSerializer for a POD
-    // struct with primitive NetReplicate fields is equivalent to the in-
-    // memory layout, so this matches reality for the common case (see R3.2
-    // design: serializeObject walks fields in type declaration order, with
-    // no padding).
-    //
-    // Why all-or-nothing (Unity NetCode convention): if a struct contains
-    // ANY non-lerpable field (int, enum, bool, string, nested struct), the
-    // whole record snaps to the lower bracket. Per-field partial-lerp
-    // would still blend the float fields mid-tick, which produces a
-    // "neither here nor there" state for the integer fields that bracket
-    // a state change (e.g. enum transition Running→Jumping). Snap-to-lower
-    // is consistent with Unreal's RepNotify+RepMovement convention.
-    size_t runningOffset = 0;
-    bool allLerpable = true;
+    auto* outBase = static_cast<uint8_t*>(out);
+    const uintptr_t outBaseAddress = reinterpret_cast<uintptr_t>(outBase);
     for (const auto& f : g.fields) {
-        if (!f.lerpable || f.sizeBytes == 0) { allLerpable = false; break; }
-        if (f.offset != 0) { allLerpable = false; break; }
-    }
-    if (allLerpable) {
-        for (const auto& f : g.fields) {
-            if (runningOffset + f.sizeBytes > g.recordBytes) break;
-            if (f.sizeBytes == 4) {
-                // R6 C7 H-05: alpha is clamped [0,1]; float lerp stays.
-                // See single-float path comment for the determinism
-                // argument.
-                float a, b;
-                std::memcpy(&a, aBuf.data() + runningOffset, 4);
-                std::memcpy(&b, bBuf.data() + runningOffset, 4);
-                const float v = a + (b - a) * alphaF;
-                std::memcpy(static_cast<uint8_t*>(out) + runningOffset, &v, 4);
-            } else if (f.sizeBytes == 8) {
-                double a, b;
-                std::memcpy(&a, aBuf.data() + runningOffset, 8);
-                std::memcpy(&b, bBuf.data() + runningOffset, 8);
-                const double v = a + (b - a) * static_cast<double>(alphaF);
-                std::memcpy(static_cast<uint8_t*>(out) + runningOffset, &v, 8);
-            }
-            runningOffset += f.sizeBytes;
+        if (!f.lerpable || !f.field) continue;
+        auto* outPtr = static_cast<uint8_t*>(f.field->get(out));
+        if (!outPtr) continue;
+        const uintptr_t outFieldAddress = reinterpret_cast<uintptr_t>(outPtr);
+        if (outFieldAddress < outBaseAddress) continue;
+        const size_t offset = static_cast<size_t>(outFieldAddress - outBaseAddress);
+        if (offset > g.recordBytes || f.sizeBytes > g.recordBytes - offset) continue;
+        const uint8_t* aPtr = aBuf.data() + offset;
+        const uint8_t* bPtr = bBuf.data() + offset;
+        if (f.sizeBytes == 4) {
+            float a, b;
+            std::memcpy(&a, aPtr, 4);
+            std::memcpy(&b, bPtr, 4);
+            const float v = a + (b - a) * alphaF;
+            std::memcpy(outPtr, &v, 4);
+        } else if (f.sizeBytes == 8) {
+            double a, b;
+            std::memcpy(&a, aPtr, 8);
+            std::memcpy(&b, bPtr, 8);
+            const double v = a + (b - a) * static_cast<double>(alphaF);
+            std::memcpy(outPtr, &v, 8);
         }
     }
     return true;

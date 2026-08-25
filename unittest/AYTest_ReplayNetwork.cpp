@@ -25,7 +25,10 @@
 #include <AYNetwork/Replay/NetworkReplayTypes.h>
 #include <AYNetwork/Replay/NetworkReplayRecorderAdapter.h>
 #include <AYNetwork/Replay/NetworkReplayEventDecoder.h>
+#include <AYNetwork/Prediction/ClientInputCodec.h>
 #include <AYNetwork/Replication/ReplicationManager.h>
+
+#include <AYReflect/detail/ReflectImpl.h>
 
 #include <AYReplay/FileReplayPlayer.h>
 
@@ -592,6 +595,18 @@ TEST_CASE(Decoder_ConnectionIdRemap_AppliesToAllEvents) {
     std::filesystem::remove(recordedPath);
 }
 
+TEST_CASE(Decoder_BuildRemapStartsAtRecordedConnectionOne) {
+    ayt::test::getStats().current_case =
+        "Decoder_BuildRemapStartsAtRecordedConnectionOne";
+
+    const auto remap = ayt::net::replay::NetworkReplayEventDecoder::buildRemap(
+        {91u, 92u});
+    CHECK(remap.size() == 2u);
+    CHECK(remap.count(0u) == 0u);
+    CHECK(remap.at(1u) == 91u);
+    CHECK(remap.at(2u) == 92u);
+}
+
 TEST_CASE(Decoder_MissingRemapFallsBackToLiteral) {
     ayt::test::getStats().current_case = "Decoder_MissingRemapFallsBackToLiteral";
 
@@ -670,7 +685,9 @@ TEST_CASE(Decoder_CheckpointPreserved) {
           ayt::replay::IReplayPlayer::Error::Ok);
     CHECK(d1.isCheckpoint);
     CHECK(d1.tick == 5u);
-    CHECK(d1.snapshot.empty());  // recordPeriodicCheckpoint wrote 0-byte snapshot
+    CHECK(d1.eventType == ayt::net::replay::kEvtNet_Checkpoint);
+    CHECK(d1.snapshot.size() == 24u); // count + two (netId,size,2-byte body) entries
+    CHECK(d1.snapshot[0] == 2u);
 
     // Second: InitialFullSnapshot.
     DecodedEvent d2;
@@ -758,11 +775,11 @@ TEST_CASE(PumpBridge_AuthorityChange_StripsPrefixAndCallsSetProxyKind) {
 
     // AuthorityChange prefix (per NetworkReplayRecorderAdapter::recordAuthorityChange):
     //   [u32 netId][u8 oldKind][u8 newKind][u32 connId][u32 reserved]   = 14 bytes
-    // We use netId=42, oldKind=1 (SimulatedProxy), newKind=2 (AutonomousProxy).
+    // We use netId=42, oldKind=2 (SimulatedProxy), newKind=1 (AutonomousProxy).
     std::vector<uint8_t> body(14, 0);
     body[0] = 42; body[1] = 0; body[2] = 0; body[3] = 0;
-    body[4] = 1;  // oldKind
-    body[5] = 2;  // newKind
+    body[4] = 2;  // oldKind
+    body[5] = 1;  // newKind
     body[6] = 7; body[7] = 0; body[8] = 0; body[9] = 0; // connId
     // reserved (10..13) = 0
 
@@ -770,6 +787,11 @@ TEST_CASE(PumpBridge_AuthorityChange_StripsPrefixAndCallsSetProxyKind) {
     sub->initialize();
     sub->getReplicationManagerForTesting()->setModeForTesting(
         ayt::net::ConnectionMode::Server);
+    int32_t object = 0;
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance()
+                           .findType<int32_t>();
+    CHECK(type != nullptr);
+    sub->getReplicationManagerForTesting()->registerObject(&object, type, 42u);
 
     // Before pumping, ProxyKind for netId=42 is SimulatedProxy (default
     // when not registered — see ReplicationManager::getObjectProxyKind).
@@ -779,16 +801,23 @@ TEST_CASE(PumpBridge_AuthorityChange_StripsPrefixAndCallsSetProxyKind) {
 
     // Pump the AuthorityChange through the bridge. The bridge strips the
     // 14-byte adapter prefix and calls setObjectProxyKind(42, AutonomousProxy).
-    // That call is a no-op when netId isn't a registered ghost (the manager
-    // intentionally refuses phantom rows); we just verify the bridge routes
-    // to the manager without crashing, and the resulting ProxyKind stays at
-    // its pre-pump value for an unregistered ghost.
     sub->tickRecordedEvent(ayt::net::replay::kEvtNet_AuthorityChange,
                            body.data(), body.size());
 
     const ProxyKind after = sub->getReplicationManagerForTesting()
                                 ->getObjectProxyKind(42);
-    CHECK(after == ProxyKind::SimulatedProxy);
+    CHECK(after == ProxyKind::AutonomousProxy);
+    const uint8_t inputPayload = 0xA5u;
+    std::vector<uint8_t> inputBody(9u);
+    CHECK(ClientInputCodec::write(inputBody.data(), 1u, 1u,
+                                  &inputPayload, 1u) == inputBody.size());
+    CHECK(sub->getReplicationManagerForTesting()->onClientInput(
+        7u, inputBody.data(), inputBody.size()));
+    sub->getReplicationManagerForTesting()->consumeClientInputs(1u);
+    CHECK(sub->getReplicationManagerForTesting()
+              ->buildAckTailForConnection(7u, 0u).present);
+    CHECK(!sub->getReplicationManagerForTesting()
+               ->buildAckTailForConnection(8u, 0u).present);
     CHECK(sub->getReplicationManager() != nullptr);
 }
 

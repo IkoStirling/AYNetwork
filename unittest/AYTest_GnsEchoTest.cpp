@@ -57,7 +57,9 @@ TEST_CASE(EchoLoopback) {
 
     CHECK(gns::init());
 
-    constexpr uint16_t kVirtualPort = 7777;
+    // Avoid the conventional application port 7777; local game/editor
+    // processes commonly keep it occupied and make this loopback test flaky.
+    constexpr uint16_t kVirtualPort = 27777;
     const char* kHelloMsg = "hello from client";
 
     // ---- Server ----
@@ -83,7 +85,7 @@ TEST_CASE(EchoLoopback) {
         clientGotEcho.store(true);
     });
 
-    client.initClient("127.0.0.1:7777", kVirtualPort);
+    client.initClient("127.0.0.1:27777", kVirtualPort);
     CHECK(client.getState() == GnsConnectionState::Connecting ||
           client.getState() == GnsConnectionState::Connected);
 

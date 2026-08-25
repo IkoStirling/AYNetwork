@@ -30,7 +30,7 @@ public:
     // Default value is kDefaultSessionSeed. Tests and the replay
     // recorder install a per-session seed here so that fault draws
     // (loss / dup / reorder / latency) are reproducible across runs.
-    void setSessionSeed(uint64_t seed) { _sessionSeed = seed; }
+    void setSessionSeed(uint64_t seed);
     uint64_t getSessionSeed() const { return _sessionSeed; }
 
     // ----- Profile management -----
@@ -38,7 +38,7 @@ public:
     // Install or replace a profile for a connection. `sessionSeed` is
     // the session randomSeed used when `profile.randomSeed == 0`.
     void setProfile(uint32_t netId, const TransportFaultProfile& profile,
-                    uint64_t sessionSeed = kDefaultSessionSeed);
+                    uint64_t sessionSeed = 0);
 
     // Remove the profile (and RNG) for a connection. Subsequent calls
     // to `hasProfile` return false; interceptor falls back to

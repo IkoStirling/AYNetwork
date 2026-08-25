@@ -1,9 +1,8 @@
 // AYNetwork/Prediction/MispredictionResolver.cpp - R5.2 pure reconcile.
 //
-// R6 C7 (2026-08-25): float lerp + relative-epsilon snap → int32 fixed-
-// point lerp + int32 ULP compare. State-equal replay requires bit-deterministic
-// math; IEEE-754 roundoff accumulates per-field per-tick and eventually
-// flips snap decisions between recordings.
+// R6 C7 (2026-08-25): threshold decisions use ordered IEEE-754 ULP distance.
+// Smoothing still operates on numeric float/double values; interpolating the
+// integer representation of their bit patterns is not numerically meaningful.
 
 #include <AYNetwork/Prediction/MispredictionResolver.h>
 
@@ -23,7 +22,7 @@ inline float clamp01(float v) {
     return v;
 }
 
-// R6 C7 (2026-08-25): float relative-epsilon comparison → int32 ULP
+// R6 C7 (2026-08-25): float relative-epsilon comparison → ordered ULP
 // compare. ≤ 64 ULPs ≈ 1.5e-5 relative error, identical threshold to the
 // float version (1e-4) for normals in the float32 range. ULPs are
 // monotonic with the bit pattern, so the comparison is identical on
@@ -40,10 +39,16 @@ inline bool numericEqualsEpsilon(const uint8_t* a, const uint8_t* b,
         // Flush denormals to zero so they don't dominate the ULP diff.
         const uint32_t absMask = 0x7FFFFFFFu;
         const uint32_t minNormal = 0x00800000u;
-        if ((ua & absMask) < minNormal) ua &= absMask; // keep sign bit, magnitude 0
-        if ((ub & absMask) < minNormal) ub &= absMask;
-        // Signed distance in ULPs (sign-independent): |ua - ub|.
-        const uint32_t diff = (ua > ub) ? (ua - ub) : (ub - ua);
+        if ((ua & absMask) < minNormal) ua = 0;
+        if ((ub & absMask) < minNormal) ub = 0;
+        if ((ua & 0x7F800000u) == 0x7F800000u ||
+            (ub & 0x7F800000u) == 0x7F800000u) return ua == ub;
+        const auto ordered = [](uint32_t bits) {
+            return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        };
+        const uint32_t oa = ordered(ua);
+        const uint32_t ob = ordered(ub);
+        const uint32_t diff = (oa > ob) ? (oa - ob) : (ob - oa);
         return diff <= 64u;
     }
     case 2: { // float64
@@ -52,9 +57,17 @@ inline bool numericEqualsEpsilon(const uint8_t* a, const uint8_t* b,
         std::memcpy(&ub, b, sizeof(uint64_t));
         const uint64_t absMask = 0x7FFFFFFFFFFFFFFFull;
         const uint64_t minNormal = 0x0010000000000000ull;
-        if ((ua & absMask) < minNormal) ua &= absMask;
-        if ((ub & absMask) < minNormal) ub &= absMask;
-        const uint64_t diff = (ua > ub) ? (ua - ub) : (ub - ua);
+        if ((ua & absMask) < minNormal) ua = 0;
+        if ((ub & absMask) < minNormal) ub = 0;
+        if ((ua & 0x7FF0000000000000ull) == 0x7FF0000000000000ull ||
+            (ub & 0x7FF0000000000000ull) == 0x7FF0000000000000ull) return ua == ub;
+        const auto ordered = [](uint64_t bits) {
+            return (bits & 0x8000000000000000ull)
+                ? ~bits : (bits | 0x8000000000000000ull);
+        };
+        const uint64_t oa = ordered(ua);
+        const uint64_t ob = ordered(ub);
+        const uint64_t diff = (oa > ob) ? (oa - ob) : (ob - oa);
         return diff <= 64u;
     }
     default:
@@ -62,42 +75,32 @@ inline bool numericEqualsEpsilon(const uint8_t* a, const uint8_t* b,
     }
 }
 
-// R6 C7 (2026-08-25): float lerp → int32 fixed-point lerp. The formula
-//
-//   dst = a + (b - a) * alpha
-//
-// becomes
-//
-//   dst = a + ((b - a) * alpha_q16) >> 16
-//
-// where alpha_q16 = uint32(0xFFFF * alpha). All intermediates stay in
-// int32/int64 to avoid float roundoff. Quantization: 16 fractional bits
-// gives ~1.5e-5 resolution — well below the ULP-64 snap threshold so the
-// snap-vs-smooth decision is unchanged from the float path. Rounding is
-// round-half-up (C1 convention) so the boundary value 0x8000 rounds up.
+// Alpha is quantized to q16 so callers make the same smoothing-step choice;
+// field values themselves are interpolated numerically.
 inline void lerpField(uint8_t* dst, const uint8_t* a, const uint8_t* b,
                       uint8_t kind, uint32_t alpha_q16)
 {
     switch (kind) {
     case 1: { // float32
-        int32_t ia, ib;
-        std::memcpy(&ia, a, sizeof(int32_t));
-        std::memcpy(&ib, b, sizeof(int32_t));
-        // Round-half-up: ((b-a) * alpha + 0x8000) >> 16.
-        const int64_t diff = static_cast<int64_t>(ib - ia);
-        const int64_t scaled = (diff * static_cast<int64_t>(alpha_q16) + 0x8000) >> 16;
-        int32_t result = ia + static_cast<int32_t>(scaled);
-        std::memcpy(dst, &result, sizeof(int32_t));
+        float va, vb;
+        std::memcpy(&va, a, sizeof(va));
+        std::memcpy(&vb, b, sizeof(vb));
+        const float alpha = static_cast<float>(alpha_q16) / 65535.0f;
+        volatile float delta = vb - va;
+        volatile float scaled = delta * alpha;
+        const float result = va + scaled;
+        std::memcpy(dst, &result, sizeof(result));
         return;
     }
     case 2: { // float64
-        int64_t ia, ib;
-        std::memcpy(&ia, a, sizeof(int64_t));
-        std::memcpy(&ib, b, sizeof(int64_t));
-        const int64_t diff = ib - ia;
-        const int64_t scaled = (diff * static_cast<int64_t>(alpha_q16) + 0x8000) >> 16;
-        int64_t result = ia + scaled;
-        std::memcpy(dst, &result, sizeof(int64_t));
+        double va, vb;
+        std::memcpy(&va, a, sizeof(va));
+        std::memcpy(&vb, b, sizeof(vb));
+        const double alpha = static_cast<double>(alpha_q16) / 65535.0;
+        volatile double delta = vb - va;
+        volatile double scaled = delta * alpha;
+        const double result = va + scaled;
+        std::memcpy(dst, &result, sizeof(result));
         return;
     }
     default:
@@ -136,11 +139,10 @@ void MispredictionResolver::applySmoothing(std::vector<uint8_t>& dst,
         dst = src;
         return;
     }
-    // R6 C7 M-02 (2026-08-25): precompute uint32 fixed-point alpha.
+    // R6 C7 M-02 (2026-08-25): precompute a q16 alpha.
     // alpha_q16 = round-half-up(0xFFFF * clamp01(dt / smoothingDuration)).
     // 16 fractional bits ≈ 1.5e-5 resolution. q16 instead of float lerp
-    // makes the smoothing step bit-deterministic across platforms and
-    // FMA/non-FMA builds.
+    // stabilizes the selected smoothing ratio across runs.
     const float alphaF = clamp01(dtSec / smoothingDuration);
     const uint32_t alpha_q16 = static_cast<uint32_t>(
         static_cast<int64_t>(lroundf(alphaF * 65535.0f)) & 0xFFFFu);
@@ -153,8 +155,8 @@ void MispredictionResolver::applySmoothing(std::vector<uint8_t>& dst,
         const size_t step = (f.numericKind == 2) ? sizeof(double) : sizeof(float);
         if (f.numericKind != 0 && f.byteSize == step) {
             lerpField(dst.data() + f.byteOffset,
-                      src.data() + f.byteOffset,
                       dst.data() + f.byteOffset,
+                      src.data() + f.byteOffset,
                       f.numericKind, alpha_q16);
         } else {
             // Snap-to-lower (a) for ints/bools/strings/nested.
@@ -184,16 +186,12 @@ ReconcileResult MispredictionResolver::reconcile(
         return r;
     }
 
-    const bool clientIsBehind = seqGreaterThan(serverLastAckedInputTick,
-                                               predictedInputSeq);
-    // "Client's prediction is older than the last server-confirmed input"
-    // means client CAN'T have applied the same server-side inputs yet —
-    // it may still be right (smooth) or wrong (snap). We always prefer
-    // smooth when delta is within threshold, regardless of seq — the
-    // snap-vs-smooth decision is purely about the FIELD delta.
-
-    std::vector<uint8_t> smoothedOut; // built lazily
-    bool haveSmoothed = false;
+    const bool predictionCoveredByAck =
+        !seqGreaterThan(predictedInputSeq, serverLastAckedInputTick);
+    const float alphaF = smoothingDuration > 0.f
+        ? clamp01(dtSec / smoothingDuration) : 1.f;
+    const uint32_t alphaQ16 = static_cast<uint32_t>(
+        static_cast<int64_t>(lroundf(alphaF * 65535.0f)) & 0xFFFFu);
 
     for (const ResolverField& f : layout.fields) {
         if (f.byteOffset + f.byteSize > serverBytes.size()) continue;
@@ -205,29 +203,26 @@ ReconcileResult MispredictionResolver::reconcile(
         const uint8_t* a = predictedBytes.data() + f.byteOffset;
         const uint8_t* b = serverBytes.data() + f.byteOffset;
 
-        const bool different = aboveThreshold(a, b, f.byteSize, f.numericKind);
-        if (!different) continue;
-
-        // Above-threshold delta → snap (overwrite predicted with server).
-        std::memcpy(predictedBytes.data() + f.byteOffset,
-                    serverBytes.data() + f.byteOffset,
-                    f.byteSize);
-        r.snapped = true;
-        ++r.fieldsSnapped;
-    }
-
-    if (clientIsBehind && smoothingDuration > 0.f && !r.snapped) {
-        // No field above threshold (server confirms client's prediction),
-        // but client is behind → smoothing pass: pull client toward the
-        // server values at alpha = dt/smoothingDuration.
-        if (!haveSmoothed) {
-            smoothedOut = predictedBytes;
-            applySmoothing(smoothedOut, serverBytes, layout,
-                           dtSec, smoothingDuration);
-            haveSmoothed = true;
+        if (std::memcmp(a, b, f.byteSize) == 0) continue;
+        const bool above = aboveThreshold(a, b, f.byteSize, f.numericKind);
+        const bool shouldSnap = above ? predictionCoveredByAck
+                                      : !predictionCoveredByAck;
+        if (shouldSnap || smoothingDuration <= 0.f || f.numericKind == 0) {
+            std::memcpy(predictedBytes.data() + f.byteOffset, b, f.byteSize);
+            r.snapped = true;
+            ++r.fieldsSnapped;
+        } else {
+            const size_t step = (f.numericKind == 2) ? sizeof(double) : sizeof(float);
+            if (f.byteSize == step) {
+                lerpField(predictedBytes.data() + f.byteOffset,
+                          a, b, f.numericKind, alphaQ16);
+                ++r.fieldsSmoothed;
+            } else {
+                std::memcpy(predictedBytes.data() + f.byteOffset, b, f.byteSize);
+                r.snapped = true;
+                ++r.fieldsSnapped;
+            }
         }
-        predictedBytes = smoothedOut;
-        r.fieldsSmoothed = r.fieldsScanned;
     }
 
     return r;

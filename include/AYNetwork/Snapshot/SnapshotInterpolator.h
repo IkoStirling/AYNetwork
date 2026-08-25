@@ -42,17 +42,17 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ayt::reflect { class ITypeInfo; }
+namespace ayt::reflect { class ITypeInfo; class IFieldInfo; }
 
 namespace ayt::net
 {
 
 // Per-field spec the interpolator captured at registerGhostKind time.
-// Used during sample() to decide lerp vs snap. We deliberately store
-// (offset, wireTypeId, typeSize) rather than ayt::reflect::IFieldInfo*
-// so the per-sample loop has no virtual dispatch.
+// Used during sample() to decide lerp vs snap. The reflection field accessor
+// is retained because accessor-backed/inherited fields may not expose a
+// meaningful byte offset through getOffset().
 struct FieldInterpSpec {
-    uint32_t offset = 0;
+    const ayt::reflect::IFieldInfo* field = nullptr;
     uint8_t  wireTypeId = 0;        // WireTypeId (0..15)
     uint8_t  sizeBytes  = 0;        // sizeof the field on the wire (1/2/4/8/var)
     bool     lerpable   = false;    // true for Float/Double only

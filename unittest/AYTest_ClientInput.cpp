@@ -15,6 +15,7 @@
 #include <AYNetwork/Replication/ReflectSerializer.h>
 
 #include <AYReflect/IReflect.h>
+#include <AYReflect/detail/ReflectImpl.h>
 
 #include <atomic>
 #include <chrono>
@@ -224,6 +225,39 @@ TEST_CASE(Ack_WraparoundMath)
                  static_cast<uint32_t>(0x00000001u));
 }
 
+TEST_CASE(AckTail_IsolatedByOwningConnection)
+{
+    ayt::test::setCurrentCase("AckTail_IsolatedByOwningConnection");
+    ReplicationManager manager(nullptr);
+    manager.setModeForTesting(ConnectionMode::Server);
+
+    int32_t first = 1;
+    int32_t second = 2;
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance()
+                           .findType<int32_t>();
+    CHECK(type != nullptr);
+    manager.registerObject(&first, type, 101u);
+    manager.registerObject(&second, type, 202u);
+    manager.setObjectProxyKind(101u, ProxyKind::AutonomousProxy, 11u);
+    manager.setObjectProxyKind(202u, ProxyKind::AutonomousProxy, 22u);
+
+    const uint8_t payload = 0x5Au;
+    std::vector<uint8_t> inputBody(9u);
+    CHECK(ClientInputCodec::write(inputBody.data(), 1u, 10u,
+                                  &payload, 1u) == inputBody.size());
+    CHECK(manager.onClientInput(11u, inputBody.data(), inputBody.size()));
+    CHECK(manager.onClientInput(22u, inputBody.data(), inputBody.size()));
+    manager.consumeClientInputs(10u);
+
+    CHECK(manager.buildAckTailForConnection(11u, 0u).present);
+    CHECK(manager.buildAckTailForConnection(22u, 0u).present);
+    CHECK(!manager.buildAckTailForConnection(33u, 0u).present);
+
+    manager.unregisterObject(101u);
+    CHECK(!manager.buildAckTailForConnection(11u, 0u).present);
+    CHECK(manager.buildAckTailForConnection(22u, 0u).present);
+}
+
 // =============================================================================
 // Case 7: MispredictionResolver skips ServerAuthoritative fields.
 // =============================================================================
@@ -412,6 +446,40 @@ TEST_CASE(PredictionManager_EndToEnd)
     // re-fetch by calling the resolver with a fake server ack.
     // Here we just confirm the call did not throw and the ghost is still tracked.
     CHECK(pm.isPredictedGhost(17));
+}
+
+TEST_CASE(PredictionManager_ConfiguredRingCapacity)
+{
+    ayt::test::setCurrentCase("PredictionManager_ConfiguredRingCapacity");
+    PredictionManager pm(2);
+    for (uint32_t seq = 1; seq <= 3; ++seq) {
+        std::vector<uint8_t> body(8, 0);
+        ClientInputCodec::write(body.data(), seq, 0, nullptr, 0);
+        CHECK(pm.onClientInput(77, body.data(), body.size()));
+    }
+    CHECK(pm.pendingInputCount(77) == 2u);
+}
+
+TEST_CASE(Misprediction_NumericLerpUsesValues)
+{
+    ayt::test::setCurrentCase("Misprediction_NumericLerpUsesValues");
+    ResolverLayout layout;
+    layout.fields.push_back({"v", 0, 4, 1, true, false});
+    std::vector<uint8_t> predicted(4), server(4);
+    float a = 0.0f, b = 1.0f;
+    std::memcpy(predicted.data(), &a, 4);
+    std::memcpy(server.data(), &b, 4);
+    auto r = MispredictionResolver::reconcile(
+        predicted, server, layout,
+        /*predictedInputSeq=*/ 6, /*serverLastAckedInputTick=*/ 5,
+        /*dtSec=*/ 0.05f, /*smoothingDuration=*/ 0.1f);
+    float out = 0.0f;
+    std::memcpy(&out, predicted.data(), 4);
+    CHECK(!r.snapped);
+    CHECK(out > 0.49f && out < 0.51f);
+    CHECK(MispredictionResolver::aboveThreshold(
+        reinterpret_cast<const uint8_t*>(&b),
+        reinterpret_cast<const uint8_t*>(&a), 4, 1));
 }
 
 // R6 C7 B-12 (2026-08-25): numericEqualsEpsilon now compares |bit-pattern diff|

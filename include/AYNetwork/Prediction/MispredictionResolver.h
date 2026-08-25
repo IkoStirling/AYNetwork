@@ -76,8 +76,8 @@ public:
                                      float smoothingDuration);
 
     // Test seam: apply smoothing in isolation. src→dst via
-    // exponential alpha = clamp(dtSec/smoothingDuration, 0, 1). Field-
-    // agnostic bytewise lerp via the layout's numericKind.
+    // linear alpha = clamp(dtSec/smoothingDuration, 0, 1). Numeric fields
+    // are interpolated as float/double values according to numericKind.
     static void applySmoothing(std::vector<uint8_t>& dst,
                                const std::vector<uint8_t>& src,
                                const ResolverLayout& layout,

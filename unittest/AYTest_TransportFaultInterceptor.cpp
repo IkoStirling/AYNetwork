@@ -165,13 +165,22 @@ TEST_CASE(Interceptor_RateLimit)
     CHECK(i.sendQueueSize(3) == 10u);
 
     // Now grant dt=10.0 (10 seconds at 1000 bytes/sec = 10000 tokens,
-    // capped at burst=2000). With dt passed to each per-frame tryConsume,
-    // each frame can consume 500. With 2000 tokens available at every
-    // tryConsume call, all 10 frames release in this tick.
+    // capped at burst=2000). Refill happens once per channel/tick, so four
+    // 500-byte frames release and the rest remain queued.
     sendOut.clear(); recvOut.clear();
     size_t n2 = i.tick(/*nowMs=*/10, /*dt=*/10.0, sendOut, recvOut);
-    CHECK(n2 == 10u);
-    CHECK(sendOut.size() == 10u);
+    CHECK(n2 == 4u);
+    CHECK(sendOut.size() == 4u);
+    CHECK(i.sendQueueSize(3) == 6u);
+
+    sendOut.clear(); recvOut.clear();
+    size_t n2b = i.tick(/*nowMs=*/20, /*dt=*/10.0, sendOut, recvOut);
+    CHECK(n2b == 4u);
+    CHECK(i.sendQueueSize(3) == 2u);
+
+    sendOut.clear(); recvOut.clear();
+    size_t n2c = i.tick(/*nowMs=*/30, /*dt=*/10.0, sendOut, recvOut);
+    CHECK(n2c == 2u);
     CHECK(i.sendQueueSize(3) == 0u);
 
     // Verify rate-limit is OFF for a profile without knobs (no rate limit).
@@ -189,6 +198,27 @@ TEST_CASE(Interceptor_RateLimit)
     size_t n3 = i2.tick(/*nowMs=*/0, /*dt=*/0.0, sendOut, recvOut);
     CHECK(n3 == 5u);
     CHECK(sendOut.size() == 5u);
+}
+
+TEST_CASE(Interceptor_ReorderDoesNotLoseOrDuplicate)
+{
+    ayt::test::setCurrentCase("Interceptor_ReorderDoesNotLoseOrDuplicate");
+    TransportFaultController ctl;
+    TransportFaultProfile p;
+    p.randomSeed = 1;
+    p.reorderPercent = 100.0f;
+    ctl.setProfile(123, p);
+    TransportFaultInterceptor i(123, ctl);
+
+    const auto a = bytes('a');
+    const auto b = bytes('b');
+    i.onSend(0, a.data(), a.size(), 0);
+    i.onSend(0, b.data(), b.size(), 0);
+    auto d = drainOne(i, 0);
+    CHECK(d.sendOut.size() == 2u);
+    CHECK(d.sendOut[0].first[0] == 'b');
+    CHECK(d.sendOut[1].first[0] == 'a');
+    CHECK(i.sendQueueSize(0) == 0u);
 }
 
 TEST_CASE(Interceptor_ChannelMaskGating)

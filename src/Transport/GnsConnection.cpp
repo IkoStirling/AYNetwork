@@ -393,32 +393,19 @@ GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
     // loop so frames that are "ready to go on the wire" actually leave
     // the system this pump iteration (not the next one).
     {
-        std::vector<std::pair<std::vector<uint8_t>, uint8_t>> sendOut;
         for (GnsConnection* owner : owners) {
             if (!owner->_faultCtl) continue;
             TransportFaultInterceptor* ic = owner->getFaultInterceptor();
             if (!ic || !ic->isEnabled()) continue;  // R5.4: skip if no profile
-            std::vector<std::pair<std::vector<uint8_t>, uint8_t>> recvTmp;
+            std::vector<std::pair<std::vector<uint8_t>, uint8_t>> sendOut;
             // dtSeconds for the rate-limit refill — the caller doesn't
             // supply one so we use a small constant (1ms). Tests that
             // care about exact refill behavior inject virtual time.
-            ic->tick(maintenanceNowMs, 0.001, sendOut, recvTmp);
-            (void)recvTmp;
-        }
-        for (auto& [bytes, channel] : sendOut) {
-            // Find the owner that owns the frame — we don't have it
-            // tagged here, so route via the global connMap() to the
-            // single owner with a non-null controller for the bytes'
-            // channel. For R5.4 we round-robin through owners and let
-            // _rawSend handle it; each interceptor only owns one
-            // connection's queue.
-            for (GnsConnection* owner : owners) {
-                if (owner->_faultCtl) {
-                    owner->_rawSend(bytes.data(),
-                                    static_cast<uint32_t>(bytes.size()),
-                                    channel);
-                    break;
-                }
+            ic->tickSend(maintenanceNowMs, 0.001, sendOut);
+            for (auto& [bytes, channel] : sendOut) {
+                owner->_rawSend(bytes.data(),
+                                static_cast<uint32_t>(bytes.size()),
+                                channel);
             }
         }
     }
@@ -492,27 +479,15 @@ GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
     // are released (deadline reached, rate-limit token available) are
     // forwarded to onRawData → PacketCodec::decode → _packetHandler.
     {
-        std::vector<std::pair<std::vector<uint8_t>, uint8_t>> recvOut;
         for (GnsConnection* owner : owners) {
             if (!owner->_faultCtl) continue;
             TransportFaultInterceptor* ic = owner->getFaultInterceptor();
             if (!ic || !ic->isEnabled()) continue;  // R5.4: skip if no profile
-            std::vector<std::pair<std::vector<uint8_t>, uint8_t>> sendTmp;
-            ic->tick(maintenanceNowMs, 0.001, sendTmp, recvOut);
-            (void)sendTmp;
-        }
-        for (auto& [bytes, channel] : recvOut) {
-            (void)channel;
-            // Find the right owner — the interceptor holds the recv
-            // queue keyed by netId, and we lost that mapping when
-            // tick() returned. Re-derive by scanning owners with a
-            // non-null controller. For R5.4 (per-connection profiles)
-            // this is a single match in practice.
-            for (GnsConnection* owner : owners) {
-                if (owner->_faultCtl) {
-                    owner->onRawData(bytes.data(), bytes.size());
-                    break;
-                }
+            std::vector<std::pair<std::vector<uint8_t>, uint8_t>> recvOut;
+            ic->tickRecv(maintenanceNowMs, 0.001, recvOut);
+            for (auto& [bytes, channel] : recvOut) {
+                (void)channel;
+                owner->onRawData(bytes.data(), bytes.size());
             }
         }
     }
@@ -608,12 +583,19 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
 
 int GnsConnection::sendEncoded(uint8_t channel, const void* data, size_t len) {
     if (!s_gns || _conn == k_HSteamNetConnection_Invalid || !data || len == 0 ||
-        len > UINT32_MAX ||
+        len > UINT32_MAX || channel > CHANNEL_ACK ||
         (_state != GnsConnectionState::Connected &&
          _state != GnsConnectionState::Handshaking &&
          _state != GnsConnectionState::Ready)) return -1;
     const auto* wire = static_cast<const uint8_t*>(data);
+    TransportFaultInterceptor* interceptor = getFaultInterceptor();
+    const bool faultActive = interceptor && interceptor->isEnabled();
     if (len <= kFrameMtu) {
+        if (faultActive) {
+            interceptor->onSend(static_cast<uint64_t>(nowMs()),
+                                wire, len, channel);
+            return 0;
+        }
         return _rawSend(wire, static_cast<uint32_t>(len), channel);
     }
 
@@ -635,7 +617,13 @@ int GnsConnection::sendEncoded(uint8_t channel, const void* data, size_t len) {
 
     int lastResult = 0;
     for (const auto& frame : frames) {
-        lastResult = _rawSend(frame.data(), static_cast<uint32_t>(frame.size()), channel);
+        if (faultActive) {
+            interceptor->onSend(static_cast<uint64_t>(nowMs()),
+                                frame.data(), frame.size(), channel);
+            lastResult = 0;
+        } else {
+            lastResult = _rawSend(frame.data(), static_cast<uint32_t>(frame.size()), channel);
+        }
         if (lastResult != 0) break;
     }
     return lastResult;
@@ -644,7 +632,8 @@ int GnsConnection::sendEncoded(uint8_t channel, const void* data, size_t len) {
 int GnsConnection::sendRequireAck(uint16_t msgType, uint8_t channel,
                                   const void* data, size_t len,
                                   AckTracker::Callback onAck) {
-    if (!s_gns || _conn == k_HSteamNetConnection_Invalid) return -1;
+    if (!s_gns || _conn == k_HSteamNetConnection_Invalid ||
+        !data || len == 0 || len > UINT32_MAX || channel > CHANNEL_ACK) return -1;
     if (_state != GnsConnectionState::Connected &&
         _state != GnsConnectionState::Handshaking &&
         _state != GnsConnectionState::Ready) {
@@ -656,6 +645,12 @@ int GnsConnection::sendRequireAck(uint16_t msgType, uint8_t channel,
         msgType, channel, seq, nowMs(), /*compress=*/ false);
     if (onAck) {
         _ackTracker.registerPending(seq, std::move(onAck));
+    }
+    if (auto* interceptor = getFaultInterceptor();
+        interceptor && interceptor->isEnabled()) {
+        interceptor->onSend(static_cast<uint64_t>(nowMs()),
+                            wire.data(), wire.size(), channel);
+        return 0;
     }
     return _rawSend(wire.data(), static_cast<uint32_t>(wire.size()), channel);
 }

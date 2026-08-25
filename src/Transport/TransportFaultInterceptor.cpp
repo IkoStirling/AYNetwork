@@ -69,13 +69,9 @@ uint64_t TransportFaultInterceptor::recvDroppedCount() {
 void TransportFaultInterceptor::clearAll() {
     for (auto& ch : _sendChannels) {
         ch.delayQueue.clear();
-        ch.lastFrame.clear();
-        ch.hasLastFrame = false;
     }
     for (auto& ch : _recvChannels) {
         ch.delayQueue.clear();
-        ch.lastFrame.clear();
-        ch.hasLastFrame = false;
     }
     _sendDropped = 0;
     _recvDropped = 0;
@@ -87,7 +83,6 @@ void TransportFaultInterceptor::onSend(uint64_t nowMs, const uint8_t* sealed,
     handleOne(nowMs, sealed, len, channel,
               _sendChannels[channel].delayQueue,
               _sendChannels[channel].bucket,
-              _sendChannels[channel],
               _sendDropped);
 }
 
@@ -97,7 +92,6 @@ void TransportFaultInterceptor::onRecv(uint64_t nowMs, const uint8_t* sealed,
     handleOne(nowMs, sealed, len, channel,
               _recvChannels[channel].delayQueue,
               _recvChannels[channel].bucket,
-              _recvChannels[channel],
               _recvDropped);
 }
 
@@ -105,7 +99,6 @@ void TransportFaultInterceptor::handleOne(uint64_t nowMs, const uint8_t* sealed,
                                           size_t len, uint8_t channel,
                                           DelayedFrameQueue& queue,
                                           TokenBucket& /*bucket*/,
-                                          ChannelState& chState,
                                           uint64_t& droppedAcc) {
     const TransportFaultProfile* prof = _ctl.getProfile(_netId);
     if (!prof || prof->isNoOp()) {
@@ -149,67 +142,29 @@ void TransportFaultInterceptor::handleOne(uint64_t nowMs, const uint8_t* sealed,
         return;
     }
 
-    // 2. Reorder — swap with predecessor.
+    // 2. Delay and adjacent reorder. Every surviving frame is enqueued
+    // exactly once; a reorder hit swaps it with the preceding queued frame.
+    // This avoids the old persistent predecessor state which could retain a
+    // frame forever and later emit a duplicate copy.
     std::vector<uint8_t> current(sealed, sealed + len);
-    if (drawBernoulli(prof->reorderPercent, rng)) {
-        if (chState.hasLastFrame) {
-            // Swap: emit the predecessor now (zero delay), queue
-            // current as the new predecessor (it leaves later with
-            // its own sampled delay).
-            std::vector<uint8_t> swapped = std::move(chState.lastFrame);
-            chState.lastFrame = std::move(current);
-            chState.hasLastFrame = true;
-
-            DelayedFrame pred;
-            pred.releaseAtMs = nowMs;
-            pred.channel     = channel;
-            pred.bytes       = std::move(swapped);
-            queue.enqueue(std::move(pred));
-
-            const uint64_t delay = sampleLatencyMs(*prof, rng);
-            DelayedFrame delayed;
-            delayed.releaseAtMs = nowMs + delay;
-            delayed.channel     = channel;
-            delayed.bytes       = chState.lastFrame; // copy of new predecessor
-            queue.enqueue(std::move(delayed));
-        } else {
-            // No predecessor yet — store as predecessor for the next
-            // frame. The current frame is silently delayed.
-            chState.lastFrame = std::move(current);
-            chState.hasLastFrame = true;
-        }
-
-        if (_queueCap > 0) {
-            uint64_t dropped = 0;
-            queue.enforceCap(_queueCap, &dropped);
-            droppedAcc += dropped;
-        }
-        return;
-    }
-
-    // 3. Delay.
     const uint64_t delay = sampleLatencyMs(*prof, rng);
+    const bool reorder = drawBernoulli(prof->reorderPercent, rng);
 
-    // 4. Dup — enqueue two copies, the second with +mean delay.
+    // 3. Dup — enqueue two copies, the second with +mean delay.
+    DelayedFrame primary;
+    primary.releaseAtMs = reorder ? nowMs : nowMs + delay;
+    primary.channel     = channel;
+    primary.bytes       = current;
+    queue.enqueue(std::move(primary));
+    if (reorder) queue.swapLastTwo();
+
     if (drawBernoulli(prof->dupPercent, rng)) {
-        DelayedFrame primary;
-        primary.releaseAtMs = nowMs + delay;
-        primary.channel     = channel;
-        primary.bytes       = current;
-        queue.enqueue(std::move(primary));
-
         DelayedFrame dup;
         dup.releaseAtMs = nowMs + delay + prof->latencyMeanMs;
         dup.channel     = channel;
         dup.isDuplicate = true;
         dup.bytes       = current;
         queue.enqueue(std::move(dup));
-    } else {
-        DelayedFrame single;
-        single.releaseAtMs = nowMs + delay;
-        single.channel     = channel;
-        single.bytes       = std::move(current);
-        queue.enqueue(std::move(single));
     }
 
     if (_queueCap > 0) {
@@ -219,47 +174,57 @@ void TransportFaultInterceptor::handleOne(uint64_t nowMs, const uint8_t* sealed,
     }
 }
 
+size_t TransportFaultInterceptor::drainDirection(
+    uint64_t nowMs, double dtSeconds,
+    std::array<ChannelState, 4>& channels,
+    std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& out) {
+    const TransportFaultProfile* prof = _ctl.getProfile(_netId);
+    size_t released = 0;
+    for (size_t c = 0; c < channels.size(); ++c) {
+        ChannelState& ch = channels[c];
+        auto ready = ch.delayQueue.releaseReady(nowMs);
+        if (ready.empty()) continue;
+        const bool rateLimited = prof && prof->rateLimitBytesPerSec > 0
+                              && prof->affectsChannel(static_cast<uint8_t>(c));
+        bool refilled = false;
+        for (auto& f : ready) {
+            if (rateLimited) {
+                ch.bucket.configure(prof->rateLimitBytesPerSec,
+                                    prof->rateLimitBurstBytes);
+                const double refill = refilled ? 0.0 : dtSeconds;
+                refilled = true;
+                if (!ch.bucket.tryConsume(static_cast<uint32_t>(f.bytes.size()),
+                                          refill)) {
+                    f.releaseAtMs = nowMs + 1;
+                    ch.delayQueue.enqueue(std::move(f));
+                    continue;
+                }
+            }
+            out.emplace_back(std::move(f.bytes), static_cast<uint8_t>(c));
+            ++released;
+        }
+    }
+    return released;
+}
+
+size_t TransportFaultInterceptor::tickSend(
+    uint64_t nowMs, double dtSeconds,
+    std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& out) {
+    return drainDirection(nowMs, dtSeconds, _sendChannels, out);
+}
+
+size_t TransportFaultInterceptor::tickRecv(
+    uint64_t nowMs, double dtSeconds,
+    std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& out) {
+    return drainDirection(nowMs, dtSeconds, _recvChannels, out);
+}
+
 size_t TransportFaultInterceptor::tick(
     uint64_t nowMs, double dtSeconds,
     std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& sendOut,
-    std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& recvOut)
-{
-    const TransportFaultProfile* prof = _ctl.getProfile(_netId);
-    size_t released = 0;
-
-    auto drain = [&](std::array<ChannelState, 4>& channels,
-                     std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& out,
-                     uint64_t& /*droppedAcc*/) {
-        for (size_t c = 0; c < channels.size(); ++c) {
-            ChannelState& ch = channels[c];
-            auto ready = ch.delayQueue.releaseReady(nowMs);
-            if (ready.empty()) continue;
-
-            const bool rateLimited = prof && prof->rateLimitBytesPerSec > 0
-                                  && prof->affectsChannel(static_cast<uint8_t>(c));
-
-            for (auto& f : ready) {
-                if (rateLimited) {
-                    ch.bucket.configure(prof->rateLimitBytesPerSec,
-                                        prof->rateLimitBurstBytes);
-                    if (!ch.bucket.tryConsume(static_cast<uint32_t>(f.bytes.size()),
-                                              dtSeconds)) {
-                        // Re-enqueue at nowMs + 1ms for next tick.
-                        f.releaseAtMs = nowMs + 1;
-                        ch.delayQueue.enqueue(std::move(f));
-                        continue;
-                    }
-                }
-                out.emplace_back(std::move(f.bytes),
-                                 static_cast<uint8_t>(c));
-                ++released;
-            }
-        }
-    };
-
-    drain(_sendChannels, sendOut, _sendDropped);
-    drain(_recvChannels, recvOut, _recvDropped);
-    return released;
+    std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& recvOut) {
+    return tickSend(nowMs, dtSeconds, sendOut)
+         + tickRecv(nowMs, dtSeconds, recvOut);
 }
 
 } // namespace ayt::net

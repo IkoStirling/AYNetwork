@@ -42,14 +42,14 @@ public:
     // ------ High-level network record methods ------
     bool recordInitialFullSnapshot(uint32_t connectionId, uint32_t serverTick,
                                    uint8_t frameFlags,
-                                   const uint8_t* sealedPayload, size_t size);
+                                   const uint8_t* bodyPayload, size_t size);
     bool recordSpawn(uint32_t connectionId, uint32_t serverTick,
                      uint32_t netId, uint64_t schemaHash,
                      const uint8_t* spawnPayload, size_t size);
     bool recordDespawn(uint32_t connectionId, uint32_t serverTick, uint32_t netId);
     bool recordDeltaSnapshot(uint32_t connectionId, uint32_t serverTick,
                              uint8_t frameFlags,
-                             const uint8_t* sealedPayload, size_t size);
+                             const uint8_t* bodyPayload, size_t size);
     bool recordInput(uint32_t connectionId, uint32_t serverTick,
                      uint32_t inputSeq, uint32_t serverTickAtSend,
                      const uint8_t* payload, size_t size);

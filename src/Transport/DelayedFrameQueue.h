@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <algorithm>
 #include <vector>
 
 namespace ayt::net
@@ -35,13 +36,19 @@ public:
         _q.push_back(std::move(frame));
     }
 
-    // Drain and return all frames whose deadline has passed. Frames are
-    // removed from the queue. Order is preserved (FIFO).
+    // Drain and return all frames whose deadline has passed. Deadlines are
+    // not guaranteed to be monotonic when jitter/reorder is active, so scan
+    // the full queue instead of allowing an unready front item to block a
+    // ready item behind it. Relative queue order is preserved.
     std::vector<DelayedFrame> releaseReady(uint64_t nowMs) {
         std::vector<DelayedFrame> out;
-        while (!_q.empty() && _q.front().releaseAtMs <= nowMs) {
-            out.push_back(std::move(_q.front()));
-            _q.pop_front();
+        for (auto it = _q.begin(); it != _q.end();) {
+            if (it->releaseAtMs <= nowMs) {
+                out.push_back(std::move(*it));
+                it = _q.erase(it);
+            } else {
+                ++it;
+            }
         }
         return out;
     }
@@ -49,9 +56,20 @@ public:
     size_t size() const { return _q.size(); }
     bool   empty() const { return _q.empty(); }
 
+    // Swap the two newest entries. Used by the fault interceptor to model
+    // one adjacent reorder without retaining an out-of-queue predecessor.
+    bool swapLastTwo() {
+        if (_q.size() < 2) return false;
+        std::iter_swap(_q.end() - 1, _q.end() - 2);
+        return true;
+    }
+
     // True if any frame in the queue has a deadline <= nowMs.
     bool hasReady(uint64_t nowMs) const {
-        return !_q.empty() && _q.front().releaseAtMs <= nowMs;
+        for (const auto& frame : _q) {
+            if (frame.releaseAtMs <= nowMs) return true;
+        }
+        return false;
     }
 
     // Cap queue size. When exceeded, the OLDEST entries are dropped and

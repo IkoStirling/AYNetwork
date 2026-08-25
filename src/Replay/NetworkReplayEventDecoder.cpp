@@ -46,13 +46,14 @@ inline uint32_t translateConnId(uint32_t recorded,
 ConnectionIdRemap NetworkReplayEventDecoder::buildRemap(
     const std::vector<uint32_t>& liveConnectionIdsInAcceptOrder)
 {
-    // R6.5-2 (2026-08-25): identity mapping. The first live id maps to
-    // recorded id 0, second to 1, etc. Callers that have accept-order
+    // NetworkSubSystem::allocateNetId starts at one. The first accepted
+    // connection therefore has recorded id 1, the second id 2, etc.
+    // Callers that have accept-order
     // metadata from the live server can build a more sophisticated map
     // in R7+; the foundation player is agnostic of how ids are translated.
     ConnectionIdRemap m;
     for (size_t i = 0; i < liveConnectionIdsInAcceptOrder.size(); ++i) {
-        m[static_cast<uint32_t>(i)] = liveConnectionIdsInAcceptOrder[i];
+        m[static_cast<uint32_t>(i + 1u)] = liveConnectionIdsInAcceptOrder[i];
     }
     return m;
 }
@@ -76,6 +77,7 @@ ayt::replay::IReplayPlayer::Error NetworkReplayEventDecoder::decodeNext(
 
     if (isCheckpoint) {
         out.isCheckpoint = true;
+        out.eventType = kEvtNet_Checkpoint;
         out.snapshot = std::move(payload);
         // stateHash is not surfaced via ReplayCheckpointHeader on the
         // foundation readNextEvent path (the foundation emits a sentinel
@@ -144,7 +146,10 @@ ayt::replay::IReplayPlayer::Error NetworkReplayEventDecoder::decodeNext(
             t.serverTickAtSend = unpackU32LE(payload.data() +  8);
             const uint32_t declared = unpackU32LE(payload.data() + 12);
             const size_t avail = payload.size() - 16;
-            const size_t take = (declared <= avail) ? declared : avail;
+            if (declared > avail) {
+                return ayt::replay::IReplayPlayer::Error::Truncated;
+            }
+            const size_t take = declared;
             if (take > 0) {
                 t.payload.assign(payload.begin() + 16, payload.begin() + 16 + take);
             }
@@ -159,7 +164,10 @@ ayt::replay::IReplayPlayer::Error NetworkReplayEventDecoder::decodeNext(
             t.connectionId = translateConnId(unpackU32LE(payload.data() + 2), remap, unmappedIds);
             const uint32_t declared = unpackU32LE(payload.data() + 6);
             const size_t avail = payload.size() - 10;
-            const size_t take = (declared <= avail) ? declared : avail;
+            if (declared > avail) {
+                return ayt::replay::IReplayPlayer::Error::Truncated;
+            }
+            const size_t take = declared;
             if (take > 0) {
                 t.body.assign(payload.begin() + 10, payload.begin() + 10 + take);
             }

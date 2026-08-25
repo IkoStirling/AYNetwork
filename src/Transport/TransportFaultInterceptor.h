@@ -58,6 +58,11 @@ public:
                 std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& sendOut,
                 std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& recvOut);
 
+    size_t tickSend(uint64_t nowMs, double dtSeconds,
+                    std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& out);
+    size_t tickRecv(uint64_t nowMs, double dtSeconds,
+                    std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& out);
+
     // True if any profile is installed for this netId AND any channel
     // mask intersects with the four runtime channels. Lets callers
     // skip the interceptor entirely when it would be a no-op.
@@ -79,20 +84,22 @@ private:
     struct ChannelState {
         DelayedFrameQueue delayQueue;
         TokenBucket       bucket;
-        std::vector<uint8_t> lastFrame; // reorder-swap predecessor
-        bool              hasLastFrame = false;
     };
 
     void handleOne(uint64_t nowMs, const uint8_t* sealed, size_t len,
                    uint8_t channel,
                    DelayedFrameQueue& queue, TokenBucket& bucket,
-                   ChannelState& chState,
                    uint64_t& droppedAcc);
 
     // Returns the sampled delay (ms) for this frame using the profile's
     // mean/jitter and the controller's RNG. Always >= 0.
     static uint64_t sampleLatencyMs(const TransportFaultProfile& prof,
                                     std::mt19937_64& rng);
+
+    size_t drainDirection(
+        uint64_t nowMs, double dtSeconds,
+        std::array<ChannelState, 4>& channels,
+        std::vector<std::pair<std::vector<uint8_t>, uint8_t>>& out);
 
     uint32_t _netId;
     TransportFaultController& _ctl;

@@ -763,7 +763,10 @@ public:
     // SimulatedProxy is the default — clients only interpolate.
     // Calling on a client is a no-op (asserted via the comment; the
     // setter still records the value but it has no wire effect).
-    void setObjectProxyKind(uint32_t netId, ProxyKind kind);
+    // ownerConnectionId is required for AutonomousProxy on an authority so
+    // ACK tails can be emitted only to the owning peer. Zero means no owner.
+    void setObjectProxyKind(uint32_t netId, ProxyKind kind,
+                            uint32_t ownerConnectionId = 0);
     ProxyKind getObjectProxyKind(uint32_t netId) const;
 
     // Sugar for game code: true on the locally-controlling client, false
@@ -950,6 +953,7 @@ private:
     // R5.2 (2026-08-24) prediction scaffolding.
     // Per-netId ProxyKind. Default SimulatedProxy keeps R3-R5.1 byte behavior.
     std::unordered_map<uint32_t, ProxyKind> _proxyKinds;
+    std::unordered_map<uint32_t, uint32_t> _proxyOwnerConnections;
     // Default input ring capacity (32, drop-oldest). Mutable via
     // setInputRingCapacity (test seam).
     uint32_t _inputRingCapacity = 32;

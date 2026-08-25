@@ -285,6 +285,7 @@ public:
             case kMsgTypeReplication:
             case kMsgTypeEntitySpawn:
             case kMsgTypeEntityDespawn:
+            case kMsgTypeClientInput:
                 if (_stagedIngress) {
                     queueSimulationInbound(header.msgType,
                                            from != nullptr ? from->getId() : 0,
@@ -443,15 +444,27 @@ public:
                 // ClientInputCodec::encode emits [u32 inputSeq][u32 serverTickAtSend][bytes].
                 uint32_t inputSeq = 0, serverTickAtSend = 0;
                 if (bodySize >= 8) {
-                    std::memcpy(&inputSeq,        body + 0, 4);
-                    std::memcpy(&serverTickAtSend, body + 4, 4);
+                    inputSeq = static_cast<uint32_t>(body[0]) |
+                               (static_cast<uint32_t>(body[1]) << 8) |
+                               (static_cast<uint32_t>(body[2]) << 16) |
+                               (static_cast<uint32_t>(body[3]) << 24);
+                    serverTickAtSend = static_cast<uint32_t>(body[4]) |
+                                       (static_cast<uint32_t>(body[5]) << 8) |
+                                       (static_cast<uint32_t>(body[6]) << 16) |
+                                       (static_cast<uint32_t>(body[7]) << 24);
                 }
                 std::vector<uint8_t> inBuf(16 + bodySize);
-                std::memcpy(inBuf.data() +  0, &fromId,            4);
-                std::memcpy(inBuf.data() +  4, &inputSeq,          4);
-                std::memcpy(inBuf.data() +  8, &serverTickAtSend,  4);
+                auto writeU32 = [&inBuf](size_t offset, uint32_t value) {
+                    inBuf[offset + 0] = static_cast<uint8_t>(value);
+                    inBuf[offset + 1] = static_cast<uint8_t>(value >> 8);
+                    inBuf[offset + 2] = static_cast<uint8_t>(value >> 16);
+                    inBuf[offset + 3] = static_cast<uint8_t>(value >> 24);
+                };
+                writeU32(0, fromId);
+                writeU32(4, inputSeq);
+                writeU32(8, serverTickAtSend);
                 const uint32_t blen = static_cast<uint32_t>(bodySize);
-                std::memcpy(inBuf.data() + 12, &blen,              4);
+                writeU32(12, blen);
                 std::memcpy(inBuf.data() + 16, body,               bodySize);
                 rec->recordEvent(_replicationManager.getServerTick(), ayt::net::replay::kEvtNet_InputBatch,
                                  inBuf.data(), inBuf.size());
@@ -914,6 +927,7 @@ public:
                            size_t size) override {
         if (!payload && size != 0) return;
         using ayt::net::replay::kEvtNet_AuthorityChange;
+        using ayt::net::replay::kEvtNet_Checkpoint;
         using ayt::net::replay::kEvtNet_DeltaSnapshot;
         using ayt::net::replay::kEvtNet_Despawn;
         using ayt::net::replay::kEvtNet_InitialFullSnapshot;
@@ -922,6 +936,30 @@ public:
         using ayt::net::replay::kEvtNet_Spawn;
 
         switch (eventType) {
+        case kEvtNet_Checkpoint: {
+            // [u32 count], then count entries of
+            // [u32 netId][u32 bodySize][replication body].
+            if (size < 4) return;
+            auto readU32 = [](const uint8_t* p) {
+                return static_cast<uint32_t>(p[0]) |
+                       (static_cast<uint32_t>(p[1]) << 8) |
+                       (static_cast<uint32_t>(p[2]) << 16) |
+                       (static_cast<uint32_t>(p[3]) << 24);
+            };
+            const uint32_t count = readU32(payload);
+            size_t offset = 4;
+            for (uint32_t i = 0; i < count; ++i) {
+                if (offset > size || size - offset < 8) return;
+                const uint32_t bodySize = readU32(payload + offset + 4);
+                offset += 8;
+                if (bodySize > size - offset) return;
+                BitStream stream(const_cast<uint8_t*>(payload + offset), bodySize);
+                stream.resetForRead();
+                (void)_replicationManager.onReceive(kMsgTypeReplication, stream, nullptr);
+                offset += bodySize;
+            }
+            return;
+        }
         case kEvtNet_InitialFullSnapshot: {
             // Prefix: [u32 connId][u8 frameFlags]; body follows.
             if (size < 5) return;
@@ -984,8 +1022,8 @@ public:
                 (static_cast<uint32_t>(payload[14]) << 16) |
                 (static_cast<uint32_t>(payload[15]) << 24);
             const size_t avail = (size > 16) ? (size - 16) : 0;
-            const size_t take  = (declaredLen <= avail) ? declaredLen : avail;
-            (void)_replicationManager.onClientInput(connId, payload + 16, take);
+            if (declaredLen > avail) return;
+            (void)_replicationManager.onClientInput(connId, payload + 16, declaredLen);
             return;
         }
         case kEvtNet_RpcBatch: {
@@ -1000,7 +1038,8 @@ public:
                 (static_cast<uint32_t>(payload[8]) << 16) |
                 (static_cast<uint32_t>(payload[9]) << 24);
             const size_t avail = (size > 10) ? (size - 10) : 0;
-            const size_t take  = (declaredLen <= avail) ? declaredLen : avail;
+            if (declaredLen > avail) return;
+            const size_t take = declaredLen;
             // Build a BitStream over the recorded body and route to the
             // matching RPC handler. The body is captured as a side buffer
             // because the decoder's payload pointer outlives this scope.
@@ -1026,15 +1065,20 @@ public:
         }
         case kEvtNet_AuthorityChange: {
             // Prefix: [u32 netId][u8 oldKind][u8 newKind][u32 connId][u32 reserved].
-            if (size < 10) return;
+            if (size < 14) return;
             const uint32_t netId =
                 static_cast<uint32_t>(payload[0])        |
                 (static_cast<uint32_t>(payload[1]) <<  8) |
                 (static_cast<uint32_t>(payload[2]) << 16) |
                 (static_cast<uint32_t>(payload[3]) << 24);
             const uint8_t newKind = payload[5];
+            const uint32_t connectionId =
+                static_cast<uint32_t>(payload[6])        |
+                (static_cast<uint32_t>(payload[7]) <<  8) |
+                (static_cast<uint32_t>(payload[8]) << 16) |
+                (static_cast<uint32_t>(payload[9]) << 24);
             _replicationManager.setObjectProxyKind(
-                netId, static_cast<ProxyKind>(newKind));
+                netId, static_cast<ProxyKind>(newKind), connectionId);
             return;
         }
         default:
@@ -1055,6 +1099,7 @@ public:
     void installReplayRngSeed(uint64_t seed) override {
         _replayRngSeed = seed;
         _replayRngSeedSet = true;
+        _faultCtl.setSessionSeed(seed);
     }
 
     // R6.5-3 (2026-08-25): read-back accessors for the bridge state. The

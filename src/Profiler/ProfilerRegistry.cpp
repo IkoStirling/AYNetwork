@@ -162,7 +162,12 @@ void ProfilerRegistry::fillLiveStatus(uint32_t connNetId, ConnLiveStatus& out) c
     //   m_flConnectionQualityLocal/Remote
     // No m_nMsgsReceived/Sent counters in this GNS version — we leave
     // inMessageCount/outMessageCount at 0 (their default).
-    if (GnsConnection::s_gns) {
+    // A default/disconnected wrapper has no live GNS handle. Do not query
+    // the global interface with k_HSteamNetConnection_Invalid: after another
+    // test/subsystem initialized GNS, some backends return a zero-filled
+    // status and overwrite the documented -1 quality sentinel.
+    if (GnsConnection::s_gns &&
+        conn->getInnerConnection() != k_HSteamNetConnection_Invalid) {
         SteamNetConnectionRealTimeStatus_t status{};
         SteamNetConnectionRealTimeLaneStatus_t lane{};
         if (GnsConnection::s_gns->GetConnectionRealTimeStatus(
@@ -230,18 +235,19 @@ bool ProfilerRegistry::snapshotFor(uint32_t connNetId, ProfilerSnapshot& out) co
     for (const auto& [k, v] : sortedExtras) {
         out.byMsgTypeExtras.emplace(k, v);
     }
-    // R6 C8 M-16 (2026-08-25): perNetId sorted by netId primary,
-    // cumulativeSendBytes secondary (was: by cumulativeSendBytes only,
-    // which made snapshot ordering depend on per-window byte totals
-    // that vary with any fault-profile perturbation).
+    // Highest cumulative wire cost first, with netId as a deterministic
+    // tie-breaker. This preserves the profiler's "top bandwidth ghosts"
+    // contract without relying on unordered_map iteration order.
     out.perNetId.reserve(c.perNetId.size());
     for (const auto& [gnid, e] : c.perNetId) {
         out.perNetId.push_back(e);
     }
     std::sort(out.perNetId.begin(), out.perNetId.end(),
               [](const NetIdWireCost& a, const NetIdWireCost& b) {
-                  if (a.netId != b.netId) return a.netId < b.netId;
-                  return a.cumulativeSendBytes > b.cumulativeSendBytes;
+                  if (a.cumulativeSendBytes != b.cumulativeSendBytes) {
+                      return a.cumulativeSendBytes > b.cumulativeSendBytes;
+                  }
+                  return a.netId < b.netId;
               });
     fillLiveStatus(connNetId, out.live);
     return true;

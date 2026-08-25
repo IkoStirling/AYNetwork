@@ -6,6 +6,7 @@
 #include <AYReplay/ReplayHash.h>
 
 #include <cstring>
+#include <limits>
 
 namespace ayt::net::replay
 {
@@ -103,15 +104,15 @@ uint32_t NetworkReplayRecorderAdapter::rotationIndex() const
 
 bool NetworkReplayRecorderAdapter::recordInitialFullSnapshot(
     uint32_t connectionId, uint32_t serverTick, uint8_t frameFlags,
-    const uint8_t* sealedPayload, size_t size)
+    const uint8_t* bodyPayload, size_t size)
 {
     if (!_authorityGateOk) return true;
     const size_t varLen = size;
     std::vector<uint8_t> buf(5 + varLen);
     packU32LE(buf.data(), connectionId);
     buf[4] = frameFlags;
-    if (size > 0 && sealedPayload) {
-        std::memcpy(buf.data() + 5, sealedPayload, size);
+    if (size > 0 && bodyPayload) {
+        std::memcpy(buf.data() + 5, bodyPayload, size);
     }
     return _inner->recordEvent(serverTick, kEvtNet_InitialFullSnapshot,
                                buf.data(), buf.size());
@@ -146,14 +147,14 @@ bool NetworkReplayRecorderAdapter::recordDespawn(
 
 bool NetworkReplayRecorderAdapter::recordDeltaSnapshot(
     uint32_t connectionId, uint32_t serverTick, uint8_t frameFlags,
-    const uint8_t* sealedPayload, size_t size)
+    const uint8_t* bodyPayload, size_t size)
 {
     if (!_authorityGateOk) return true;
     std::vector<uint8_t> buf(5 + size);
     packU32LE(buf.data(), connectionId);
     buf[4] = frameFlags;
-    if (size > 0 && sealedPayload) {
-        std::memcpy(buf.data() + 5, sealedPayload, size);
+    if (size > 0 && bodyPayload) {
+        std::memcpy(buf.data() + 5, bodyPayload, size);
     }
     return _inner->recordEvent(serverTick, kEvtNet_DeltaSnapshot,
                                buf.data(), buf.size());
@@ -216,20 +217,37 @@ bool NetworkReplayRecorderAdapter::recordPeriodicCheckpoint(
     if (!_authorityGateOk) return true;
     if (!_inner || !provider) return false;
 
-    // Combine FNV-1a across every registered ghost's bytes. The order
-    // is defined by the iteration order of registeredNetIds, so a
-    // deterministic playback is possible later (v2).
+    // Store a restartable snapshot as [count] + repeated
+    // [netId][bodySize][replicationBody] entries while hashing the exact
+    // same identity and bytes.
     uint64_t h = ayt::replay::kFnv1a64Offset;
     std::vector<uint8_t> scratch;
-    bool any = false;
+    std::vector<uint8_t> snapshot(4, 0);
+    uint32_t count = 0;
     for (uint32_t netId : registeredNetIds) {
         scratch.clear();
         if (!provider(netId, scratch)) continue;
-        any = true;
+        if (scratch.size() > std::numeric_limits<uint32_t>::max()) return false;
+        const size_t oldSize = snapshot.size();
+        if (oldSize > std::numeric_limits<size_t>::max() - 8u - scratch.size()) {
+            return false;
+        }
+        snapshot.resize(oldSize + 8u + scratch.size());
+        packU32LE(snapshot.data() + oldSize, netId);
+        packU32LE(snapshot.data() + oldSize + 4u,
+                  static_cast<uint32_t>(scratch.size()));
+        if (!scratch.empty()) {
+            std::memcpy(snapshot.data() + oldSize + 8u,
+                        scratch.data(), scratch.size());
+        }
+        h = ayt::replay::fnv1a64Combine(h, snapshot.data() + oldSize, 4u);
         h = ayt::replay::fnv1a64Combine(h, scratch.data(), scratch.size());
+        ++count;
     }
-    if (!any) return false;
-    return _inner->recordCheckpoint(serverTick, h, nullptr, 0);
+    if (count == 0) return false;
+    packU32LE(snapshot.data(), count);
+    return _inner->recordCheckpoint(serverTick, h,
+                                    snapshot.data(), snapshot.size());
 }
 
 } // namespace ayt::net::replay

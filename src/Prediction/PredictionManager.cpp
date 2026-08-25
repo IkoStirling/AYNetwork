@@ -29,12 +29,9 @@ bool PredictionManager::onClientInput(uint32_t connectionId,
         return false;
     }
 
-    InputRing& ring = _rings[connectionId]; // default-constructs on first use
-    // Ensure the ring honors current cap. Existing rings stay as they were
-    // (documented); but a fresh entry picks up _ringCapacity.
-    // We can't resize an existing InputRing without losing data, so this
-    // is a "first-touch wins" semantic. Tests that change cap mid-game
-    // must drain / recreate. Documented in header.
+    auto [it, inserted] = _rings.try_emplace(connectionId, _ringCapacity);
+    (void)inserted;
+    InputRing& ring = it->second;
 
     ClientInputRecord rec;
     rec.inputSeq = inputSeq;
@@ -167,6 +164,12 @@ void PredictionManager::setLayoutHash(uint32_t netId, uint64_t h)
 {
     auto it = _ghosts.find(netId);
     if (it != _ghosts.end()) it->second.layoutHash = h;
+}
+
+uint32_t PredictionManager::lastPredictedInputSeq(uint32_t netId) const
+{
+    auto it = _ghosts.find(netId);
+    return it != _ghosts.end() ? it->second.lastPredictedForInputSeq : 0u;
 }
 
 } // namespace ayt::net
