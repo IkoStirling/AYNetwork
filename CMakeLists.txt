@@ -27,6 +27,7 @@ set(SRC_FILES
     src/Transport/DelayedFrameQueue.cpp          # R5.4 (2026-08-25)
     src/Transport/TransportFaultController.cpp   # R5.4
     src/Transport/TransportFaultInterceptor.cpp   # R5.4
+    src/Profiler/ProfilerRegistry.cpp            # R5.5 (2026-08-25)
 )
 
 # R1 (2026-07-26): wire up GameNetworkingSockets via vcpkg. See design.md §14.
@@ -87,6 +88,7 @@ target_include_directories(${MODULE_NAME} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Transport
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Snapshot
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Prediction   # R5.2 (2026-08-24)
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Profiler     # R5.5 (2026-08-25)
     ${CMAKE_CURRENT_SOURCE_DIR}/interface
     ${CMAKE_CURRENT_SOURCE_DIR}/interface/AYNetwork/Replay  # R5.3 (2026-08-24)
     ${CMAKE_CURRENT_SOURCE_DIR}

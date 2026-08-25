@@ -14,6 +14,7 @@
 #include <AYReplay/IReplayRecorder.h>
 #include <AYNetwork/Replay/NetworkReplayTypes.h>
 #include "TransportFaultController.h"    // R5.4 (2026-08-25)
+#include <AYNetwork/Profiler/ProfilerRegistry.h>  // R5.5 (2026-08-25)
 // R1.A (2026-07-27): pull in EResult + AcceptConnection signature. The
 // GnsConnection.cpp TU-private includes are sufficient because s_gns is a
 // fully-typed pointer in this TU — we just need the constants.
@@ -89,6 +90,7 @@ public:
         }
         _initialized = true;
         _driverMode = DriverMode::Unknown;
+        setupProfilerHooks();
         ::printf("[Network] Initialized (GNS ready)\n");
         return true;
     }
@@ -106,6 +108,10 @@ public:
         pumpTransport();
         _replicationManager.tick(deltaTime);
         _rpcHandler.tick(deltaTime);
+        // R5.5 (2026-08-25): tick the profiler window + periodic dump.
+        _profiler.tickWindow(_replicationManager.getServerTick());
+        _profiler.dumpPeriodicIfDue();
+        fireProfilerSinkIfSet();
     }
 
     void tick(::ayt::game::FramePhase phase,
@@ -139,6 +145,12 @@ public:
             if (auto* rec = _replicationManager.getReplayRecorder()) {
                 rec->flush();
             }
+            // R5.5 (2026-08-25): tick the profiler window + periodic dump
+            // at end-of-tick so a snapshot pulled after Egress reflects
+            // the just-completed serverTick's contributions.
+            _profiler.tickWindow(_replicationManager.getServerTick());
+            _profiler.dumpPeriodicIfDue();
+            fireProfilerSinkIfSet();
         }
     }
 
@@ -202,6 +214,7 @@ public:
         const uint32_t netId = allocateNetId();
         rawChild->setNetId(netId);                         // R5.4
         rawChild->attachFaultController(&_faultCtl);        // R5.4
+        hookGnsConnection(rawChild);                        // R5.5
         auto netConn = std::make_unique<NetConnectionImpl>(rawChild, netId);
         NetConnectionImpl* netPtr = netConn.get();
 
@@ -574,6 +587,7 @@ public:
         const uint32_t clientNetId = allocateNetId();
         _clientConn->setNetId(clientNetId);                    // R5.4
         _clientConn->attachFaultController(&_faultCtl);       // R5.4
+        hookGnsConnection(_clientConn.get());                 // R5.5
         _clientNetConn = std::make_unique<NetConnectionImpl>(
             _clientConn.get(), clientNetId);
         _mode = ConnectionMode::Client;
@@ -609,6 +623,10 @@ public:
         _serverConn = std::make_unique<GnsConnection>();
         _serverConn->setProtocolVersion(_protocolVersion);
         _serverConn->initServer(port);
+        // The listen conn is just a socket — no peer netId, no messages
+        // flow through it. Hooking it would inject netId=0 records which
+        // ProfilerRegistry::recordSend drops (early return at line 47).
+        // Skip hookGnsConnection here; children hook themselves when accepted.
         const HSteamListenSocket listener = _serverConn->getInnerListenSocket();
         GnsConnection::setAdoptFactory(
             listener,
@@ -846,6 +864,98 @@ public:
         return _faultCtl.getProfile(netId);
     }
 
+    // ===== R5.5 (2026-08-25) bandwidth / connection profiler =====
+    void getProfilerSnapshot(ProfilerSnapshot& out, uint32_t netId) override {
+        _profiler.snapshotFor(netId, out);
+    }
+    void getProfilerSnapshots(std::vector<ProfilerSnapshot>& out) override {
+        _profiler.snapshotAll(out);
+    }
+    void setProfilerSinkForTesting(
+        std::function<void(const ProfilerSnapshot&)> sink) override {
+        _profiler.setSink(std::move(sink));
+    }
+    void setProfilerDumpInterval(uint32_t ticks) override {
+        _profiler.setDumpEveryTicks(ticks);
+    }
+
+    // Wire the profiler hooks into ReplicationManager, RpcHandler, and any
+    // GnsConnections that exist at the time of call. New connections built
+    // later (connectNow / adoptIncomingClient) call hookGnsConnection()
+    // inline so their bytes count toward the same per-connection state.
+    //
+    // Called once from initialize(). Idempotent — replacing a hook is fine.
+    void setupProfilerHooks() {
+        // ReplicationManager: (connNetId, msgType, bytes, ghostNetId)
+        _replicationManager.setProfilerSendHook(
+            [this](uint32_t connNetId, uint16_t msgType, uint64_t bytes, uint32_t ghostNetId) {
+                _profiler.recordSend(connNetId, msgType, bytes, ghostNetId);
+            });
+
+        // RpcHandler: (connNetId, msgType, bytes) — no ghost association.
+        _rpcHandler.setProfilerRpcHook(
+            [this](uint32_t connNetId, uint16_t msgType, uint64_t bytes) {
+                _profiler.recordSend(connNetId, msgType, bytes, /*ghostNetId=*/ 0);
+            });
+
+        // GnsConnection (already created before initialize): client conn,
+        // server listen conn, server children.
+        if (_clientConn) hookGnsConnection(_clientConn.get());
+        if (_serverConn) hookGnsConnection(_serverConn.get());
+        for (auto& rec : _serverClients) {
+            if (rec.transport) hookGnsConnection(rec.transport.get());
+        }
+
+        // ConnAccessor — the registry needs a way to ask "who owns netId X"
+        // when building the live-status row of a snapshot. Return a pointer
+        // to whichever GnsConnection carries the given netId (server child,
+        // client conn, or server listen conn). Null when not found.
+        _profiler.setConnAccessorForTesting(
+            [this](uint32_t connNetId, const GnsConnection*& out) {
+                if (_clientConn && _clientConn->getNetId() == connNetId) {
+                    out = _clientConn.get();
+                    return;
+                }
+                if (_serverConn && _serverConn->getNetId() == connNetId) {
+                    out = _serverConn.get();
+                    return;
+                }
+                for (auto& rec : _serverClients) {
+                    if (rec.transport && rec.transport->getNetId() == connNetId) {
+                        out = rec.transport.get();
+                        return;
+                    }
+                }
+                out = nullptr;
+            });
+    }
+
+    // Attach the profiler hooks to a single GnsConnection (send + recv).
+    // Uses the connection's own netId so the registry can bucket counters.
+    void hookGnsConnection(GnsConnection* conn) {
+        if (!conn) return;
+        const uint32_t netId = conn->getNetId();
+        conn->setProfilerSendHook(
+            [this, netId](uint16_t msgType, uint64_t bytes) {
+                _profiler.recordSend(netId, msgType, bytes, /*ghostNetId=*/ 0);
+            });
+        conn->setProfilerRecvHook(
+            [this, netId](uint16_t msgType, uint64_t bytes) {
+                _profiler.recordRecv(netId, msgType, bytes, /*ghostNetId=*/ 0);
+            });
+    }
+
+    // Build a snapshot vector (one entry per active connection) and fan it
+    // out to the test sink if one was registered. Called after tickWindow
+    // + dumpPeriodicIfDue so the snapshot reflects the just-completed tick.
+    void fireProfilerSinkIfSet() {
+        std::vector<ProfilerSnapshot> snaps;
+        _profiler.snapshotAll(snaps);
+        for (const auto& s : snaps) {
+            _profiler.fireSink(s);
+        }
+    }
+
     // ===== R4.0 RPC =====
     RpcHandler* getRpcHandler() override {
         return &_rpcHandler;
@@ -892,6 +1002,13 @@ private:
     // RNG map keyed by netId. GnsConnection instances pull profiles
     // through it on every send/recv tick.
     TransportFaultController _faultCtl;
+
+    // R5.5 (2026-08-25): bandwidth / connection profiler. Owns the
+    // per-connection counters and the periodic stderr dump machinery.
+    // Pull API goes through the four override methods above; the hook
+    // for ReplicationManager / RpcHandler / GnsConnection is wired in
+    // setupProfilerHooks() called from the constructor.
+    ProfilerRegistry _profiler;
     std::mutex _simulationInboundMutex;
     std::deque<PendingSimulationInbound> _simulationInbound;
     size_t _simulationInboundBytes = 0;

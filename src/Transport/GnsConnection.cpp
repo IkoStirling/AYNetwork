@@ -17,6 +17,7 @@
 #include <AYNetwork/Transport/GnsConnection.h>
 #include <AYNetwork/INetwork.h>                  // R1 done: HandshakeMsgType / DisconnectReason / kProtocolVersion
 #include <AYNetwork/Protocol/PacketCodec.h>                  // R2: framing layer
+#include <AYNetwork/Profiler/ProfilerMsgType.h> // R5.5 (2026-08-25): handshake extras-key helper
 #include "TransportFaultController.h"      // R5.4 (2026-08-25)
 #include "TransportFaultInterceptor.h"     // R5.4
 
@@ -496,6 +497,16 @@ GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
 
     result.budgetExhausted =
         result.messages >= maxMessages || result.bytes >= maxBytes;
+    // R5.5 (2026-08-25): cache the inbound byte total on every known
+    // owner so getLastPumpBytes() can return it from the profiler path
+    // without re-running GNS. We attribute the full pump total to each
+    // owner — the per-message m_conn ownership information is already
+    // discarded by the time we reach this point, and the profiler only
+    // needs a per-connection trend ("is this connection draining
+    // inbound traffic?"), not byte-accurate attribution.
+    for (GnsConnection* owner : owners) {
+        owner->_lastPumpBytes = result.bytes;
+    }
     return result;
 }
 
@@ -894,6 +905,12 @@ void GnsConnection::_sendHello() {
         nowMs(),
         /*compress=*/false);
     (void)_rawSend(wire.data(), static_cast<uint32_t>(wire.size()), CHANNEL_RELIABLE);
+    // R5.5 (2026-08-25): profiler hook — handshake bytes count toward
+    // the byMsgTypeExtras map keyed by handshakeExtrasKey(Hello).
+    if (_profilerSendHook) {
+        _profilerSendHook(profiler::handshakeExtrasKey(HandshakeMsgType::Hello),
+                          static_cast<uint64_t>(wire.size()));
+    }
 }
 
 void GnsConnection::_sendWelcome() {
@@ -910,6 +927,10 @@ void GnsConnection::_sendWelcome() {
         nowMs(),
         /*compress=*/false);
     (void)_rawSend(wire.data(), static_cast<uint32_t>(wire.size()), CHANNEL_RELIABLE);
+    if (_profilerSendHook) {
+        _profilerSendHook(profiler::handshakeExtrasKey(HandshakeMsgType::Welcome),
+                          static_cast<uint64_t>(wire.size()));
+    }
 }
 
 void GnsConnection::_sendReject(DisconnectReason reason) {
@@ -928,6 +949,10 @@ void GnsConnection::_sendReject(DisconnectReason reason) {
     // linger=true (in _handleHandshake's protocol-mismatch path) is what
     // guarantees the flush.
     (void)_rawSend(wire.data(), static_cast<uint32_t>(wire.size()), CHANNEL_RELIABLE);
+    if (_profilerSendHook) {
+        _profilerSendHook(profiler::handshakeExtrasKey(HandshakeMsgType::Reject),
+                          static_cast<uint64_t>(wire.size()));
+    }
 }
 
 void GnsConnection::_handleHandshake(const uint8_t* data, size_t len) {
@@ -1035,6 +1060,23 @@ void GnsConnection::onRawData(const uint8_t* data, size_t len) {
             decoded.header.flags & ~static_cast<uint8_t>(PacketFlag::Fragmented));
     }
 
+    // R5.5 (2026-08-25): profiler hook — count decoded inbound bytes by
+    // msgType (or by handshake sub-type for kMsgTypeHandshake). We
+    // deliberately record BEFORE any downstream drop (CRC-decode-fail is
+    // already filtered above; the AppAck / Handshake early-returns
+    // below are still "received" so they count).
+    if (_profilerRecvHook) {
+        if (hdr.msgType == kMsgTypeHandshake && !decoded.body.empty()) {
+            uint8_t sub = decoded.body[0];
+            _profilerRecvHook(profiler::handshakeExtrasKey(
+                                  static_cast<HandshakeMsgType>(sub)),
+                              static_cast<uint64_t>(decoded.body.size()));
+        } else {
+            _profilerRecvHook(hdr.msgType,
+                              static_cast<uint64_t>(decoded.body.size()));
+        }
+    }
+
     // Handshake path. The HandshakeMsgType byte lives at body[0] (R1 wire
     // format unchanged — only the envelope changed). Only valid during
     // Handshaking or Connected (server-side: just-accepted children fire
@@ -1052,6 +1094,13 @@ void GnsConnection::onRawData(const uint8_t* data, size_t len) {
         if (AckPipeline::unwrapAckableBody(decoded.body, ackSeq)) {
             auto ackWire = AckPipeline::sealAck(ackSeq, nowMs());
             (void)_rawSend(ackWire.data(), static_cast<uint32_t>(ackWire.size()), CHANNEL_ACK);
+            // R5.5 (2026-08-25): profiler hook — AppAck wire bytes
+            // count toward the byMsgTypeExtras map keyed by msgType
+            // (AppAck has its own slot entry, no handshake sub-encoding).
+            if (_profilerSendHook) {
+                _profilerSendHook(kMsgTypeAppAck,
+                                  static_cast<uint64_t>(ackWire.size()));
+            }
         } else {
             return;
         }

@@ -591,6 +591,14 @@ bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream
         _replay->recordEvent(/*tick=*/ 0, /*type=*/ 0x10006u /*kEvtNet_RpcBatch*/,
                              hdrBuf.data(), hdrBuf.size());
     }
+    // R5.5 (2026-08-25) profiler hook — RPC envelope wire bytes. ghostNetId
+    // is 0 (RPCs aren't per-entity); connNetId = target->getId() when
+    // targeted, 0 when broadcast.
+    if (_profilerHook) {
+        const uint32_t connNetId = target ? target->getId() : 0u;
+        _profilerHook(connNetId, envelopeMsgType,
+                      static_cast<uint64_t>(sealed.size()));
+    }
     return true;
 }
 

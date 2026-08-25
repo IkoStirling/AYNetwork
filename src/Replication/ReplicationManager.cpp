@@ -339,6 +339,11 @@ void ReplicationManager::unregisterObject(uint32_t netId) {
                 sendSealedToConnection(target, CHANNEL_RELIABLE, sealed.data(), sealed.size());
                 // R5.3 (2026-08-24) Replay wire-tap: uninstantiate Despawn.
                 recordDespawn(_replay, connectionId, _serverTick, netId);
+                // R5.5 (2026-08-25) profiler hook — Despawn wire bytes.
+                if (_profilerHook) {
+                    _profilerHook(connectionId, kMsgTypeEntityDespawn,
+                                  static_cast<uint64_t>(sealed.size()), netId);
+                }
             }
         }
     }
@@ -484,6 +489,11 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                 // R5.3 (2026-08-24) Replay wire-tap: capture Despawn for
                 // the previous peer that lost visibility.
                 recordDespawn(_replay, peerIt->first, _serverTick, netId);
+                // R5.5 (2026-08-25) profiler hook — interest-exit Despawn.
+                if (_profilerHook) {
+                    _profilerHook(peerIt->first, kMsgTypeEntityDespawn,
+                                  static_cast<uint64_t>(wire.size()), netId);
+                }
             }
             peerIt = e._peers.erase(peerIt);
         }
@@ -515,6 +525,11 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                 recordSpawn(_replay, connectionId, _serverTick,
                             netId, ReflectSerializer::hashTypeSchema(e.type),
                             spawnWire.data(), spawnWire.size());
+                // R5.5 (2026-08-25) profiler hook — EntitySpawn bytes.
+                if (_profilerHook) {
+                    _profilerHook(connectionId, kMsgTypeEntitySpawn,
+                                  static_cast<uint64_t>(spawnWire.size()), netId);
+                }
                 peer.visible = true;
                 peer.initialized = false;
                 peer.fieldHashes.clear();
@@ -551,6 +566,11 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                     recordFullSnapshot(_replay, connectionId, _serverTick,
                                        frameFlags,
                                        fullWire.data(), fullWire.size());
+                    // R5.5 (2026-08-25) profiler hook — Full Snapshot.
+                    if (_profilerHook) {
+                        _profilerHook(connectionId, kMsgTypeReplication,
+                                      static_cast<uint64_t>(fullWire.size()), netId);
+                    }
                 }
                 continue;
             }
@@ -581,6 +601,11 @@ void ReplicationManager::tick(float /*deltaTime*/) {
                 recordDeltaSnapshot(_replay, connectionId, _serverTick,
                                     /*frameFlags=*/ 0,
                                     deltaWire.data(), deltaWire.size());
+                // R5.5 (2026-08-25) profiler hook — Delta frame.
+                if (_profilerHook) {
+                    _profilerHook(connectionId, kMsgTypeDelta,
+                                  static_cast<uint64_t>(deltaWire.size()), netId);
+                }
             }
         }
 
@@ -867,6 +892,13 @@ bool ReplicationManager::rebroadcastEntitySpawn(uint32_t netId, NetConnection* t
                     sealed.data(), sealed.size());
         recordFullSnapshot(_replay, connectionId, _serverTick, /*frameFlags=*/ 0,
                            fullWire.data(), fullWire.size());
+        // R5.5 (2026-08-25) profiler hook — rebroadcast Spawn + Full.
+        if (_profilerHook) {
+            _profilerHook(connectionId, kMsgTypeEntitySpawn,
+                          static_cast<uint64_t>(sealed.size()), netId);
+            _profilerHook(connectionId, kMsgTypeReplication,
+                          static_cast<uint64_t>(fullWire.size()), netId);
+        }
         auto& peer = e._peers[connectionId];
         peer.visible = true;
         peer.initialized = true;

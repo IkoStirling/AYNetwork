@@ -251,6 +251,16 @@ public:
     void setReplayRecorder(ayt::replay::IReplayRecorder* r) { _replay = r; }
     ayt::replay::IReplayRecorder* getReplayRecorder() const { return _replay; }
 
+    // R5.5 (2026-08-25) profiler send hook. Mirrors ReplicationManager's
+    // setProfilerSendHook: called after every successful emit() for the
+    // three envelope msgTypes (kMsgTypeRpcRequest/Response/Reject). RPC
+    // traffic isn't per-ghost (no netId association), so ghostNetId=0.
+    // Default null = no-op. Lifetime managed by the caller (subsystem).
+    using ProfilerRpcHook = std::function<void(uint32_t connNetId,
+                                               uint16_t msgType,
+                                               uint64_t bytes)>;
+    void setProfilerRpcHook(ProfilerRpcHook hook) { _profilerHook = std::move(hook); }
+
     // ===== Registry access (for tests + downstream RpcSerializer callers) =====
     //
     // Map of methodHash(FNV-1a-32 low-16) → IMethodInfo for every
@@ -335,6 +345,9 @@ private:
     size_t _responseCompressMinBytes = RpcResponseCompressMinBytes;
     ayt::replay::IReplayRecorder* _replay = nullptr;
     std::unique_ptr<RpcAsyncPool> _asyncPool;
+
+    // R5.5 (2026-08-25): profiler send hook for RPC envelope msgTypes.
+    ProfilerRpcHook _profilerHook;
 };
 
 } // namespace ayt::net

@@ -23,6 +23,12 @@
 // CHANNEL_* constants below — so this include is safe to put BEFORE them.
 #include <AYNetwork/TransportFaultProfile.h>
 
+// R5.5 (2026-08-25): ProfilerSnapshot is a header-only POD struct also
+// declared inside ayt::net — no transitive AYNetwork deps. We include it
+// here so the pull-API virtuals below can take ProfilerSnapshot by
+// reference and callers don't need a separate include.
+#include <AYNetwork/Profiler/ProfilerSnapshot.h>
+
 namespace ayt::net
 {
 
@@ -357,6 +363,26 @@ public:
                                           const TransportFaultProfile& /*profile*/) {}
     virtual void clearTransportFaultProfile(uint32_t /*netId*/) {}
     virtual const TransportFaultProfile* getTransportFaultProfile(uint32_t /*netId*/) const { return nullptr; }
+
+    // R5.5 (2026-08-25): bandwidth / connection profiler pull API.
+    // Default impls are no-ops so existing test stubs that inherit
+    // `INetworkSubSystem` don't need to override them. Production
+    // (`AYNetworkSubSystem`) overrides all four to its internal
+    // `ProfilerRegistry`. Pull is from the main thread only — the
+    // profiler is single-threaded by design (record* / snapshot / window
+    // tick all run on the update path).
+    //
+    // getProfilerSnapshot copies one snapshot for a single connection
+    // (the conn's AYNetwork netId). getProfilerSnapshots clears `out`
+    // and appends one entry per known connection (typically ≤ 64).
+    // setProfilerSinkForTesting installs an after-each-update callback.
+    // setProfilerDumpInterval enables the periodic [AYProfiler] stderr
+    // dump every N window-ticks (0 = off, default).
+    virtual void getProfilerSnapshot(ProfilerSnapshot& /*out*/, uint32_t /*netId*/) {}
+    virtual void getProfilerSnapshots(std::vector<ProfilerSnapshot>& /*out*/) {}
+    virtual void setProfilerSinkForTesting(
+        std::function<void(const ProfilerSnapshot&)> /*sink*/) {}
+    virtual void setProfilerDumpInterval(uint32_t /*ticks*/) {}
 };
 
 // =============================================================================
@@ -790,6 +816,20 @@ public:
     void setReplayRecorder(ayt::replay::IReplayRecorder* r) { _replay = r; }
     ayt::replay::IReplayRecorder* getReplayRecorder() const { return _replay; }
 
+    // R5.5 (2026-08-25): profiler send hook. Called for every sealed
+    // replication frame the manager would broadcast (Full / Delta /
+    // Spawn / Despawn). Signature mirrors the GnsConnection transport
+    // hook: (connNetId, msgType, bytes, ghostNetId). Default null =
+    // no-op. Lifetime managed by the caller (typically the subsystem).
+    // The hook fires AFTER sendSealedToConnection returns success, so
+    // bytes reflects the post-broadcast count (consistent with the
+    // transport-layer hooks).
+    using ProfilerSendHook = std::function<void(uint32_t connNetId,
+                                                uint16_t msgType,
+                                                uint64_t bytes,
+                                                uint32_t ghostNetId)>;
+    void setProfilerSendHook(ProfilerSendHook hook) { _profilerHook = std::move(hook); }
+
 private:
 
     std::vector<NetConnection*> buildInterestTargets(
@@ -845,6 +885,10 @@ private:
     // R5.3 (2026-08-24): Replay recorder pointer (non-owning). See public
     // setter above for lifetime contract.
     ayt::replay::IReplayRecorder* _replay = nullptr;
+
+    // R5.5 (2026-08-25): profiler send hook. Set by AYNetworkSubSystem at
+    // construction time; default null keeps test stubs zero-cost.
+    ProfilerSendHook _profilerHook;
 };
 
 #if defined(AYNETWORK_BUILD_TESTS)

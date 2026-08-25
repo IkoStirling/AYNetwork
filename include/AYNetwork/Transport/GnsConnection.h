@@ -227,6 +227,14 @@ public:
     // Test seams for AckPipeline integration.
     size_t pendingAckCountForTesting() const { return _ackTracker.pendingCount(); }
 
+    // R5.5 (2026-08-25): profiler hooks. pendingFragmentBytesForTesting is
+    // the AYNetwork-side reassembly queue (PacketAssembler::pendingBytes);
+    // getLastPumpBytes is the inbound byte count from the most recent
+    // pump() iteration, cached so the profiler snapshot doesn't have to
+    // re-run GNS. Cached values are refreshed by the next pump().
+    uint32_t pendingFragmentBytesForTesting() const { return static_cast<uint32_t>(_assembler.pendingBytes()); }
+    uint32_t getLastPumpBytes() const { return _lastPumpBytes; }
+
     // ===== R5.4 test seam: FakeTransport =====
     // Mirrors `ReplicationManager::setBroadcastSinkForTesting` (INetwork.h).
     // When a non-null `FakeTransportSender` is installed, `_rawSend` calls
@@ -254,6 +262,18 @@ public:
     // the fault-profile lookup key. 0 = unassigned (legacy connections).
     void    setNetId(uint32_t netId) { _netId = netId; }
     uint32_t getNetId() const        { return _netId; }
+
+    // R5.5 (2026-08-25): profiler hooks. Installed by the subsystem at
+    // construction time. The transport layer doesn't know about
+    // ProfilerRegistry directly — it just calls these functions with
+    // (msgType, bytes) after each _rawSend / onRawData that goes through
+    // the transport layer's sealed-bytes seam. The subsystem's lambda
+    // forwards to its ProfilerRegistry::recordSend/recordRecv(...).
+    // Default null = no-op (cheap test paths).
+    using ProfilerSendHook = std::function<void(uint16_t msgType, uint64_t bytes)>;
+    using ProfilerRecvHook = std::function<void(uint16_t msgType, uint64_t bytes)>;
+    void setProfilerSendHook(ProfilerSendHook hook) { _profilerSendHook = std::move(hook); }
+    void setProfilerRecvHook(ProfilerRecvHook hook) { _profilerRecvHook = std::move(hook); }
 
 private:
     void setState(GnsConnectionState newState);
@@ -316,6 +336,14 @@ private:
     // short-circuit _rawSend and the receive pump respectively.
     FakeTransportSender   _fakeSender;
     FakeTransportReceiver _fakeReceiver;
+
+    // R5.5 (2026-08-25): inbound byte count cached from the most recent
+    // pump() iteration. Refreshed by pump(); read by getLastPumpBytes().
+    uint32_t _lastPumpBytes = 0;
+
+    // R5.5 (2026-08-25): profiler hooks installed by AYNetworkSubSystem.
+    ProfilerSendHook _profilerSendHook;
+    ProfilerRecvHook _profilerRecvHook;
 };
 
 // =============================================================================
