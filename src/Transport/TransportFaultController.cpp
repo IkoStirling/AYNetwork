@@ -29,10 +29,11 @@ std::mt19937_64& TransportFaultController::rngFor(uint32_t netId) {
     auto it = _rngs.find(netId);
     if (it != _rngs.end()) return it->second;
 
-    // First use for this netId — seed from the profile (if any) or
-    // the default. The session seed is no longer in scope here, so
-    // we fall back to the default.
-    uint64_t seed = kDefaultSessionSeed;
+    // First use for this netId — seed from the profile (if any),
+    // then the configured session seed, then the default fallback.
+    // R6 C4 B-09: consults _sessionSeed (settable via setSessionSeed)
+    // so tests and the replay recorder can drive reproducible draws.
+    uint64_t seed = _sessionSeed != 0 ? _sessionSeed : kDefaultSessionSeed;
     auto pit = _profiles.find(netId);
     if (pit != _profiles.end() && pit->second.randomSeed != 0) {
         seed = pit->second.randomSeed;

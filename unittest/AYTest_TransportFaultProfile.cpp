@@ -136,4 +136,54 @@ TEST_CASE(Profile_RngDeterminism)
     CHECK(rng2() == b);
 }
 
+// R6 C4 (2026-08-25): B-09 finding. TransportFaultController::setSessionSeed
+// drives the RNG fallback when a profile has randomSeed == 0. Two
+// controllers seeded identically produce identical draw sequences — the
+// determinism contract required for replay equality.
+TEST_CASE(Controller_SessionSeed_ReproducesDraws)
+{
+    ayt::test::setCurrentCase("Controller_SessionSeed_ReproducesDraws");
+
+    TransportFaultController a;
+    TransportFaultController b;
+    a.setSessionSeed(0xA1B2C3D4E5F6ULL);
+    b.setSessionSeed(0xA1B2C3D4E5F6ULL);
+
+    TransportFaultProfile p;  // randomSeed == 0 → use session seed
+    a.setProfile(7, p);
+    b.setProfile(7, p);
+
+    auto& ra = a.rngFor(7);
+    auto& rb = b.rngFor(7);
+    for (int i = 0; i < 8; ++i) {
+        CHECK(ra() == rb());
+    }
+
+    // Different session seed → different draw sequence.
+    TransportFaultController c;
+    c.setSessionSeed(0x112233445566ULL);
+    TransportFaultProfile p2;
+    c.setProfile(7, p2);
+    auto& rc = c.rngFor(7);
+    CHECK(rc() != ra());
+}
+
+TEST_CASE(Controller_DefaultSessionSeedIsStable)
+{
+    ayt::test::setCurrentCase("Controller_DefaultSessionSeedIsStable");
+    // No setSessionSeed call → kDefaultSessionSeed (0xC0FFEE) drives
+    // the fallback path. Two default-constructed controllers must
+    // produce identical draws.
+    TransportFaultController a;
+    TransportFaultController b;
+    TransportFaultProfile p;
+    a.setProfile(11, p);
+    b.setProfile(11, p);
+    auto& ra = a.rngFor(11);
+    auto& rb = b.rngFor(11);
+    for (int i = 0; i < 4; ++i) {
+        CHECK(ra() == rb());
+    }
+}
+
 TEST_SUITE_END

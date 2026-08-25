@@ -24,6 +24,15 @@ class TransportFaultController
 public:
     TransportFaultController() = default;
 
+    // ----- Session seed (R6 C4 B-09) -----
+    //
+    // Sets the fallback RNG seed used when a profile's `randomSeed == 0`.
+    // Default value is kDefaultSessionSeed. Tests and the replay
+    // recorder install a per-session seed here so that fault draws
+    // (loss / dup / reorder / latency) are reproducible across runs.
+    void setSessionSeed(uint64_t seed) { _sessionSeed = seed; }
+    uint64_t getSessionSeed() const { return _sessionSeed; }
+
     // ----- Profile management -----
 
     // Install or replace a profile for a connection. `sessionSeed` is
@@ -62,6 +71,9 @@ public:
 private:
     std::unordered_map<uint32_t, TransportFaultProfile> _profiles;
     std::unordered_map<uint32_t, std::mt19937_64>      _rngs;
+    // R6 C4 (2026-08-25): session-wide seed. Falls back to
+    // kDefaultSessionSeed when no session seed is set explicitly.
+    uint64_t _sessionSeed = kDefaultSessionSeed;
 };
 
 } // namespace ayt::net
