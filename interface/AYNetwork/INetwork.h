@@ -848,11 +848,16 @@ private:
     float _interestRadius = 0.f;
     float _interestRadiusSq = 0.f;
 
-    // R5.0 server tick accounting. _serverTickAccumulator carries the
+    // R5.0 server tick accounting. _serverTickAccumulatorUs carries the
     // sub-tick fractional time between calls so the tick count stays
     // accurate even if dtSec drifts.
+    //
+    // R6 (2026-08-25): converted from double to uint64 microseconds (B-02,
+    // M-17). The accumulator now tracks `dtSec * tickRate` in
+    // microsecond units, removing platform-dependent float rounding
+    // from the serverTick truncation path.
     uint32_t _serverTick = 0;
-    double   _serverTickAccumulator = 0.0;
+    uint64_t _serverTickAccumulatorUs = 0;
     double   _serverTickRate = 30.0;
 
     // Forward-declared below; single map shared by both register paths.

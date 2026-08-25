@@ -991,15 +991,51 @@ bool ReplicationManager::peekSpawnAnnouncement(uint32_t netId, uint64_t& schemaH
 // =============================================================================
 void ReplicationManager::setServerTickRate(double hz) {
     _serverTickRate = (hz > 0.0) ? hz : 30.0;
-    _serverTickAccumulator = 0.0;
+    _serverTickAccumulatorUs = 0;
 }
 
 void ReplicationManager::advanceServerTick(double dtSec) {
     if (dtSec <= 0.0 || _serverTickRate <= 0.0) return;
-    _serverTickAccumulator += dtSec * _serverTickRate;
-    uint32_t wholeTicks = static_cast<uint32_t>(_serverTickAccumulator);
-    if (wholeTicks > 64u) wholeTicks = 64u;
-    _serverTickAccumulator -= static_cast<double>(wholeTicks);
+
+    // R6 (2026-08-25): fixed-point accumulator (B-02, M-17).
+    //
+    // Sub-tick remainder is tracked in *microseconds* since the last
+    // whole tick. Each call:
+    //   1. dtSec → dtUs (round-half-up; preserves 1/30s @ 30 Hz exactly)
+    //   2. tickUs = (1'000'000 + tickRate/2) / tickRate   (one tick in us,
+    //      round-half-up; 30 Hz → 33333 us, 60 Hz → 16667 us)
+    //   3. accumulatedUs += dtUs
+    //   4. wholeTicks = accumulatedUs / tickUs    (integer; 1+ ticks)
+    //   5. accumulatedUs -= wholeTicks * tickUs   (sub-tick remainder)
+    //
+    // This is equivalent to the old double accumulator but executes in
+    // uint64, removing platform-dependent float rounding from the tick
+    // truncation path. Round-half-up at every boundary preserves
+    // `1/30s @ 30 Hz → 1 tick` semantics that the truncation variant
+    // broke (33333 us * 30 = 999990 us → 0 ticks).
+    //
+    // Cap at 64 ticks per call so a long stall (breakpoint) doesn't fire
+    // 1000 ticks when execution resumes; the cap is in microseconds of
+    // accumulated carry, not in tick count, which lets the next normal
+    // call clear any back-log smoothly.
+    const uint64_t kMaxAccumulatorUs = 64ULL * 1000000ULL; // 64 micro-tick cap
+    if (_serverTickAccumulatorUs >= kMaxAccumulatorUs) return;
+
+    const uint64_t dtUs = static_cast<uint64_t>(dtSec * 1000000.0 + 0.5);
+    if (dtUs == 0) return;
+
+    const uint64_t tickRate64 = static_cast<uint64_t>(_serverTickRate > 0.0
+                                                      ? _serverTickRate
+                                                      : 30.0);
+    if (tickRate64 == 0) return;
+    const uint64_t tickUs = (1000000ULL + (tickRate64 / 2ULL)) / tickRate64;
+    if (tickUs == 0) return;
+
+    uint64_t newAccum = _serverTickAccumulatorUs + dtUs;
+    if (newAccum > kMaxAccumulatorUs) newAccum = kMaxAccumulatorUs;
+
+    const uint32_t wholeTicks = static_cast<uint32_t>(newAccum / tickUs);
+    _serverTickAccumulatorUs = newAccum - static_cast<uint64_t>(wholeTicks) * tickUs;
     _serverTick += wholeTicks;
 }
 

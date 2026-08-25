@@ -45,6 +45,11 @@ namespace ayt::net
 ISteamNetworkingSockets* GnsConnection::s_gns       = nullptr;
 HSteamNetPollGroup       GnsConnection::s_pollGroup = k_HSteamNetPollGroup_Invalid;
 
+// R6 (2026-08-25): clock seam. When non-null, nowMs() returns the override
+// (downshifted to uint32 ms) instead of consulting ayt::performanceNowUs.
+// Default null = production wall clock.
+GnsConnection::NowOverrideFn GnsConnection::s_nowOverride;
+
 // Active connection map (HSteamNetConnection -> GnsConnection*).
 static std::unordered_map<HSteamNetConnection, GnsConnection*>& connMap() {
     static std::unordered_map<HSteamNetConnection, GnsConnection*> m;
@@ -695,8 +700,34 @@ int GnsConnection::_rawSend(const uint8_t* data, uint32_t len, uint8_t channel) 
 }
 
 // R2: monotonic-ish clock used to stamp PacketHeader.timestampMs.
+//
+// R6 (2026-08-25): when s_nowOverride is non-null, consult it first so
+// determinism tests can drive the wire-time stamp from a logical clock.
 uint32_t GnsConnection::nowMs() {
+    if (s_nowOverride) {
+        return static_cast<uint32_t>((s_nowOverride() / 1000u) & 0xFFFFFFFFu);
+    }
     return static_cast<uint32_t>((ayt::performanceNowUs() / 1000u) & 0xFFFFFFFFu);
+}
+
+void GnsConnection::setNowOverrideForTesting(NowOverrideFn fn) {
+    s_nowOverride = std::move(fn);
+}
+
+void GnsConnection::clearNowOverride() {
+    s_nowOverride = nullptr;
+}
+
+void GnsConnection::setNowOverrideForTickRate(uint32_t serverTick, uint32_t tickRate) {
+    const uint32_t safeRate = (tickRate > 0u) ? tickRate : 1u;
+    s_nowOverride = [serverTick, safeRate]() {
+        // Logical time: (serverTick * 1'000'000) / tickRate microseconds.
+        // The captured `serverTick` is taken at install time — tests that
+        // want the override to track a moving counter must update the
+        // override via setNowOverrideForTesting each tick.
+        return (static_cast<uint64_t>(serverTick) * 1000000u) /
+               static_cast<uint64_t>(safeRate);
+    };
 }
 
 // =============================================================================

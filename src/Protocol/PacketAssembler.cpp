@@ -1,6 +1,7 @@
 // PacketAssembler.cpp - Fragment / reassemble for application payloads.
 
 #include <AYNetwork/Protocol/PacketAssembler.h>
+#include <AYNetwork/Transport/GnsConnection.h>  // R6 (2026-08-25): clock seam
 
 #include <algorithm>
 #include <cstring>
@@ -120,9 +121,13 @@ std::vector<std::vector<uint8_t>> PacketAssembler::fragment(
 std::optional<std::vector<uint8_t>> PacketAssembler::consume(
     const uint8_t* fragBody, size_t fragBodyLen)
 {
-    const uint32_t nowMs = static_cast<uint32_t>(
-        (ayt::performanceNowUs() / 1000u) & 0xFFFFFFFFu);
-    return consume(fragBody, fragBodyLen, nowMs);
+    // R6 (2026-08-25): clock seam (B-02). TTL eviction now reads the same
+    // logical clock as the wire stamp (PacketHeader.timestampMs). When
+    // tests install setNowOverrideForTesting / setNowOverrideForTickRate,
+    // fragment expiry is driven by logical time, not wall-clock, so two
+    // runs of the same scenario reap the same fragments at the same
+    // moments.
+    return consume(fragBody, fragBodyLen, GnsConnection::nowMs());
 }
 
 std::optional<std::vector<uint8_t>> PacketAssembler::consume(

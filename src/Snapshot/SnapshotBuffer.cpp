@@ -174,6 +174,10 @@ uint32_t SnapshotBuffer::tickAt(size_t idx) const {
 
 double SnapshotBuffer::timeAt(size_t idx) const {
     if (idx >= _records.size()) return 0.0;
+    // R6 (2026-08-25): caller passes serverTimeSec via push(); the buffer
+    // stores the literal double it was given, so callers that compare to
+    // `10.0/30.0` etc. get bit-exact equality. (Storing in microseconds
+    // would lose 1 ULP at the 10/30 boundary; see SnapshotBuffer.h.)
     return _records[idx].serverTimeSec;
 }
 

@@ -224,6 +224,31 @@ public:
     // Otherwise forwards to the user data handler.
     void onRawData(const uint8_t* data, size_t len);
 
+    // R2: low-overhead current-time helper used by PacketCodec::encode
+    // AND by R6 callers (PacketAssembler::consume TTL clock,
+    // NetworkTime, etc.) that need a logically-deterministic timestamp.
+    // Public so the seam can drive every monotonic-time call site.
+    static uint32_t nowMs();
+
+    // R6 (2026-08-25): clock seam for determinism tests.
+    //
+    // nowMs() consults this optional override first. When non-null, the
+    // override's returned microseconds are downshifted to a uint32 ms
+    // timestamp so PacketHeader::timestampMs is stable across runs that
+    // install the same override. Default null = production wall clock.
+    //
+    // Production code never sets this. Only tests use it; install/clear
+    // happens in test setup/teardown, paired with clearNowOverride().
+    //
+    // The tick-rate convenience helper stamps logical time as
+    // (serverTick * 1'000'000) / tickRate microseconds — equivalent to a
+    // monotonic "logical now" derived from the server tick counter.
+    using NowOverrideFn = std::function<uint64_t()>;
+    static void setNowOverrideForTesting(NowOverrideFn fn);
+    static void clearNowOverride();
+    static void setNowOverrideForTickRate(uint32_t serverTick, uint32_t tickRate);
+    static NowOverrideFn s_nowOverride;
+
     // Test seams for AckPipeline integration.
     size_t pendingAckCountForTesting() const { return _ackTracker.pendingCount(); }
 
@@ -317,9 +342,6 @@ private:
     // R2: low-level GNS send wrapper. Called by send() and the handshake
     // helpers; maps channel -> GNS Reliable/Unreliable and reports EResult.
     int _rawSend(const uint8_t* data, uint32_t len, uint8_t channel);
-
-    // R2: low-overhead current-time helper used by PacketCodec::encode.
-    static uint32_t nowMs();
 
     // R5.4 (2026-08-25): AYNetwork netId for fault-profile lookup. 0 =
     // unassigned. Set by NetworkSubSystem when the GnsConnection is

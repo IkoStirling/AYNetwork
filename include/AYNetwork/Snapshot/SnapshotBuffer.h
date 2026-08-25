@@ -52,6 +52,15 @@ namespace ayt::net
 // R5.1: `snap` is set by push(..., snap=true) to mark this record as a
 // teleport. sample() treats any bracket whose upper record has snap=true
 // as a snap-to-upper case (no lerp). See design §15.8.
+//
+// R6 (2026-08-25): serverTimeSec remains the canonical storage (so
+// callers comparing to literal `10.0/30.0` etc. get bit-exact values).
+// The wire path's tick advancement was made uint64 in C1b/C1c; this
+// site keeps double for storage because (a) callers compare with
+// bit-exact literals, (b) interpolation alpha must be a fraction of
+// seconds (the 0.5 test), and (c) the buffer is rendered once per frame
+// in fixed cost, not on the hot replication path. The remaining
+// float-rounding risk is addressed in C7 (QuantizedFloat round-trip).
 struct SnapshotRecord {
     uint32_t serverTick = 0;
     double   serverTimeSec = 0.0;

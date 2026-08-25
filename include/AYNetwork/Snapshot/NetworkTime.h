@@ -68,7 +68,11 @@ private:
     double   _tickRate    = 30.0;
     double   _interpDelay = 0.1;       // 100 ms — typical Unreal / Unity default
     uint32_t _serverTick  = 0;
-    double   _accumulator = 0.0;        // sub-tick fractional time
+    // R6 (2026-08-25): fixed-point accumulator. Microseconds of sub-tick
+    // remainder; `1'000'000 / tickRate` is one whole tick. uint64 to avoid
+    // float drift (B-01): two runs of advance(0.0166) must agree bit-for-bit
+    // regardless of FPU rounding mode.
+    uint64_t _accumulatorUs = 0;
     double   _clientTimeSec = 0.0;
 };
 
