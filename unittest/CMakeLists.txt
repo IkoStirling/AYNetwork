@@ -34,13 +34,13 @@ set(CORE_SRC_FILES
     AYTest_TokenBucket.cpp             # R5.4
     AYTest_DelayedFrameQueue.cpp       # R5.4
     AYTest_TransportFaultInterceptor.cpp # R5.4
+    AYTest_StateEqual.cpp              # R6 C9 (2026-08-25) — must precede FakeTransport (crash without gns::init kills the process)
     AYTest_FakeTransport.cpp           # R5.4
     AYTest_ProfilerAccumulator.cpp     # R5.5 (2026-08-25)
     AYTest_PerMsgType.cpp              # R5.5
     AYTest_PerNetId.cpp                # R5.5
     AYTest_RttAndCongestion.cpp        # R5.5
     AYTest_ProfilerSubsystem.cpp       # R5.5
-    AYTest_StateEqual.cpp              # R6 C9 (2026-08-25)
 )
 
 add_executable(${MODULE_NAME} ${CORE_SRC_FILES})
