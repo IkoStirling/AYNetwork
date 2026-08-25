@@ -176,15 +176,15 @@ void ProfilerRegistry::fillLiveStatus(uint32_t connNetId, ConnLiveStatus& out) c
             out.sendQueueBytes  = out.pendingReliable + out.pendingUnreliable;
         }
 
-        // SteamNetConnectionInfo_t in this GNS version does NOT expose
-        // connection-type enum (Direct/Relay). The closest signal is the
-        // m_idPOPRelay field (0 = not relaying). Map: relay=0 → "direct"
-        // (we store 0); relay != 0 → "relay" (we store 1). Tests assert
-        // `>= 0` so the heuristic is safe.
+        // R6 C5 H-13: m_idPOPRelay varies run-to-run and would break snapshot
+        // equality between recordings. Normalize both path fields to 0
+        // unconditionally — path classification is forward-looking for
+        // the v2 player and not used by state-equal hashing today.
         SteamNetConnectionInfo_t info{};
         if (GnsConnection::s_gns->GetConnectionInfo(conn->getInnerConnection(), &info)) {
-            out.pathLocal  = (info.m_idPOPRelay == 0) ? 0u : 1u;
-            out.pathRemote = (info.m_idPOPRelay == 0) ? 0u : 1u;
+            (void)info;
+            out.pathLocal  = 0u;
+            out.pathRemote = 0u;
         }
     }
 

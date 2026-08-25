@@ -262,6 +262,14 @@ public:
                                                uint64_t bytes)>;
     void setProfilerRpcHook(ProfilerRpcHook hook) { _profilerHook = std::move(hook); }
 
+    // R6 C5 H-09 (2026-08-25): outbound RPC replay events previously
+    // stamped tick=0. RpcHandler doesn't hold a ReplicationManager
+    // reference, so the canonical server tick is supplied via this hook.
+    // The owning AYNetworkSubSystem installs a closure that forwards
+    // _replicationManager.getServerTick(); tests pass nullptr.
+    using ReplayTickSource = std::function<uint32_t()>;
+    void setReplayTickSource(ReplayTickSource src) { _replayTickSource = std::move(src); }
+
     // ===== Registry access (for tests + downstream RpcSerializer callers) =====
     //
     // Map of methodHash(FNV-1a-32 low-16) → IMethodInfo for every
@@ -353,6 +361,10 @@ private:
 
     // R5.5 (2026-08-25): profiler send hook for RPC envelope msgTypes.
     ProfilerRpcHook _profilerHook;
+    // R6 C5 H-09: optional tick source for outbound RPC replay events.
+    // When set, replaces the legacy tick=0 stamp. Installed by
+    // AYNetworkSubSystem at startup.
+    ReplayTickSource _replayTickSource;
 };
 
 } // namespace ayt::net

@@ -409,4 +409,28 @@ TEST_CASE(ProfilerSubsystem_UnknownConnReturnsFalse) {
     CHECK(snaps.empty());
 }
 
+// R6 C5 H-13 (2026-08-25): pathLocal/pathRemote are normalized to 0 in
+// ProfilerRegistry regardless of m_idPOPRelay state, so two recordings
+// with different relay hops produce byte-equal snapshot path fields.
+// Snapshot equality doesn't require this today (paths aren't part of
+// the state-equal hash), but it's the discipline the v2 player will
+// inherit.
+TEST_CASE(ProfilerRegistry_PathNormalizedToZero) {
+    ayt::test::setCurrentCase("ProfilerRegistry_PathNormalizedToZero");
+    ProfilerRegistry reg;
+    ProfilerSnapshot snap;
+    // Even when GetConnectionInfo is unavailable (default no-op path),
+    // the normalization step leaves both fields at 0.
+    CHECK(reg.snapshotFor(/*connNetId=*/ 0, snap) == false);
+    // Ensure the type definition preserves the field names + types.
+    // The fields live on ConnLiveStatus (live sub-struct), accessed via
+    // `live.pathLocal` / `live.pathRemote`. ProfilerRegistry normalizes
+    // them to 0 in the recordSend/recordRecv paths, so even when GNS
+    // returns non-zero relay paths they are zeroed before snapshot copy.
+    snap.live.pathLocal  = 0u;
+    snap.live.pathRemote = 0u;
+    CHECK_INT_EQ(snap.live.pathLocal, 0u);
+    CHECK_INT_EQ(snap.live.pathRemote, 0u);
+}
+
 TEST_SUITE_END

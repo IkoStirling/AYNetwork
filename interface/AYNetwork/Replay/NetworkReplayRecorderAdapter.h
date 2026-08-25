@@ -64,6 +64,14 @@ public:
     // `provider` and writes a single ReplayCheckpointHeader. Returns
     // false if the provider returns false for every netId (no state).
     // `registeredNetIds` enumerates the netIds the caller wants hashed.
+    //
+    // R6 C5 H-14 (2026-08-25): the iteration order of `registeredNetIds`
+    // defines the FNV-1a accumulator sequence, so two recordings with
+    // different orderings produce different hashes. The caller MUST
+    // pass a vector sorted ascending by netId (std::sort or std::map
+    // key iteration). This is the contract documented for the v2
+    // player — replicating it on the record side is mandatory for
+    // state-equal replay.
     using StateBytesProvider =
         std::function<bool(uint32_t netId, std::vector<uint8_t>& out)>;
     bool recordPeriodicCheckpoint(uint32_t serverTick,

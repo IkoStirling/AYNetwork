@@ -893,6 +893,11 @@ public:
                 _profiler.recordSend(connNetId, msgType, bytes, /*ghostNetId=*/ 0);
             });
 
+        // R6 C5 H-09: forward the live server tick to RpcHandler so
+        // outbound RPC replay events carry the canonical tick (was 0).
+        _rpcHandler.setReplayTickSource(
+            [this]() { return _replicationManager.getServerTick(); });
+
         // GnsConnection (already created before initialize): client conn,
         // server listen conn, server children.
         if (_clientConn) hookGnsConnection(_clientConn.get());

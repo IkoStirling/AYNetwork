@@ -445,7 +445,10 @@ bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream
         if (bodyLen > 0 && bodyBytes) {
             std::memcpy(hdrBuf.data() + 10, bodyBytes, bodyLen);
         }
-        _replay->recordEvent(/*tick=*/ 0, /*type=*/ 0x10006u /*kEvtNet_RpcBatch*/,
+        // R6 C5 H-09: forward server tick via _replayTickSource when set;
+        // falls back to 0 when no source is installed (unit tests).
+        const uint32_t rpcTick = _replayTickSource ? _replayTickSource() : 0u;
+        _replay->recordEvent(/*tick=*/ rpcTick, /*type=*/ 0x10006u /*kEvtNet_RpcBatch*/,
                              hdrBuf.data(), hdrBuf.size());
     }
     // R5.5 (2026-08-25) profiler hook — RPC envelope wire bytes. ghostNetId
