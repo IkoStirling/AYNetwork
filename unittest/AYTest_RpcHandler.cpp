@@ -1068,4 +1068,42 @@ TEST_CASE(RpcMsgTypeEnvelopeIsDistinct) {
     CHECK(kMsgTypeRpcRequest != ayt::net::kMsgTypeDelta);
     CHECK(kMsgTypeRpcRequest != ayt::net::kMsgTypeHandshake);
 }
+
+// R6 C3 (2026-08-25): RpcHandler::_pendingCalls switched from
+// std::unordered_map to std::map (B-06). Expire / retry iteration now
+// walks callIds in ascending order — the deterministic retry timeline.
+//
+// hasPending() walks the sorted map directly, so two runs that
+// registered the same callIds in different orders must report
+// pendingCount() == n and hasPending() == true for every registered id.
+TEST_CASE(PendingCalls_IterateInCallIdOrder) {
+    ayt::test::setCurrentCase("PendingCalls_IterateInCallIdOrder");
+    RpcHandler handler(/*network=*/ nullptr);
+    handler.setPendingTimeoutMsForTesting(1);
+
+    // Register three pending callbacks; callIds intentionally inserted
+    // in non-monotonic order to exercise the sort invariant.
+    const uint64_t kA = 100;
+    const uint64_t kB = 50;
+    const uint64_t kC = 75;
+    std::vector<uint64_t> fireOrder;
+    handler.registerPending(kA, [&](bool, const void*) { fireOrder.push_back(kA); });
+    handler.registerPending(kB, [&](bool, const void*) { fireOrder.push_back(kB); });
+    handler.registerPending(kC, [&](bool, const void*) { fireOrder.push_back(kC); });
+    CHECK_INT_EQ(static_cast<size_t>(handler.pendingCount()), static_cast<size_t>(3));
+    CHECK(handler.hasPending(kA));
+    CHECK(handler.hasPending(kB));
+    CHECK(handler.hasPending(kC));
+
+    // Let the deadlines elapse, then drive a single tick to fire the
+    // expire sweep. Expired callbacks fire in callId-ascending order:
+    // 50, 75, 100 — independent of insertion order.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    handler.tick(0.0f);
+    CHECK_INT_EQ(static_cast<size_t>(fireOrder.size()), static_cast<size_t>(3));
+    CHECK_INT_EQ(static_cast<uint64_t>(fireOrder[0]), static_cast<uint64_t>(kB));
+    CHECK_INT_EQ(static_cast<uint64_t>(fireOrder[1]), static_cast<uint64_t>(kC));
+    CHECK_INT_EQ(static_cast<uint64_t>(fireOrder[2]), static_cast<uint64_t>(kA));
+    CHECK_INT_EQ(static_cast<size_t>(handler.pendingCount()), static_cast<size_t>(0));
+}
 TEST_SUITE_END

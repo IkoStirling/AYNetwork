@@ -16,8 +16,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -212,7 +212,7 @@ public:
     // Outbound callers can register a callback that fires when the
     // matching Response or Reject arrives. Auto-cleaned when matched.
     void registerPending(uint64_t callId, RpcCallback cb) {
-        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+        // R6 C3: single-thread; no lock.
         PendingEntry entry;
         entry.cb = std::move(cb);
         entry.deadlineUs = ayt::performanceNowUs()
@@ -220,11 +220,9 @@ public:
         _pendingCalls[callId] = std::move(entry);
     }
     bool hasPending(uint64_t callId) const {
-        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
         return _pendingCalls.find(callId) != _pendingCalls.end();
     }
     size_t pendingCount() const {
-        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
         return _pendingCalls.size();
     }
 
@@ -337,8 +335,12 @@ private:
     std::unordered_map<uint16_t, void*>                            _objsByHash;
     std::unordered_map<std::string, void*>                         _wildcardMulticastObjs;
 
-    mutable std::mutex                       _pendingCallsMutex;
-    std::unordered_map<uint64_t, PendingEntry> _pendingCalls;
+    // R6 C3 (2026-08-25): std::map (was std::unordered_map) so expirePendingCalls
+    // iterates callIds in ascending order — deterministic retry timeline
+    // (B-06). Single-thread model: the `_pendingCallsMutex` was over-defensive
+    // given the synchronous tick() dispatch path and has been removed.
+    // Cross-thread enqueue must be migrated to the tick() funnel (see R6 C6).
+    std::map<uint64_t, PendingEntry> _pendingCalls;
     uint32_t _pendingTimeoutMs = RpcDefaultTimeoutMs;
     uint32_t _maxRetries = RpcDefaultMaxRetries;
     uint32_t _retryBaseMs = RpcDefaultRetryBaseMs;

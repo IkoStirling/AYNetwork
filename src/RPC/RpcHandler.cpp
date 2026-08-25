@@ -726,19 +726,18 @@ void RpcHandler::registerPendingWithRetry(uint64_t callId, RpcCallback cb,
     entry.phase = PendingPhase::AwaitingResponse;
     entry.deadlineUs = ayt::performanceNowUs()
         + static_cast<uint64_t>(_pendingTimeoutMs) * 1000u;
-    std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+    // R6 C3: single-thread; no lock.
     _pendingCalls[callId] = std::move(entry);
 }
 
 void RpcHandler::expirePendingCalls() {
     const uint64_t nowUs = ayt::performanceNowUs();
     std::vector<uint64_t> due;
-    {
-        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
-        due.reserve(_pendingCalls.size());
-        for (const auto& kv : _pendingCalls) {
-            if (nowUs >= kv.second.deadlineUs) due.push_back(kv.first);
-        }
+    // R6 C3: single-thread; no lock. _pendingCalls is std::map (sorted by
+    // callId), so the due[] list is itself deterministic.
+    due.reserve(_pendingCalls.size());
+    for (const auto& kv : _pendingCalls) {
+        if (nowUs >= kv.second.deadlineUs) due.push_back(kv.first);
     }
 
     for (uint64_t callId : due) {
@@ -748,7 +747,7 @@ void RpcHandler::expirePendingCalls() {
         RpcCallback failCb;
 
         {
-            std::lock_guard<std::mutex> lk(_pendingCallsMutex);
+            // R6 C3: single-thread; no lock.
             auto it = _pendingCalls.find(callId);
             if (it == _pendingCalls.end()) continue;
             PendingEntry& entry = it->second;
@@ -1028,13 +1027,11 @@ bool RpcHandler::onRpcResponse(BitStream& body, NetConnection* from) {
         return false;
     }
     RpcCallback cb;
-    {
-        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
-        auto it = _pendingCalls.find(callId);
-        if (it == _pendingCalls.end()) return false;
-        cb = std::move(it->second.cb);
-        _pendingCalls.erase(it);
-    }
+    // R6 C3: single-thread; no lock.
+    auto it = _pendingCalls.find(callId);
+    if (it == _pendingCalls.end()) return false;
+    cb = std::move(it->second.cb);
+    _pendingCalls.erase(it);
     if (cb) cb(true, returnBuf.empty() ? nullptr : returnBuf.data());
     (void)from;
     return true;
@@ -1046,13 +1043,11 @@ bool RpcHandler::onRpcReject(BitStream& body, NetConnection* from) {
     RpcRejectReason reason;
     if (!RpcSerializer::readRpcReject(body, callId, reason)) return false;
     RpcCallback cb;
-    {
-        std::lock_guard<std::mutex> lk(_pendingCallsMutex);
-        auto it = _pendingCalls.find(callId);
-        if (it == _pendingCalls.end()) return false;
-        cb = std::move(it->second.cb);
-        _pendingCalls.erase(it);
-    }
+    // R6 C3: single-thread; no lock.
+    auto it = _pendingCalls.find(callId);
+    if (it == _pendingCalls.end()) return false;
+    cb = std::move(it->second.cb);
+    _pendingCalls.erase(it);
     (void)reason;
     if (cb) cb(false, nullptr);
     (void)from;

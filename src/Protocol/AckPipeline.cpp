@@ -76,34 +76,30 @@ void AckTracker::registerPending(uint32_t seq, Callback cb, uint32_t timeoutMs) 
     entry.cb = std::move(cb);
     entry.deadlineUs = ayt::performanceNowUs()
         + static_cast<uint64_t>(timeoutMs) * 1000u;
-    std::lock_guard<std::mutex> lk(_mutex);
+    // R6 C3: single-thread; no lock.
     _pending[seq] = std::move(entry);
 }
 
 void AckTracker::onAck(uint32_t seq) {
-    Callback cb;
-    {
-        std::lock_guard<std::mutex> lk(_mutex);
-        auto it = _pending.find(seq);
-        if (it == _pending.end()) return;
-        cb = std::move(it->second.cb);
-        _pending.erase(it);
-    }
+    // R6 C3: single-thread; no lock.
+    auto it = _pending.find(seq);
+    if (it == _pending.end()) return;
+    Callback cb = std::move(it->second.cb);
+    _pending.erase(it);
     if (cb) cb(true);
 }
 
 void AckTracker::expire() {
     const uint64_t nowUs = ayt::performanceNowUs();
     std::vector<Callback> expired;
-    {
-        std::lock_guard<std::mutex> lk(_mutex);
-        for (auto it = _pending.begin(); it != _pending.end();) {
-            if (nowUs >= it->second.deadlineUs) {
-                expired.push_back(std::move(it->second.cb));
-                it = _pending.erase(it);
-            } else {
-                ++it;
-            }
+    // R6 C3: single-thread; no lock. Iterates _pending in ascending seq
+    // order (std::map) so expired callbacks fire in deterministic order.
+    for (auto it = _pending.begin(); it != _pending.end();) {
+        if (nowUs >= it->second.deadlineUs) {
+            expired.push_back(std::move(it->second.cb));
+            it = _pending.erase(it);
+        } else {
+            ++it;
         }
     }
     for (Callback& cb : expired) {
@@ -112,7 +108,7 @@ void AckTracker::expire() {
 }
 
 size_t AckTracker::pendingCount() const {
-    std::lock_guard<std::mutex> lk(_mutex);
+    // R6 C3: single-thread; no lock.
     return _pending.size();
 }
 

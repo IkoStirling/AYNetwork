@@ -101,6 +101,28 @@ TEST_CASE(AckTrackerExpiresPending) {
     CHECK_INT_EQ(static_cast<size_t>(tracker.pendingCount()), static_cast<size_t>(0));
 }
 
+// R6 C3 (2026-08-25): AckTracker::_pending switched from std::unordered_map
+// to std::map (B-07). expire() iterates pending acks in ascending seq
+// order — the B-07 determinism finding. Three expired callbacks registered
+// out of order; we assert the firing order is strictly ascending seq so
+// two runs see identical expire() side-effect order.
+TEST_CASE(AckTrackerExpireFiresInAscendingSeqOrder) {
+    ayt::test::setCurrentCase("AckTrackerExpireFiresInAscendingSeqOrder");
+    AckTracker tracker;
+    std::vector<uint32_t> firedSeqs;
+    // Register in deliberately non-monotonic order: 30, 10, 20.
+    tracker.registerPending(30, [&](bool ok) { if (!ok) firedSeqs.push_back(30); }, /*timeoutMs=*/ 1);
+    tracker.registerPending(10, [&](bool ok) { if (!ok) firedSeqs.push_back(10); }, /*timeoutMs=*/ 1);
+    tracker.registerPending(20, [&](bool ok) { if (!ok) firedSeqs.push_back(20); }, /*timeoutMs=*/ 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    tracker.expire();
+    CHECK_INT_EQ(static_cast<size_t>(firedSeqs.size()), static_cast<size_t>(3));
+    CHECK_INT_EQ(static_cast<uint32_t>(firedSeqs[0]), static_cast<uint32_t>(10));
+    CHECK_INT_EQ(static_cast<uint32_t>(firedSeqs[1]), static_cast<uint32_t>(20));
+    CHECK_INT_EQ(static_cast<uint32_t>(firedSeqs[2]), static_cast<uint32_t>(30));
+    CHECK_INT_EQ(static_cast<size_t>(tracker.pendingCount()), static_cast<size_t>(0));
+}
+
 TEST_CASE(RequireAckRoundTripOverGns) {
     ayt::test::setCurrentCase("RequireAckRoundTripOverGns");
     CHECK(gns::init());

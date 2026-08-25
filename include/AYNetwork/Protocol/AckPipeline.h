@@ -12,8 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <mutex>
-#include <unordered_map>
+#include <map>
 
 namespace ayt::net
 {
@@ -54,9 +53,12 @@ private:
         uint64_t deadlineUs = 0;
     };
 
-    mutable std::mutex _mutex;
+    // R6 C3 (2026-08-25): std::map (was std::unordered_map) so expire() walks
+    // pending acks in ascending seq order. The single-thread model drops
+    // the over-defensive _mutex — callers must drive registerPending /
+    // onAck / expire from the main network thread only.
     std::atomic<uint32_t> _nextSeq{1};
-    std::unordered_map<uint32_t, Entry> _pending;
+    std::map<uint32_t, Entry> _pending;
 };
 
 } // namespace ayt::net
