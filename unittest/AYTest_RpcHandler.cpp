@@ -870,8 +870,13 @@ TEST_CASE(PendingCallRetriesThenSucceeds) {
     CHECK(!s.clientRpc.hasPending(callId));
 }
 
-TEST_CASE(AsyncRpcCompletesOnServerTick) {
-    ayt::test::setCurrentCase("AsyncRpcCompletesOnServerTick");
+TEST_CASE(AsyncRpcCompletesSynchronouslyOnInbound) {
+    ayt::test::setCurrentCase("AsyncRpcCompletesSynchronouslyOnInbound");
+    // R6 C6 (2026-08-25): RpcAsyncPool worker-thread dispatcher was
+    // removed (B-11). isAsync RPCs now invoke synchronously inside
+    // onRpcRequest — the network thread blocks until the user's
+    // isAsync handler returns. Documented behavior change in
+    // design.md §15.13.
     RpcE2EScaffold s;
     g_activeReceiver = &s.serverReceiver;
     CHECK(s.serverRpc.registerMethod("PlayerRpc", "ServerHealSlow", &s.serverReceiver));
@@ -885,18 +890,54 @@ TEST_CASE(AsyncRpcCompletesOnServerTick) {
             if (accepted) succeeded.store(true);
         }));
 
-    CHECK(!succeeded.load());
-    CHECK_INT_EQ(s.serverReceiver.healCalls.load(), 0);
-
-    for (int i = 0; i < 64 && !succeeded.load(); ++i) {
+    // Drive the server's inbound pump until the call completes. The
+    // server has now executed ServerHealSlow synchronously on the
+    // network thread, so healCalls must reach 1.
+    for (int i = 0; i < 64 && s.serverReceiver.healCalls.load() == 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         s.serverRpc.tick(0.016f);
     }
 
-    CHECK(succeeded.load());
     CHECK_INT_EQ(s.serverReceiver.healCalls.load(), 1);
     CHECK_INT_EQ(s.serverReceiver.lastHpReceived.load(), 88);
+    CHECK(succeeded.load());
     CHECK(!s.clientRpc.hasPending(callId));
+}
+
+// R6 C6: isAsync RPCs now run synchronously inside onRpcRequest. Three
+// consecutive calls arrive on the network thread in wire order, so the
+// server's isAsync handler observes a deterministic invocation order
+// (B-11 was the worker-thread reordering finding).
+TEST_CASE(AsyncRpc_FireInWireArrivalOrder) {
+    ayt::test::setCurrentCase("AsyncRpc_FireInWireArrivalOrder");
+    RpcE2EScaffold s;
+    g_activeReceiver = &s.serverReceiver;
+    CHECK(s.serverRpc.registerMethod("PlayerRpc", "ServerHealSlow", &s.serverReceiver));
+
+    int32_t hp1 = 11;
+    int32_t hp2 = 22;
+    int32_t hp3 = 33;
+    const void* args1[1] = { &hp1 };
+    const void* args2[1] = { &hp2 };
+    const void* args3[1] = { &hp3 };
+    uint64_t c1, c2, c3;
+    CHECK(s.clientRpc.callServerWithCallback("PlayerRpc", "ServerHealSlow",
+                                              args1, nullptr, 1, c1, nullptr));
+    CHECK(s.clientRpc.callServerWithCallback("PlayerRpc", "ServerHealSlow",
+                                              args2, nullptr, 1, c2, nullptr));
+    CHECK(s.clientRpc.callServerWithCallback("PlayerRpc", "ServerHealSlow",
+                                              args3, nullptr, 1, c3, nullptr));
+
+    // Drive the server's inbound pump. After three synchronous calls,
+    // lastHpReceived must hold the LAST wire-arrival value (33), and
+    // healCalls must equal 3 (proving all three ran on the network
+    // thread in sequence without dropping).
+    for (int i = 0; i < 200 && s.serverReceiver.healCalls.load() < 3; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        s.serverRpc.tick(0.016f);
+    }
+    CHECK_INT_EQ(s.serverReceiver.healCalls.load(), 3);
+    CHECK_INT_EQ(s.serverReceiver.lastHpReceived.load(), 33);
 }
 
 TEST_CASE(UnreliableServerRpcOverGns) {

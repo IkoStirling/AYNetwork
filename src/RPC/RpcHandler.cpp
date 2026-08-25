@@ -68,148 +68,6 @@ bool shouldAutoCompressRpcResponse(const uint8_t* body, size_t bodyLen, size_t m
 } // anonymous namespace
 
 // =============================================================================
-// R4.1-B: RpcAsyncPool — worker threads invoke isAsync RPCs; completions are
-// drained on the network/game thread via RpcHandler::tick().
-//
-// Audit (2026-08-02): Job/Completion stored `NetConnection* from` as a raw
-// pointer. Between worker submission and drain on the game thread, the
-// caller could disconnect/listen/server-restart, which destroys the
-// NetConnectionImpl. The drain path (drainAsyncRpcCompletions) would then
-// pass a dangling pointer to _network->sendTo. Switched to a stable
-// uint32_t netId snapshot; the drain path re-resolves the live conn on
-// the game thread and drops the completion if no live conn matches.
-// =============================================================================
-class RpcAsyncPool {
-public:
-    struct Job {
-        const ayt::reflect::IMethodInfo* methodInfo = nullptr;
-        void* obj = nullptr;
-        std::vector<uint8_t> argBuf;
-        uint64_t callId = 0;
-        uint32_t fromNetId = 0; // 0 = no per-target send (broadcast/multicast)
-        bool isMulticast = false;
-    };
-
-    struct Completion {
-        uint64_t callId = 0;
-        uint32_t fromNetId = 0;
-        const ayt::reflect::ITypeInfo* returnType = nullptr;
-        std::vector<uint8_t> returnBuf;
-        bool hasReturn = false;
-        bool isMulticast = false;
-    };
-
-    void start(size_t workerCount) {
-        if (! _workers.empty()) return;
-        _stop.store(false);
-        if (workerCount == 0) workerCount = 1;
-        _workers.reserve(workerCount);
-        for (size_t i = 0; i < workerCount; ++i) {
-            _workers.emplace_back([this]() { workerLoop(); });
-        }
-    }
-
-    void shutdown() {
-        _stop.store(true);
-        _jobCv.notify_all();
-        for (std::thread& t : _workers) {
-            if (t.joinable()) t.join();
-        }
-        _workers.clear();
-        {
-            std::lock_guard<std::mutex> lk(_jobMutex);
-            while (!_jobs.empty()) _jobs.pop();
-        }
-        {
-            std::lock_guard<std::mutex> lk(_completionMutex);
-            while (!_completions.empty()) _completions.pop();
-        }
-    }
-
-    void submit(Job job) {
-        {
-            std::lock_guard<std::mutex> lk(_jobMutex);
-            _jobs.push(std::move(job));
-        }
-        _jobCv.notify_one();
-    }
-
-    bool tryPopCompletion(Completion& out) {
-        std::lock_guard<std::mutex> lk(_completionMutex);
-        if (_completions.empty()) return false;
-        out = std::move(_completions.front());
-        _completions.pop();
-        return true;
-    }
-
-private:
-    static bool buildArgPtrTable(const ayt::reflect::IMethodInfo* methodInfo,
-                                 const std::vector<uint8_t>& argBuf,
-                                 std::vector<const void*>& argPtrsOut) {
-        if (!methodInfo) return false;
-        const size_t argCount = methodInfo->getParamCount();
-        argPtrsOut.resize(argCount);
-        size_t offset = 0;
-        for (size_t i = 0; i < argCount; ++i) {
-            const ayt::reflect::ITypeInfo* argType = methodInfo->getParamType(i);
-            const size_t argSize = argType ? argType->getSize() : 0;
-            if (offset + argSize > argBuf.size()) return false;
-            argPtrsOut[i] = argBuf.data() + offset;
-            offset += argSize;
-        }
-        return true;
-    }
-
-    void workerLoop() {
-        while (true) {
-            Job job;
-            {
-                std::unique_lock<std::mutex> lk(_jobMutex);
-                _jobCv.wait(lk, [this]() { return _stop.load() || !_jobs.empty(); });
-                if (_stop.load() && _jobs.empty()) return;
-                job = std::move(_jobs.front());
-                _jobs.pop();
-            }
-
-            Completion completion;
-            completion.callId = job.callId;
-            completion.fromNetId = job.fromNetId;
-            completion.isMulticast = job.isMulticast;
-            if (!job.methodInfo || !job.obj) {
-                completion.hasReturn = false;
-            } else {
-                std::vector<const void*> argPtrs;
-                if (!buildArgPtrTable(job.methodInfo, job.argBuf, argPtrs)) {
-                    completion.hasReturn = false;
-                } else {
-                    const void* retPtr = job.methodInfo->invoke(job.obj, argPtrs.data());
-                    completion.returnType = job.methodInfo->getReturnType();
-                    if (completion.returnType != nullptr && retPtr != nullptr) {
-                        const size_t retSize = completion.returnType->getSize();
-                        completion.returnBuf.resize(retSize);
-                        std::memcpy(completion.returnBuf.data(), retPtr, retSize);
-                        completion.hasReturn = true;
-                    }
-                }
-            }
-
-            {
-                std::lock_guard<std::mutex> lk(_completionMutex);
-                _completions.push(std::move(completion));
-            }
-        }
-    }
-
-    std::vector<std::thread> _workers;
-    std::queue<Job> _jobs;
-    std::queue<Completion> _completions;
-    std::mutex _jobMutex;
-    std::mutex _completionMutex;
-    std::condition_variable _jobCv;
-    std::atomic<bool> _stop{false};
-};
-
-// =============================================================================
 // RpcSerializer implementation
 // =============================================================================
 
@@ -409,16 +267,15 @@ bool RpcSerializer::readRpcReject(BitStream& s, uint64_t& callIdOut, RpcRejectRe
 RpcHandler::RpcHandler(INetworkSubSystem* network)
     : _network(network)
 {
-    _asyncPool = std::make_unique<RpcAsyncPool>();
-    _asyncPool->start(2);
+    // R6 C6 (2026-08-25): the RpcAsyncPool worker-thread dispatcher has
+    // been removed. Async RPCs now invoke synchronously inside
+    // onRpcRequest — they block the network thread until completion.
+    // Documented as a behavior change in design.md §15.13.
 }
 
 RpcHandler::~RpcHandler() {
-    if (_asyncPool) _asyncPool->shutdown();
-    // Locked access for the destructor: trivial since the handler's owner
-    // (AYNetworkSubSystem) is single-threaded by design. Pending callbacks
-    // are dropped; clients must drain their own state before destroying
-    // the subsystem.
+    // Single-thread model: pending callbacks are dropped; clients must
+    // drain their own state before destroying the subsystem.
     _pendingCalls.clear();
 }
 
@@ -611,7 +468,8 @@ NetConnection* RpcHandler::findNetConnectionById(uint32_t netId) const {
 }
 
 void RpcHandler::tick(float /*deltaTime*/) {
-    drainAsyncRpcCompletions();
+    // R6 C6: RpcAsyncPool removed — async RPCs invoke synchronously inside
+    // onRpcRequest. tick() now only handles the retry/expire sweep.
     expirePendingCalls();
 }
 
@@ -645,40 +503,9 @@ void RpcHandler::sendRpcResponse(uint64_t callId, NetConnection* from,
     emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, from);
 }
 
-void RpcHandler::drainAsyncRpcCompletions() {
-    if (!_asyncPool) return;
-    RpcAsyncPool::Completion completion;
-    while (_asyncPool->tryPopCompletion(completion)) {
-        if (completion.isMulticast) continue; // Multicast is fire-and-forget; the queue entry holds only the returnBuf allocation which is freed by Completion destructor when we exit this block.
-        // Lifetime guard (audit 2026-08-02): re-resolve the target
-        // connection from the stable netId snapshot. If the conn was
-        // disconnected between submit and drain, findNetConnectionById
-        // returns nullptr and we drop the completion silently — the
-        // pending callback map (if any) will eventually time out via
-        // expirePendingCalls.
-        NetConnection* liveFrom = completion.fromNetId
-            ? findNetConnectionById(completion.fromNetId)
-            : nullptr;
-        if (completion.fromNetId != 0 && !liveFrom) {
-            // Target conn is gone. We don't have a direct handle to the
-            // pending callback here (callers using async+RpcResponse
-            // track via the standard Response path), so just skip the
-            // response emission; the original caller's pending will
-            // expire on the standard timeout.
-            continue;
-        }
-        if (completion.hasReturn && completion.returnType && !completion.returnBuf.empty()) {
-            BitStream respBody;
-            RpcSerializer::writeRpcResponse(respBody, completion.returnType, completion.callId,
-                                            completion.returnBuf.data());
-            emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, liveFrom);
-        } else {
-            BitStream respBody;
-            RpcSerializer::writeRpcResponse(respBody, nullptr, completion.callId, nullptr);
-            emit(CHANNEL_RELIABLE, kMsgTypeRpcResponse, respBody, liveFrom);
-        }
-    }
-}
+// R6 C6: RpcHandler::drainAsyncRpcCompletions() removed — async RPCs
+// invoke synchronously inside onRpcRequest (block the network thread).
+// Documented in design.md §15.13.
 
 uint32_t RpcHandler::computeRetryBackoffMs(uint32_t retryCount) const {
     // Audit (2026-08-02): the previous branch
@@ -830,8 +657,11 @@ bool RpcHandler::callServerWithCallback(const char* typeName, const char* method
         return false;
     }
     const uint8_t channel = methodInfo->isUnreliable() ? CHANNEL_UNRELIABLE : CHANNEL_RELIABLE;
+    // R6 C6: register the pending callback BEFORE emit() so that a
+    // synchronous round-trip (Response arriving while emit() is still
+    // on the stack, e.g. via a loopback test sink) finds the entry.
+    if (cb) registerPendingWithRetry(outCallId, cb, channel, kMsgTypeRpcRequest, body, 0);
     if (!emit(channel, kMsgTypeRpcRequest, body)) return false;
-    if (cb) registerPendingWithRetry(outCallId, std::move(cb), channel, kMsgTypeRpcRequest, body, 0);
     return true;
 }
 
@@ -895,14 +725,17 @@ bool RpcHandler::callClientWithCallback(uint32_t targetNetId, const char* typeNa
     }
     if (!target) {
         if (_broadcastSink) {
+            // R6 C6: register pending BEFORE emit so a synchronous
+            // loopback round-trip finds the entry.
+            if (cb) registerPendingWithRetry(outCallId, cb, channel, kMsgTypeRpcRequest, body, targetNetId);
             if (!emit(channel, kMsgTypeRpcRequest, body)) return false;
-            if (cb) registerPendingWithRetry(outCallId, std::move(cb), channel, kMsgTypeRpcRequest, body, targetNetId);
             return true;
         }
         return false;
     }
+    // R6 C6: same register-before-emit ordering.
+    if (cb) registerPendingWithRetry(outCallId, cb, channel, kMsgTypeRpcRequest, body, targetNetId);
     if (!emit(channel, kMsgTypeRpcRequest, body, target)) return false;
-    if (cb) registerPendingWithRetry(outCallId, std::move(cb), channel, kMsgTypeRpcRequest, body, targetNetId);
     return true;
 }
 
@@ -989,24 +822,16 @@ bool RpcHandler::onRpcRequest(BitStream& body, NetConnection* from) {
 
     const bool isMulticast = (rpcKind == ayt::reflect::RpcKind::Multicast);
 
+    // R6 C6 (2026-08-25): RpcAsyncPool removed. Async RPCs now invoke
+    // synchronously here — the network thread blocks until the user's
+    // isAsync handler returns. Documented behavior change in
+    // design.md §15.13 (RpcAsyncPool removal). B-11 was the
+    // worker-thread ordering finding; this eliminates it entirely.
     if (methodInfo->isAsync()) {
-        if (!_asyncPool) {
-            emitRpcRejectIfTracked(rpcKind, callId, RpcRejectReason::UnknownMethod, from);
-            return false;
+        const void* retPtr = methodInfo->invoke(obj, argPtrs.data());
+        if (!isMulticast) {
+            sendRpcResponse(callId, from, methodInfo, retPtr);
         }
-        RpcAsyncPool::Job job;
-        job.methodInfo = methodInfo;
-        job.obj = obj;
-        job.argBuf = std::move(argBuf);
-        job.callId = callId;
-        // Lifetime note (audit 2026-08-02): store the stable netId only.
-        // The worker thread cannot dereference `from` because the network
-        // thread may disconnect the connection before drain; the drain
-        // re-resolves from _network->getConnections() and drops the
-        // completion if the conn is no longer live.
-        job.fromNetId = from ? from->getId() : 0u;
-        job.isMulticast = isMulticast;
-        _asyncPool->submit(std::move(job));
         return true;
     }
 

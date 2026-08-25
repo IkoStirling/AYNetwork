@@ -129,7 +129,10 @@ constexpr uint32_t RpcSyncBudgetMs           = 16;
 // when compression shrinks the on-wire frame (see RpcHandler::emit).
 constexpr size_t RpcResponseCompressMinBytes = 64;
 
-class RpcAsyncPool;
+// R6 C6 (2026-08-25): the RpcAsyncPool worker-thread dispatcher has been
+// removed. Async RPCs invoke synchronously inside onRpcRequest — the
+// network thread blocks until the user's isAsync handler returns.
+// Documented behavior change in design.md §15.13.
 
 class RpcHandler {
 public:
@@ -286,7 +289,8 @@ private:
     NetConnection* findNetConnectionById(uint32_t netId) const;
 
     void expirePendingCalls();
-    void drainAsyncRpcCompletions();
+    // R6 C6: drainAsyncRpcCompletions() removed — async RPCs now invoke
+    // synchronously inside onRpcRequest (see RpcHandler.cpp).
     void sendRpcResponse(uint64_t callId, NetConnection* from,
                          const ayt::reflect::IMethodInfo* methodInfo, const void* retPtr);
     void emitRpcRejectIfTracked(ayt::reflect::RpcKind rpcKind, uint64_t callId,
@@ -346,7 +350,6 @@ private:
     uint32_t _retryBaseMs = RpcDefaultRetryBaseMs;
     size_t _responseCompressMinBytes = RpcResponseCompressMinBytes;
     ayt::replay::IReplayRecorder* _replay = nullptr;
-    std::unique_ptr<RpcAsyncPool> _asyncPool;
 
     // R5.5 (2026-08-25): profiler send hook for RPC envelope msgTypes.
     ProfilerRpcHook _profilerHook;

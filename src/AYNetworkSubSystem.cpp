@@ -171,11 +171,9 @@ public:
 
     void shutdownNow() {
         disconnectNow();
-        {
-            std::lock_guard<std::mutex> lock(_simulationInboundMutex);
-            _simulationInbound.clear();
-            _simulationInboundBytes = 0;
-        }
+        // R6 C6: single-thread; no lock.
+        _simulationInbound.clear();
+        _simulationInboundBytes = 0;
         _ingressTargetSimTick = 0;
         gns::shutdown();
         _initialized = false;
@@ -314,7 +312,7 @@ public:
                                 uint32_t fromNetId,
                                 const uint8_t* body,
                                 size_t bodySize) {
-        std::lock_guard<std::mutex> lock(_simulationInboundMutex);
+        // R6 C6: single-thread; no lock.
         if ((body == nullptr && bodySize != 0) ||
             bodySize > _limits.maxQueuedInboundBytes ||
             _simulationInbound.size() >= _limits.maxQueuedInboundMessages ||
@@ -466,14 +464,13 @@ public:
 
     void drainSimulationInbound(uint64_t simTick) {
         std::vector<PendingSimulationInbound> due;
-        {
-            std::lock_guard<std::mutex> lock(_simulationInboundMutex);
-            while (!_simulationInbound.empty()
-                   && _simulationInbound.front().targetSimTick <= simTick) {
-                due.push_back(std::move(_simulationInbound.front()));
-                _simulationInboundBytes -= due.back().body.size();
-                _simulationInbound.pop_front();
-            }
+        // R6 C6: single-thread; no lock. _simulationInbound deque is drained
+        // in FIFO order so the due[] list is itself deterministic.
+        while (!_simulationInbound.empty()
+               && _simulationInbound.front().targetSimTick <= simTick) {
+            due.push_back(std::move(_simulationInbound.front()));
+            _simulationInboundBytes -= due.back().body.size();
+            _simulationInbound.pop_front();
         }
 
         for (PendingSimulationInbound& pending : due) {
@@ -660,11 +657,9 @@ public:
             _serverConn.reset();
         }
         clearServerClients("server shutdown");
-        {
-            std::lock_guard<std::mutex> lock(_simulationInboundMutex);
-            _simulationInbound.clear();
-            _simulationInboundBytes = 0;
-        }
+        // R6 C6: single-thread; no lock.
+        _simulationInbound.clear();
+        _simulationInboundBytes = 0;
         _mode = ConnectionMode::Disconnected;
     }
 
@@ -1009,7 +1004,9 @@ private:
     // for ReplicationManager / RpcHandler / GnsConnection is wired in
     // setupProfilerHooks() called from the constructor.
     ProfilerRegistry _profiler;
-    std::mutex _simulationInboundMutex;
+    // R6 C6 (2026-08-25): single-thread model — the over-defensive
+    // _simulationInboundMutex has been removed. The inbound queue is
+    // drained on the main thread only.
     std::deque<PendingSimulationInbound> _simulationInbound;
     size_t _simulationInboundBytes = 0;
     uint64_t _ingressTargetSimTick = 0;
