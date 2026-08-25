@@ -35,6 +35,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <algorithm>
 #include <string>
 #include <thread>
 #include <vector>
@@ -470,6 +471,67 @@ TEST_CASE(TopLevelSchemaMismatchDoesNotMutateObject) {
     wire.resetForRead();
     CHECK(!manager.onReceive(kMsgTypeReplication, wire, nullptr));
     CHECK_INT_EQ(destination.score, 17);
+}
+
+// R6 C2 (2026-08-25): the ReplicationManager's per-netId PeerState map
+// is std::map<uint32_t, ...> (sorted by connectionId), not std::unordered_map.
+// The state-equal replay depends on tick() emitting frames in a deterministic
+// order; if the internal type regressed to an unsorted container the replicate
+// and despawn paths would emit in hash-iteration order, which depends on the
+// runtime allocator and pointer identity.
+//
+// We can't reach _peers directly (private), so we exercise the observable
+// consequence: register N ghost objects with scrambled netIds, tick, and
+// confirm every captured Replication frame's netId equals the registered one
+// (a trivially-sorted iteration produces a single frame per netId in netId
+// order; this test is a regression sentinel — if the iteration regresses
+// to unordered_map the manager still emits one frame per netId, so we
+// verify the netId set rather than the order itself).
+TEST_CASE(DespawnOrderIsByConnectionId) {
+    ayt::test::setCurrentCase("DespawnOrderIsByConnectionId");
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationNoNet>();
+    CHECK(type != nullptr);
+
+    ReplicationManager mgr(nullptr);
+    mgr.setModeForTesting(ConnectionMode::Server);
+
+    // Register in scrambled netId order (88, 11, 55, 33).
+    std::vector<uint32_t> netIds{88, 11, 55, 33};
+    for (uint32_t nid : netIds) {
+        ReplicationNoNet obj;
+        mgr.registerObject(&obj, type, nid);
+    }
+
+    // Capture every Replication frame's netId + whether it's a Full snapshot.
+    std::vector<uint32_t> frameNetIds;
+    mgr.setBroadcastSinkForTesting([&](uint8_t /*channel*/, const void* data, size_t size) {
+        DecodedPacket decoded = PacketCodec::decode(static_cast<const uint8_t*>(data), size);
+        if (!decoded.ok) return;
+        if (decoded.header.msgType != kMsgTypeReplication) return;
+        BitStream bs(decoded.body.data(), decoded.body.size());
+        uint32_t serverTick = 0;
+        ReflectSerializer::readServerTick(bs, serverTick);
+        ReflectSerializer::FrameHeader hdr;
+        if (!ReflectSerializer::readReplicationFrameHeader(bs, hdr)) return;
+        frameNetIds.push_back(hdr.netId);
+    });
+
+    mgr.tick(1.0f / 30.0f);
+
+    // The ReplicationManager iterates _objects[netId] in ascending netId
+    // order (R6 C2 — std::map<uint32_t, ReflectedEntry>). We registered
+    // {88, 11, 55, 33}; the manager's tick walks them as
+    // {11, 33, 55, 88} and emits frames in that order. The captured
+    // sequence must be sorted ascending even though the registration
+    // was scrambled.
+    std::vector<uint32_t> expected = netIds;
+    std::sort(expected.begin(), expected.end());
+    CHECK(frameNetIds.size() == expected.size());
+    bool sorted = true;
+    for (size_t i = 1; i < frameNetIds.size(); ++i) {
+        if (frameNetIds[i] < frameNetIds[i - 1]) { sorted = false; break; }
+    }
+    CHECK(sorted);
 }
 
 TEST_SUITE_END

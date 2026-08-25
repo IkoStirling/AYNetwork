@@ -27,7 +27,7 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <unordered_map>
+#include <map>
 #include <vector>
 #include <functional>
 
@@ -133,9 +133,12 @@ public:
 
 private:
     uint32_t _ringCapacity;
-    std::unordered_map<uint32_t, InputRing> _rings;       // per-connection
-    std::unordered_map<uint32_t, uint32_t>  _ackedSeq;    // per-connection last-acked
-    std::unordered_map<uint32_t, PredictedGhost> _ghosts; // per-netId
+    // R6 C2 (2026-08-25): std::map (was std::unordered_map) so iteration
+    // order is deterministic — sorted by connectionId / netId. Same
+    // [k]/find/erase/range-for API; copy/move semantics unchanged.
+    std::map<uint32_t, InputRing>      _rings;    // per-connection
+    std::map<uint32_t, uint32_t>       _ackedSeq; // per-connection last-acked
+    std::map<uint32_t, PredictedGhost> _ghosts;   // per-netId
 };
 
 } // namespace ayt::net

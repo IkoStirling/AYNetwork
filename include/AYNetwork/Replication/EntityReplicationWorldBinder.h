@@ -12,8 +12,8 @@
 #include <AYReflect/ReflectRegistry.h>
 
 #include <cstdint>
-#include <unordered_map>
-#include <unordered_set>
+#include <map>
+#include <set>
 #include <vector>
 
 namespace ayt::net
@@ -40,8 +40,10 @@ public:
             uint32_t entityNetId = 0;
         };
 
-        std::unordered_map<uint32_t, DesiredBinding> desired;
-        std::unordered_set<uint32_t> collisions;
+        // R6 C2 (2026-08-25): std::map / std::set for deterministic iteration
+        // (was unordered_map / unordered_set).
+        std::map<uint32_t, DesiredBinding> desired;
+        std::set<uint32_t> collisions;
 
         for (ayt::entity::Entity* entity : _world.getAllEntities()) {
             if (!entity) continue;
@@ -136,7 +138,7 @@ private:
 
     ReplicationManager& _manager;
     ayt::entity::World& _world;
-    std::unordered_map<uint32_t, Binding> _bindings;
+    std::map<uint32_t, Binding> _bindings;  // R6 C2: sorted by netId
     size_t _collisionCount = 0;
 };
 

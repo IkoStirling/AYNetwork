@@ -7,6 +7,7 @@
 #include <bit>
 #include <vector>
 #include <cstdint>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -862,8 +863,11 @@ private:
 
     // Forward-declared below; single map shared by both register paths.
     struct ReflectedEntry;
-    std::unordered_map<uint32_t, ReflectedEntry> _objects;
-    std::unordered_map<uint32_t, uint64_t>        _spawnAnnouncements;
+    // R6 C2 (2026-08-25): std::map (was std::unordered_map). tick() iterates
+    // _objects to enumerate ghosts; sorting by netId makes the wire-side
+    // frame order deterministic across runs (state-equal replay).
+    std::map<uint32_t, ReflectedEntry> _objects;
+    std::unordered_map<uint32_t, uint64_t> _spawnAnnouncements;
 
     // R5.1 (teleport): per-netId one-shot marker set by markTeleported().
     // tick() drains the set: each marked netId emits a Full Snapshot with

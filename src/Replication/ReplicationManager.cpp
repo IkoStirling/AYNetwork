@@ -3,6 +3,7 @@
 #include <AYNetwork/Replication/ReplicationManager.h>
 
 #include <AYNetwork/Replication/ReflectSerializer.h>
+#include <map>
 #include <AYNetwork/Snapshot/SnapshotInterpolator.h>
 #include <AYNetwork/Protocol/PacketCodec.h>
 #include <AYNetwork/Transport/GnsConnection.h>
@@ -47,7 +48,7 @@ struct ReplicationManager::ReflectedEntry {
 
     // ---- per-connection dirty tracking ----
     std::vector<uint32_t> _netFieldSparseIndex;   // dense → type->getField() sparse
-    std::unordered_map<uint32_t, PeerState> _peers;
+    std::map<uint32_t, PeerState> _peers;       // R6 C2 (2026-08-25): sorted by connectionId for deterministic iteration
 
     // ---- R4.1-B interest ----
     NetVec3 _location{};
@@ -464,7 +465,7 @@ void ReplicationManager::tick(float /*deltaTime*/) {
             e.obj, e.type, netId, e._location, e._hasLocation);
         if (_extension) _extension->onPreReplicate(e.obj, e.type, netId, targets);
 
-        std::unordered_map<uint32_t, NetConnection*> targetById;
+        std::map<uint32_t, NetConnection*> targetById;  // R6 C2: sorted iteration
         for (NetConnection* target : targets) {
             if (target && target->isConnected()) targetById[target->getId()] = target;
         }
