@@ -24,13 +24,17 @@
 
 #include <AYNetwork/Replay/NetworkReplayTypes.h>
 #include <AYNetwork/Replay/NetworkReplayRecorderAdapter.h>
+#include <AYNetwork/Replay/NetworkReplayEventDecoder.h>
 #include <AYNetwork/Replication/ReplicationManager.h>
+
+#include <AYReplay/FileReplayPlayer.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -416,6 +420,269 @@ TEST_CASE(PeriodicCheckpointProduced) {
     CHECK(hashes[0] != 0ull);
     CHECK(hashes[0] == hashes[1]); // same provider bytes → same hash
     std::filesystem::remove(FileReplayRecorder::rotationPathFor(base, 0));
+}
+
+// =============================================================================
+// R6.5-2 (2026-08-25): NetworkReplayEventDecoder tests
+// =============================================================================
+
+TEST_CASE(Decoder_PureRecordAllEventsDecodes) {
+    ayt::test::getStats().current_case = "Decoder_PureRecordAllEventsDecodes";
+
+    const std::string base =
+        (std::filesystem::temp_directory_path() / "ayt_decoder_pure.ayrp").string();
+    const std::string recordedPath = FileReplayRecorder::rotationPathFor(base, 0);
+
+    auto inner = std::make_unique<FileReplayRecorder>(base);
+    auto* adapter = new ayt::net::replay::NetworkReplayRecorderAdapter(std::move(inner));
+    std::unique_ptr<ayt::net::replay::NetworkReplayRecorderAdapter> guard(adapter);
+
+    CHECK(adapter->beginSession(makeHeader(kSchemaVersion)));
+    adapter->setAuthorityGate(true);
+
+    const uint8_t body[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02};
+
+    CHECK(adapter->recordInitialFullSnapshot(/*conn=*/ 7, 100, /*flags=*/ 0x11, body, 6));
+    CHECK(adapter->recordSpawn(7, 101, /*netId=*/ 42, /*schemaHash=*/ 0xAA, body, 6));
+    CHECK(adapter->recordDespawn(7, 102, 42));
+    CHECK(adapter->recordDeltaSnapshot(7, 103, 0x22, body, 6));
+    CHECK(adapter->recordInput(7, 104, /*seq=*/ 5, /*serverTickAtSend=*/ 99, body, 6));
+    CHECK(adapter->recordRpc(/*msgType=*/ 0x0010, 7, 105, body, 6));
+    CHECK(adapter->recordAuthorityChange(42, 106, /*oldKind=*/ 1, /*newKind=*/ 2, 7));
+    CHECK(adapter->endSession());
+
+    // Open the foundation player and decode every event.
+    ayt::replay::FileReplayPlayer player(recordedPath);
+    CHECK(player.open() == ayt::replay::IReplayPlayer::Error::Ok);
+
+    using ayt::net::replay::DecodedEvent;
+    using ayt::net::replay::NetworkReplayEventDecoder;
+
+    DecodedEvent d;
+    int seen[7] = {0};
+
+    // Loop until EOF. readNextEvent returns Ok with SessionEnd at EOF; we
+    // break on that or on a count of 7.
+    int safety = 32;
+    while (safety-- > 0) {
+        const auto err = NetworkReplayEventDecoder::decodeNext(player, d);
+        if (err != ayt::replay::IReplayPlayer::Error::Ok) break;
+        if (d.isCheckpoint) continue;
+        switch (d.eventType) {
+            case ayt::net::replay::kEvtNet_InitialFullSnapshot:
+                ++seen[0];
+                CHECK(d.initialFullSnapshot.connectionId == 7u);
+                CHECK(d.initialFullSnapshot.frameFlags   == 0x11u);
+                CHECK(d.initialFullSnapshot.payload.size() == 6u);
+                break;
+            case ayt::net::replay::kEvtNet_Spawn:
+                ++seen[1];
+                CHECK(d.spawn.connectionId == 7u);
+                CHECK(d.spawn.netId        == 42u);
+                CHECK(d.spawn.schemaHash   == 0xAAull);
+                CHECK(d.spawn.payload.size() == 6u);
+                break;
+            case ayt::net::replay::kEvtNet_Despawn:
+                ++seen[2];
+                CHECK(d.despawn.connectionId == 7u);
+                CHECK(d.despawn.netId        == 42u);
+                break;
+            case ayt::net::replay::kEvtNet_DeltaSnapshot:
+                ++seen[3];
+                CHECK(d.deltaSnapshot.connectionId == 7u);
+                CHECK(d.deltaSnapshot.frameFlags   == 0x22u);
+                CHECK(d.deltaSnapshot.payload.size() == 6u);
+                break;
+            case ayt::net::replay::kEvtNet_InputBatch:
+                ++seen[4];
+                CHECK(d.inputBatch.connectionId     == 7u);
+                CHECK(d.inputBatch.inputSeq         == 5u);
+                CHECK(d.inputBatch.serverTickAtSend == 99u);
+                CHECK(d.inputBatch.payload.size()   == 6u);
+                break;
+            case ayt::net::replay::kEvtNet_RpcBatch:
+                ++seen[5];
+                CHECK(d.rpcBatch.messageType  == 0x0010u);
+                CHECK(d.rpcBatch.connectionId == 7u);
+                CHECK(d.rpcBatch.body.size()  == 6u);
+                break;
+            case ayt::net::replay::kEvtNet_AuthorityChange:
+                ++seen[6];
+                CHECK(d.authorityChange.netId        == 42u);
+                CHECK(d.authorityChange.oldKind      == 1u);
+                CHECK(d.authorityChange.newKind      == 2u);
+                CHECK(d.authorityChange.connectionId == 7u);
+                break;
+            default:
+                break;
+        }
+        // All 7 events seen? Stop.
+        if (seen[0] && seen[1] && seen[2] && seen[3] && seen[4] && seen[5] && seen[6]) break;
+    }
+    for (int i = 0; i < 7; ++i) CHECK_INT_EQ(seen[i], 1);
+
+    player.close();
+    std::filesystem::remove(recordedPath);
+}
+
+TEST_CASE(Decoder_ConnectionIdRemap_AppliesToAllEvents) {
+    ayt::test::getStats().current_case = "Decoder_ConnectionIdRemap_AppliesToAllEvents";
+
+    const std::string base =
+        (std::filesystem::temp_directory_path() / "ayt_decoder_remap.ayrp").string();
+    const std::string recordedPath = FileReplayRecorder::rotationPathFor(base, 0);
+
+    auto inner = std::make_unique<FileReplayRecorder>(base);
+    auto* adapter = new ayt::net::replay::NetworkReplayRecorderAdapter(std::move(inner));
+    std::unique_ptr<ayt::net::replay::NetworkReplayRecorderAdapter> guard(adapter);
+
+    CHECK(adapter->beginSession(makeHeader(kSchemaVersion)));
+    adapter->setAuthorityGate(true);
+
+    // All events recorded with conn=10.
+    const uint8_t body[4] = {0x01, 0x02, 0x03, 0x04};
+    CHECK(adapter->recordInitialFullSnapshot(10, 1, 0, body, 4));
+    CHECK(adapter->recordSpawn(10, 2, 1, 0, body, 4));
+    CHECK(adapter->recordDespawn(10, 3, 1));
+    CHECK(adapter->recordDeltaSnapshot(10, 4, 0, body, 4));
+    CHECK(adapter->recordInput(10, 5, 1, 1, body, 4));
+    CHECK(adapter->recordRpc(0x0010, 10, 6, body, 4));
+    CHECK(adapter->recordAuthorityChange(1, 7, 0, 1, 10));
+    CHECK(adapter->endSession());
+
+    // Build remap: recorded 10 → live 99.
+    ayt::net::replay::ConnectionIdRemap remap;
+    remap[10] = 99;
+
+    ayt::replay::FileReplayPlayer player(recordedPath);
+    CHECK(player.open() == ayt::replay::IReplayPlayer::Error::Ok);
+
+    using ayt::net::replay::DecodedEvent;
+    using ayt::net::replay::NetworkReplayEventDecoder;
+
+    DecodedEvent d;
+    int seen[7] = {0};
+    int safety = 32;
+    while (safety-- > 0) {
+        const auto err = NetworkReplayEventDecoder::decodeNext(player, d, remap);
+        if (err != ayt::replay::IReplayPlayer::Error::Ok) break;
+        if (d.isCheckpoint) continue;
+        switch (d.eventType) {
+            case ayt::net::replay::kEvtNet_InitialFullSnapshot:
+                ++seen[0]; CHECK(d.initialFullSnapshot.connectionId == 99u); break;
+            case ayt::net::replay::kEvtNet_Spawn:
+                ++seen[1]; CHECK(d.spawn.connectionId == 99u); break;
+            case ayt::net::replay::kEvtNet_Despawn:
+                ++seen[2]; CHECK(d.despawn.connectionId == 99u); break;
+            case ayt::net::replay::kEvtNet_DeltaSnapshot:
+                ++seen[3]; CHECK(d.deltaSnapshot.connectionId == 99u); break;
+            case ayt::net::replay::kEvtNet_InputBatch:
+                ++seen[4]; CHECK(d.inputBatch.connectionId == 99u); break;
+            case ayt::net::replay::kEvtNet_RpcBatch:
+                ++seen[5]; CHECK(d.rpcBatch.connectionId == 99u); break;
+            case ayt::net::replay::kEvtNet_AuthorityChange:
+                ++seen[6]; CHECK(d.authorityChange.connectionId == 99u); break;
+            default: break;
+        }
+        if (seen[0] && seen[1] && seen[2] && seen[3] && seen[4] && seen[5] && seen[6]) break;
+    }
+    for (int i = 0; i < 7; ++i) CHECK_INT_EQ(seen[i], 1);
+
+    player.close();
+    std::filesystem::remove(recordedPath);
+}
+
+TEST_CASE(Decoder_MissingRemapFallsBackToLiteral) {
+    ayt::test::getStats().current_case = "Decoder_MissingRemapFallsBackToLiteral";
+
+    const std::string base =
+        (std::filesystem::temp_directory_path() / "ayt_decoder_missing.ayrp").string();
+    const std::string recordedPath = FileReplayRecorder::rotationPathFor(base, 0);
+
+    auto inner = std::make_unique<FileReplayRecorder>(base);
+    auto* adapter = new ayt::net::replay::NetworkReplayRecorderAdapter(std::move(inner));
+    std::unique_ptr<ayt::net::replay::NetworkReplayRecorderAdapter> guard(adapter);
+
+    CHECK(adapter->beginSession(makeHeader(kSchemaVersion)));
+    adapter->setAuthorityGate(true);
+
+    const uint8_t body[2] = {0xAB, 0xCD};
+    CHECK(adapter->recordInitialFullSnapshot(/*conn=*/ 10, 1, 0, body, 2));
+    CHECK(adapter->endSession());
+
+    // No remap → fall back to literal id; diagnostic should report 10.
+    ayt::replay::FileReplayPlayer player(recordedPath);
+    CHECK(player.open() == ayt::replay::IReplayPlayer::Error::Ok);
+
+    using ayt::net::replay::DecodedEvent;
+    using ayt::net::replay::NetworkReplayEventDecoder;
+
+    DecodedEvent d;
+    std::vector<uint32_t> unmapped;
+    const auto err = NetworkReplayEventDecoder::decodeNext(player, d, {}, &unmapped);
+    CHECK(err == ayt::replay::IReplayPlayer::Error::Ok);
+    CHECK(d.eventType == ayt::net::replay::kEvtNet_InitialFullSnapshot);
+    CHECK(d.initialFullSnapshot.connectionId == 10u);
+    CHECK(unmapped.size() == 1u);
+    CHECK(unmapped[0] == 10u);
+
+    player.close();
+    std::filesystem::remove(recordedPath);
+}
+
+TEST_CASE(Decoder_CheckpointPreserved) {
+    ayt::test::getStats().current_case = "Decoder_CheckpointPreserved";
+
+    const std::string base =
+        (std::filesystem::temp_directory_path() / "ayt_decoder_ckpt.ayrp").string();
+    const std::string recordedPath = FileReplayRecorder::rotationPathFor(base, 0);
+
+    auto inner = std::make_unique<FileReplayRecorder>(base);
+    auto* adapter = new ayt::net::replay::NetworkReplayRecorderAdapter(std::move(inner));
+    std::unique_ptr<ayt::net::replay::NetworkReplayRecorderAdapter> guard(adapter);
+
+    CHECK(adapter->beginSession(makeHeader(kSchemaVersion)));
+    adapter->setAuthorityGate(true);
+
+    // Record 1 checkpoint + 1 event.
+    const std::vector<uint32_t> netIds = {10, 20};
+    auto provider = [](uint32_t netId, std::vector<uint8_t>& out) -> bool {
+        out.clear();
+        if (netId == 10) { out.assign({0xAA, 0xAA}); return true; }
+        if (netId == 20) { out.assign({0xBB, 0xBB}); return true; }
+        return false;
+    };
+    CHECK(adapter->recordPeriodicCheckpoint(/*tick=*/ 5, netIds, provider));
+
+    const uint8_t body[3] = {0x01, 0x02, 0x03};
+    CHECK(adapter->recordInitialFullSnapshot(7, 6, 0x11, body, 3));
+    CHECK(adapter->endSession());
+
+    ayt::replay::FileReplayPlayer player(recordedPath);
+    CHECK(player.open() == ayt::replay::IReplayPlayer::Error::Ok);
+
+    using ayt::net::replay::DecodedEvent;
+    using ayt::net::replay::NetworkReplayEventDecoder;
+
+    // First: checkpoint.
+    DecodedEvent d1;
+    CHECK(NetworkReplayEventDecoder::decodeNext(player, d1) ==
+          ayt::replay::IReplayPlayer::Error::Ok);
+    CHECK(d1.isCheckpoint);
+    CHECK(d1.tick == 5u);
+    CHECK(d1.snapshot.empty());  // recordPeriodicCheckpoint wrote 0-byte snapshot
+
+    // Second: InitialFullSnapshot.
+    DecodedEvent d2;
+    CHECK(NetworkReplayEventDecoder::decodeNext(player, d2) ==
+          ayt::replay::IReplayPlayer::Error::Ok);
+    CHECK(!d2.isCheckpoint);
+    CHECK(d2.eventType == ayt::net::replay::kEvtNet_InitialFullSnapshot);
+    CHECK(d2.tick == 6u);
+    CHECK(d2.initialFullSnapshot.payload.size() == 3u);
+
+    player.close();
+    std::filesystem::remove(recordedPath);
 }
 
 TEST_SUITE_END

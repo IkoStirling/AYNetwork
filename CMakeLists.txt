@@ -24,6 +24,7 @@ set(SRC_FILES
     src/Prediction/PredictionManager.cpp       # R5.2
     src/Prediction/MispredictionResolver.cpp   # R5.2
     src/Replay/NetworkReplayRecorderAdapter.cpp  # R5.3 (2026-08-24)
+    src/Replay/NetworkReplayEventDecoder.cpp      # R6.5-2 (2026-08-25)
     src/Transport/DelayedFrameQueue.cpp          # R5.4 (2026-08-25)
     src/Transport/TransportFaultController.cpp   # R5.4
     src/Transport/TransportFaultInterceptor.cpp   # R5.4
