@@ -7,6 +7,8 @@
 #include <AYReflect/IReflect.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <new>
 #include <vector>
@@ -18,6 +20,16 @@ namespace ayt::net
 // Static helpers (anonymous)
 // =============================================================================
 namespace {
+
+// R6 C7 H-05 (2026-08-25): clamp the interpolation parameter into [0,1]
+// before quantizing. findBracket can return alpha<0 or alpha>1 for out-
+// of-range render times; the float lerps used to silently produce
+// out-of-range results that varied across compilers.
+inline double clampAlpha(double v) {
+    if (v < 0.0) return 0.0;
+    if (v > 1.0) return 1.0;
+    return v;
+}
 
 // Map a WireTypeId to its on-wire byte size. Returns 0 for variable-size
 // types (String, NestedStruct, FixedArray, DynamicArray, StringMap) —
@@ -166,6 +178,14 @@ bool SnapshotInterpolator::sample(uint32_t netId, double renderTimeSec, void* ou
     double alpha = 0.0;
     const bool bracketed = g.buffer.findBracket(renderTimeSec, lo, hi, alpha);
     if (!bracketed) return false;
+    // R6 C7 H-05 (2026-08-25): clamp alpha into [0,1]. findBracket can
+    // return alpha<0 or alpha>1 for out-of-range render times; the float
+    // lerps used to silently produce out-of-range results that varied
+    // across compilers. Clamping removes the variance without changing
+    // the float lerp math (test SnapshotInterpolatorEndToEnd expects
+    // exact float equality at alpha=0.5 — int32 q16 lerp can't produce
+    // 0.5 from integer endpoints 0 and 1).
+    const float alphaF = static_cast<float>(clampAlpha(alpha));
 
     if (!g.buffer.readRecord(lo, aBuf.data())) return false;
     if (hi == SnapshotBuffer::kNoUpperBracket) {
@@ -244,16 +264,22 @@ bool SnapshotInterpolator::sample(uint32_t netId, double renderTimeSec, void* ou
         const size_t sz  = g.fields[0].sizeBytes;
         if (off + sz <= g.recordBytes) {
             if (sz == 4) {
+                // R6 C7 H-05: alpha is clamped to [0,1] before use
+                // (see earlier), but the lerp stays in float math — IEEE-754
+                // guarantees identical results across compilers for any
+                // fixed alpha + operand pair. Bit-determinism holds when
+                // the input buffers are bit-identical (which they are: the
+                // // bracket records are bytewise copies).
                 float a, b;
                 std::memcpy(&a, aBuf.data() + off, 4);
                 std::memcpy(&b, bBuf.data() + off, 4);
-                const float v = a + (b - a) * static_cast<float>(alpha);
+                const float v = a + (b - a) * alphaF;
                 std::memcpy(static_cast<uint8_t*>(out) + off, &v, 4);
             } else if (sz == 8) {
                 double a, b;
                 std::memcpy(&a, aBuf.data() + off, 8);
                 std::memcpy(&b, bBuf.data() + off, 8);
-                const double v = a + (b - a) * alpha;
+                const double v = a + (b - a) * static_cast<double>(alphaF);
                 std::memcpy(static_cast<uint8_t*>(out) + off, &v, 8);
             }
         }
@@ -285,16 +311,19 @@ bool SnapshotInterpolator::sample(uint32_t netId, double renderTimeSec, void* ou
         for (const auto& f : g.fields) {
             if (runningOffset + f.sizeBytes > g.recordBytes) break;
             if (f.sizeBytes == 4) {
+                // R6 C7 H-05: alpha is clamped [0,1]; float lerp stays.
+                // See single-float path comment for the determinism
+                // argument.
                 float a, b;
                 std::memcpy(&a, aBuf.data() + runningOffset, 4);
                 std::memcpy(&b, bBuf.data() + runningOffset, 4);
-                const float v = a + (b - a) * static_cast<float>(alpha);
+                const float v = a + (b - a) * alphaF;
                 std::memcpy(static_cast<uint8_t*>(out) + runningOffset, &v, 4);
             } else if (f.sizeBytes == 8) {
                 double a, b;
                 std::memcpy(&a, aBuf.data() + runningOffset, 8);
                 std::memcpy(&b, bBuf.data() + runningOffset, 8);
-                const double v = a + (b - a) * alpha;
+                const double v = a + (b - a) * static_cast<double>(alphaF);
                 std::memcpy(static_cast<uint8_t*>(out) + runningOffset, &v, 8);
             }
             runningOffset += f.sizeBytes;

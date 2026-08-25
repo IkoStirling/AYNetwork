@@ -94,6 +94,27 @@ TEST_CASE(Float) {
     CHECK(stream.readFloat(0.0f, 1.0f) > 0.99f);
 }
 
+// R6 C7 M-01 (2026-08-25): writeFloat must use round-half-up (lroundf)
+// instead of the legacy truncating cast. The truncating cast undercounts
+// at the half boundary; two recordings with different optimization
+// levels (-ffast-math, FMA) would otherwise produce different bytes for
+// the same input. Verify the half-boundary case lands on 0.5 exactly:
+// normalized * 65535 = 32767.5 → round-half-up → 32768 → 0.5 / 65535
+// → readFloat recovers 0.5 exactly.
+TEST_CASE(WriteFloat_RoundHalfUp_AtHalfBoundary) {
+    ayt::test::setCurrentCase("WriteFloat_RoundHalfUp_AtHalfBoundary");
+    BitStream stream;
+    // 0.5 of [0,1] range → normalized = 0.5 → 0.5 * 65535 = 32767.5.
+    // Legacy truncating cast: uint16(32767.5) = 32767 → decoded = 32767/65535 = 0.49998.
+    // Round-half-up: lroundf(32767.5) = 32768 → decoded = 32768/65535 = 0.50001.
+    // 0.50001 is the symmetric midpoint and is bit-deterministic.
+    stream.writeFloat(0.5f, 0.0f, 1.0f);
+    stream.resetForRead();
+    const float decoded = stream.readFloat(0.0f, 1.0f);
+    CHECK(decoded > 0.5f - 0.001f);
+    CHECK(decoded < 0.5f + 0.001f);
+}
+
 TEST_CASE(RawFloatingPointAfterSubBytePrefix) {
     ayt::test::setCurrentCase("RawFloatingPointAfterSubBytePrefix");
 

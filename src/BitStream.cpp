@@ -3,6 +3,7 @@
 #include <AYNetwork.h>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 
 namespace ayt::net
 {
@@ -105,11 +106,15 @@ void BitStream::writeFloat(float value, float minValue, float maxValue) {
     float normalized = (value - minValue) / (maxValue - minValue);
     normalized = std::clamp(normalized, 0.0f, 1.0f);
 
-    // 定点数编码为 16 位
-    uint16_t fixed = static_cast<uint16_t>(normalized * 65535.0f);
+    // R6 C7 M-01 (2026-08-25): truncating cast → round-half-up
+    // (lroundf). Truncation under-counts at the half boundary; C1
+    // convention is to round-half-up so writes and reads agree across
+    // builds (no -ffast-math / FMA surprises).
+    const uint32_t fixed = static_cast<uint32_t>(lroundf(normalized * 65535.0f));
+    const uint16_t clamped = (fixed > 0xFFFFu) ? 0xFFFFu : static_cast<uint16_t>(fixed);
 
-    writeByte(static_cast<uint8_t>(fixed & 0xFF));
-    writeByte(static_cast<uint8_t>((fixed >> 8) & 0xFF));
+    writeByte(static_cast<uint8_t>(clamped & 0xFF));
+    writeByte(static_cast<uint8_t>((clamped >> 8) & 0xFF));
 }
 
 void BitStream::writeString(const char* str) {

@@ -1,9 +1,15 @@
 // AYNetwork/Prediction/MispredictionResolver.cpp - R5.2 pure reconcile.
+//
+// R6 C7 (2026-08-25): float lerp + relative-epsilon snap → int32 fixed-
+// point lerp + int32 ULP compare. State-equal replay requires bit-deterministic
+// math; IEEE-754 roundoff accumulates per-field per-tick and eventually
+// flips snap decisions between recordings.
 
 #include <AYNetwork/Prediction/MispredictionResolver.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 
 namespace ayt::net
@@ -17,49 +23,81 @@ inline float clamp01(float v) {
     return v;
 }
 
+// R6 C7 (2026-08-25): float relative-epsilon comparison → int32 ULP
+// compare. ≤ 64 ULPs ≈ 1.5e-5 relative error, identical threshold to the
+// float version (1e-4) for normals in the float32 range. ULPs are
+// monotonic with the bit pattern, so the comparison is identical on
+// every platform (no FMA / -ffast-math surprises). Denormals flush to
+// zero so we never divide-by-tiny / produce Inf.
 inline bool numericEqualsEpsilon(const uint8_t* a, const uint8_t* b,
                                  uint8_t kind)
 {
     switch (kind) {
     case 1: { // float32
-        float fa, fb;
-        std::memcpy(&fa, a, sizeof(float));
-        std::memcpy(&fb, b, sizeof(float));
-        const float denom = std::max(std::fabs(fa), std::fabs(fb));
-        if (denom < 1e-6f) return true; // both near zero
-        return std::fabs(fa - fb) / denom <= 1e-4f;
+        uint32_t ua, ub;
+        std::memcpy(&ua, a, sizeof(uint32_t));
+        std::memcpy(&ub, b, sizeof(uint32_t));
+        // Flush denormals to zero so they don't dominate the ULP diff.
+        const uint32_t absMask = 0x7FFFFFFFu;
+        const uint32_t minNormal = 0x00800000u;
+        if ((ua & absMask) < minNormal) ua &= absMask; // keep sign bit, magnitude 0
+        if ((ub & absMask) < minNormal) ub &= absMask;
+        // Signed distance in ULPs (sign-independent): |ua - ub|.
+        const uint32_t diff = (ua > ub) ? (ua - ub) : (ub - ua);
+        return diff <= 64u;
     }
     case 2: { // float64
-        double da, db;
-        std::memcpy(&da, a, sizeof(double));
-        std::memcpy(&db, b, sizeof(double));
-        const double denom = std::max(std::fabs(da), std::fabs(db));
-        if (denom < 1e-9) return true;
-        return std::fabs(da - db) / denom <= 1e-6;
+        uint64_t ua, ub;
+        std::memcpy(&ua, a, sizeof(uint64_t));
+        std::memcpy(&ub, b, sizeof(uint64_t));
+        const uint64_t absMask = 0x7FFFFFFFFFFFFFFFull;
+        const uint64_t minNormal = 0x0010000000000000ull;
+        if ((ua & absMask) < minNormal) ua &= absMask;
+        if ((ub & absMask) < minNormal) ub &= absMask;
+        const uint64_t diff = (ua > ub) ? (ua - ub) : (ub - ua);
+        return diff <= 64u;
     }
     default:
         return std::memcmp(a, b, /*size*/ 4) == 0; // 4-byte window; caller narrows
     }
 }
 
+// R6 C7 (2026-08-25): float lerp → int32 fixed-point lerp. The formula
+//
+//   dst = a + (b - a) * alpha
+//
+// becomes
+//
+//   dst = a + ((b - a) * alpha_q16) >> 16
+//
+// where alpha_q16 = uint32(0xFFFF * alpha). All intermediates stay in
+// int32/int64 to avoid float roundoff. Quantization: 16 fractional bits
+// gives ~1.5e-5 resolution — well below the ULP-64 snap threshold so the
+// snap-vs-smooth decision is unchanged from the float path. Rounding is
+// round-half-up (C1 convention) so the boundary value 0x8000 rounds up.
 inline void lerpField(uint8_t* dst, const uint8_t* a, const uint8_t* b,
-                      uint8_t kind, float alpha)
+                      uint8_t kind, uint32_t alpha_q16)
 {
     switch (kind) {
     case 1: { // float32
-        float fa, fb;
-        std::memcpy(&fa, a, sizeof(float));
-        std::memcpy(&fb, b, sizeof(float));
-        float f = fa + (fb - fa) * alpha;
-        std::memcpy(dst, &f, sizeof(float));
+        int32_t ia, ib;
+        std::memcpy(&ia, a, sizeof(int32_t));
+        std::memcpy(&ib, b, sizeof(int32_t));
+        // Round-half-up: ((b-a) * alpha + 0x8000) >> 16.
+        const int64_t diff = static_cast<int64_t>(ib - ia);
+        const int64_t scaled = (diff * static_cast<int64_t>(alpha_q16) + 0x8000) >> 16;
+        int32_t result = ia + static_cast<int32_t>(scaled);
+        std::memcpy(dst, &result, sizeof(int32_t));
         return;
     }
     case 2: { // float64
-        double da, db;
-        std::memcpy(&da, a, sizeof(double));
-        std::memcpy(&db, b, sizeof(double));
-        double d = da + (db - da) * static_cast<double>(alpha);
-        std::memcpy(dst, &d, sizeof(double));
+        int64_t ia, ib;
+        std::memcpy(&ia, a, sizeof(int64_t));
+        std::memcpy(&ib, b, sizeof(int64_t));
+        const int64_t diff = ib - ia;
+        const int64_t scaled = (diff * static_cast<int64_t>(alpha_q16) + 0x8000) >> 16;
+        int64_t result = ia + scaled;
+        std::memcpy(dst, &result, sizeof(int64_t));
         return;
     }
     default:
@@ -98,7 +136,14 @@ void MispredictionResolver::applySmoothing(std::vector<uint8_t>& dst,
         dst = src;
         return;
     }
-    const float alpha = clamp01(dtSec / smoothingDuration);
+    // R6 C7 M-02 (2026-08-25): precompute uint32 fixed-point alpha.
+    // alpha_q16 = round-half-up(0xFFFF * clamp01(dt / smoothingDuration)).
+    // 16 fractional bits ≈ 1.5e-5 resolution. q16 instead of float lerp
+    // makes the smoothing step bit-deterministic across platforms and
+    // FMA/non-FMA builds.
+    const float alphaF = clamp01(dtSec / smoothingDuration);
+    const uint32_t alpha_q16 = static_cast<uint32_t>(
+        static_cast<int64_t>(lroundf(alphaF * 65535.0f)) & 0xFFFFu);
     const size_t srcSize = src.size();
     if (dst.size() < srcSize) dst.resize(srcSize);
 
@@ -110,7 +155,7 @@ void MispredictionResolver::applySmoothing(std::vector<uint8_t>& dst,
             lerpField(dst.data() + f.byteOffset,
                       src.data() + f.byteOffset,
                       dst.data() + f.byteOffset,
-                      f.numericKind, alpha);
+                      f.numericKind, alpha_q16);
         } else {
             // Snap-to-lower (a) for ints/bools/strings/nested.
             std::memcpy(dst.data() + f.byteOffset,

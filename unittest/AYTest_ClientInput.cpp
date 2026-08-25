@@ -414,4 +414,58 @@ TEST_CASE(PredictionManager_EndToEnd)
     CHECK(pm.isPredictedGhost(17));
 }
 
+// R6 C7 B-12 (2026-08-25): numericEqualsEpsilon now compares |bit-pattern diff|
+// in ULPs (≤64) instead of the float relative-epsilon formula. Verify the
+// sub-64-ULP case still considers values equal, and the >64-ULP case snaps.
+TEST_CASE(Misprediction_UlpThreshold_Boundary) {
+    ayt::test::setCurrentCase("Misprediction_UlpThreshold_Boundary");
+
+    ResolverLayout layout;
+    ResolverField f;
+    f.name = "v";
+    f.byteOffset = 0;
+    f.byteSize = 4;
+    f.numericKind = 1; // float32
+    f.netReplicate = true;
+    layout.fields.push_back(f);
+
+    // 32 ULPs apart — must be considered equal (under threshold).
+    {
+        std::vector<uint8_t> predicted(4, 0);
+        std::vector<uint8_t> server(4, 0);
+        float a = 1.0f;
+        uint32_t ua = 0, ub = 0;
+        std::memcpy(&ua, &a, 4);
+        ub = ua + 32u;        // 32 ULPs above
+        std::memcpy(&a, &ua, 4);
+        float b = 0.f;
+        std::memcpy(&b, &ub, 4);
+        std::memcpy(predicted.data(), &a, 4);
+        std::memcpy(server.data(),    &b, 4);
+
+        auto r = MispredictionResolver::reconcile(predicted, server, layout,
+            5, 5, 0.f, 0.1f);
+        CHECK(!r.snapped);
+        CHECK_INT_EQ(static_cast<uint32_t>(r.fieldsSnapped), static_cast<uint32_t>(0));
+    }
+    // 256 ULPs apart — must snap.
+    {
+        std::vector<uint8_t> predicted(4, 0);
+        std::vector<uint8_t> server(4, 0);
+        float a = 1.0f;
+        uint32_t ua = 0, ub = 0;
+        std::memcpy(&ua, &a, 4);
+        ub = ua + 256u;
+        std::memcpy(&a, &ua, 4);
+        float b = 0.f;
+        std::memcpy(&b, &ub, 4);
+        std::memcpy(predicted.data(), &a, 4);
+        std::memcpy(server.data(),    &b, 4);
+
+        auto r = MispredictionResolver::reconcile(predicted, server, layout,
+            5, 5, 0.f, 0.1f);
+        CHECK(r.snapped);
+    }
+}
+
 TEST_SUITE_END
