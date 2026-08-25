@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <utility>
+#include <vector>
 
 namespace ayt::net
 {
@@ -207,13 +209,38 @@ bool ProfilerRegistry::snapshotFor(uint32_t connNetId, ProfilerSnapshot& out) co
     for (uint8_t i = 0; i < kProfilerMsgTypeSlotCount; ++i) {
         out.byMsgType[i] = c.bySlot[i];
     }
-    out.byMsgTypeExtras = c.byExtras;
+    // R6 C8 M-15 (2026-08-25): byMsgTypeExtras is an unordered_map;
+    // copy keys into a sorted local vector first so the snapshot's
+    // insertion order is stable across runs / compilers (the
+    // unordered_map's bucket order is implementation-defined, but the
+    // snapshot is read by key so the test surface (`count()`,
+    // `operator[]`) is unchanged).
+    std::vector<std::pair<uint16_t, MsgTypeBytes>> sortedExtras;
+    sortedExtras.reserve(c.byExtras.size());
+    for (const auto& [k, v] : c.byExtras) {
+        sortedExtras.emplace_back(k, v);
+    }
+    std::sort(sortedExtras.begin(), sortedExtras.end(),
+              [](const std::pair<uint16_t, MsgTypeBytes>& a,
+                 const std::pair<uint16_t, MsgTypeBytes>& b) {
+                  return a.first < b.first;
+              });
+    out.byMsgTypeExtras.clear();
+    out.byMsgTypeExtras.reserve(sortedExtras.size());
+    for (const auto& [k, v] : sortedExtras) {
+        out.byMsgTypeExtras.emplace(k, v);
+    }
+    // R6 C8 M-16 (2026-08-25): perNetId sorted by netId primary,
+    // cumulativeSendBytes secondary (was: by cumulativeSendBytes only,
+    // which made snapshot ordering depend on per-window byte totals
+    // that vary with any fault-profile perturbation).
     out.perNetId.reserve(c.perNetId.size());
     for (const auto& [gnid, e] : c.perNetId) {
         out.perNetId.push_back(e);
     }
     std::sort(out.perNetId.begin(), out.perNetId.end(),
               [](const NetIdWireCost& a, const NetIdWireCost& b) {
+                  if (a.netId != b.netId) return a.netId < b.netId;
                   return a.cumulativeSendBytes > b.cumulativeSendBytes;
               });
     fillLiveStatus(connNetId, out.live);
@@ -223,9 +250,18 @@ bool ProfilerRegistry::snapshotFor(uint32_t connNetId, ProfilerSnapshot& out) co
 void ProfilerRegistry::snapshotAll(std::vector<ProfilerSnapshot>& out) const
 {
     out.clear();
-    out.reserve(_conns.size());
+    // R6 C8 H-12 (2026-08-25): _conns is std::unordered_map; iterate in
+    // sorted netId order so snapshotAll is stable across runs / compilers
+    // (hash order is implementation-defined).
+    std::vector<uint32_t> keys;
+    keys.reserve(_conns.size());
     for (const auto& [netId, _] : _conns) {
         (void)_;
+        keys.push_back(netId);
+    }
+    std::sort(keys.begin(), keys.end());
+    out.reserve(keys.size());
+    for (uint32_t netId : keys) {
         ProfilerSnapshot s;
         if (snapshotFor(netId, s)) {
             out.push_back(std::move(s));
@@ -239,11 +275,21 @@ void ProfilerRegistry::dumpPeriodicIfDue()
     if (_ticksSinceLastDump < _dumpEveryTicks) return;
     _ticksSinceLastDump = 0;
 
-    for (const auto& [netId, c] : _conns) {
-        (void)c;
-        if (c.windowTotalSend == 0 && c.windowTotalRecv == 0) continue;
-        ProfilerSnapshot s;
-        if (!snapshotFor(netId, s)) continue;
+    // R6 C8 H-12 (2026-08-25): iterate _conns in sorted netId order so
+    // dump output is stable across runs / compilers (hash order is
+    // implementation-defined).
+    {
+        std::vector<uint32_t> keys;
+        keys.reserve(_conns.size());
+        for (const auto& kv : _conns) keys.push_back(kv.first);
+        std::sort(keys.begin(), keys.end());
+        for (uint32_t netId : keys) {
+            auto it = _conns.find(netId);
+            if (it == _conns.end()) continue;
+            const ConnState& c = it->second;
+            if (c.windowTotalSend == 0 && c.windowTotalRecv == 0) continue;
+            ProfilerSnapshot s;
+            if (!snapshotFor(netId, s)) continue;
         const double total = static_cast<double>(s.windowTotalSendBytes);
         auto slotPct = [&](uint8_t i) -> double {
             return total > 0.0
@@ -276,6 +322,7 @@ void ProfilerRegistry::dumpPeriodicIfDue()
                   s.live.qualityLocal, s.live.qualityRemote,
                   s.live.pendingReliable, s.live.pendingUnreliable,
                   s.live.sendQueueBytes, s.live.ackPending, s.live.fragmentQueueBytes);
+        }
     }
 
     // Reset window counters now that we've reported them.

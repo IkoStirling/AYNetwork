@@ -347,6 +347,17 @@ bool GnsConnection::isPumping() {
 GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
     GnsPumpResult result;
     if (!s_gns || s_pollGroup == k_HSteamNetPollGroup_Invalid || insidePump) {
+        // R6 C8 M-10 (2026-08-25): the re-entry guard silently swallowed
+        // nested-pump calls. Document the behaviour with a single-shot
+        // stderr line in debug builds so misuse is visible.
+#ifndef NDEBUG
+        static thread_local bool warned = false;
+        if (insidePump && !warned) {
+            ::fprintf(stderr, "[GnsConnection] nested pump() detected — ignored "
+                              "(callers must not re-enter pump()).\n");
+            warned = true;
+        }
+#endif
         return result;
     }
 
@@ -368,7 +379,13 @@ GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
             if (owner) owners.push_back(owner);
         }
     }
-    std::sort(owners.begin(), owners.end());
+    // R6 C8 H-02 (2026-08-25): sort owners by netId, not pointer. Pointer
+    // ordering is allocator-dependent (ASLR, address-space layout) and
+    // varied across runs. NetId is stable across processes and recordings.
+    std::sort(owners.begin(), owners.end(),
+              [](const GnsConnection* a, const GnsConnection* b) {
+                  return a->getNetId() < b->getNetId();
+              });
     owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
     for (GnsConnection* owner : owners) owner->runMaintenance(maintenanceNowMs);
 
@@ -567,7 +584,7 @@ int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
         static_cast<const uint8_t*>(data), len,
         static_cast<uint32_t>(kFrameMtu),
         kMsgTypeApp, kSchemaVersion,
-        channel, tsMs, ++_nextFragmentId);
+        channel, tsMs, _nextFragmentId.fetch_add(1, std::memory_order_relaxed));
     if (frames.empty()) {
         ::fprintf(stderr, "[GnsConnection] send: fragment() returned empty (MTU too small?)\n");
         return -1;
@@ -613,7 +630,7 @@ int GnsConnection::sendEncoded(uint8_t channel, const void* data, size_t len) {
     auto frames = PacketAssembler::fragment(
         decoded.body.data(), decoded.body.size(), static_cast<uint32_t>(kFrameMtu),
         decoded.header.msgType, decoded.header.schemaVersion, channel,
-        decoded.header.timestampMs, ++_nextFragmentId);
+        decoded.header.timestampMs, _nextFragmentId.fetch_add(1, std::memory_order_relaxed));
     if (frames.empty()) return -1;
 
     int lastResult = 0;

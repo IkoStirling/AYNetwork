@@ -29,6 +29,7 @@
 #include <AYNetwork/INetwork.h>                // R1 done: DisconnectReason / HandshakeMsgType / kProtocolVersion
 #include <AYNetwork/Protocol/PacketAssembler.h>           // R2: receive-side reassembly
 #include <AYNetwork/Protocol/AckPipeline.h>      // R4.1-B: CHANNEL_ACK pipeline
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -331,7 +332,13 @@ private:
     // R2: per-connection reassembly state. Fragments are routed through
     // _assembler.consume() and the optional result is dispatched.
     PacketAssembler _assembler;
-    uint32_t _nextFragmentId = 0;
+    // R6 C8 M-14 (2026-08-25): was uint32_t; pump() iterates owners and
+    // send-path may run from multiple places. Atomic with relaxed memory
+    // order is sufficient — pump()'s mutex provides the cross-thread
+    // ordering for the high-level send path; fragment id only needs to
+    // be unique within a connection's outgoing stream, not globally
+    // ordered.
+    std::atomic<uint32_t> _nextFragmentId{0};
     AckTracker _ackTracker;
 
     // R2: convenience for fragments that exceed MTU. ~1200 bytes fits
