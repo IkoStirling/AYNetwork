@@ -1642,6 +1642,113 @@ R6 commits `C1` through `C9` fix all 12 Blocker + 14 High findings from `determi
 
 ---
 
+## 15.14 R6.5 Replay v2 Player (2026-08-25 ship)
+
+R6 deferred two replays: foundation-level `FileReplayPlayer` was a stub
+that returned `NotImplemented` from every read/seek API, and the v1
+`B-10` connectionId-remap finding was filed as forward-looking because
+there was no real player to consume a remap. R6.5 fills both gaps so
+recorded sessions can actually be played back and the determinism oracle
+can validate state-equal hashes across a replay.
+
+### 15.14.1 Player core (R6.5-1)
+
+`FileReplayPlayer` now ships a real implementation:
+
+- **`open()`** slurps the whole file into a `vector<uint8_t>` at
+  `open()` if the file fits in `kReplayPlayerFileCap` (256 MiB; the
+  rotation default is 64 MiB so this gives generous headroom). Files
+  beyond the cap reject with `IoError`. Magic and version validation
+  match the recorder.
+- **Checkpoint index** built once at `open()` in a single forward pass.
+  Each entry is `{ReplayTick tick; int64_t fileOffset;}` — ~24 bytes
+  per checkpoint. Memory is negligible for typical workloads.
+- **`readNextEvent(hdr, payload, isCheckpointOut=nullptr)`** peeks the
+  first 16 bytes to disambiguate event vs checkpoint (same heuristic as
+  the test scanner — event iff `low32 ∈ [0x0001,0x0020] ∪
+  [0x10000,0x1FFFF]`), reads the full header, returns the payload
+  bytes, decompresses LZ4 if `flags & kEvtFlagPayloadCompressed` (cap
+  16 MiB on decompressed output; `OutOfMemory` if exceeded).
+  Synthesizes a `SessionEnd` sentinel at EOF so callers can drive a
+  replay-to-completion loop without a separate `atEof()` predicate.
+  When `isCheckpointOut` is non-null, flips it for the checkpoint
+  branch; the `tick` field is propagated from the underlying
+  checkpoint header so callers can correlate checkpoints with adjacent
+  events.
+- **`seekToTick(tick)`** finds the latest checkpoint at-or-before the
+  target, sets the cursor to that offset, then linear-reads events
+  forward until `hdr.tick >= target` (or EOF).
+- **`seekToCheckpoint(tick)`** binary-searches the checkpoint index
+  (O(log N)) and jumps to the offset of the first entry with
+  `tick >= target`.
+
+The player is foundation-only: no AYNetwork dependency, no decoder.
+Adapter-level event decoding lives in §15.14.2.
+
+### 15.14.2 AYNetwork decoder + connectionId remap (R6.5-2)
+
+`NetworkReplayEventDecoder::decodeNext(player, out, remap,
+unmappedIds)` reads the next event from a foundation player and unpacks
+the adapter-prefix bytes for the 7 `kEvtNet_*` event types
+(`InitialFullSnapshot` / `Spawn` / `Despawn` / `DeltaSnapshot` /
+`InputBatch` / `RpcBatch` / `AuthorityChange`). Each event's
+`connectionId` is consulted against `ConnectionIdRemap` (a
+`std::map<uint32_t, uint32_t>` keyed by recorded id) and substituted
+with the live id. Missing keys fall back to the literal id and append
+to `unmappedIds` for diagnostics.
+
+Why per-event remap and not a global swap: the recorded `connectionId`
+is captured at the network wire-tap and reflects the record-time
+accept order. The R6 C5 stable allocation scheme (B-09) makes the
+recorded id equal to the accept-order ordinal, so the remap is identity
+when accept order matches between record and playback — and that is
+the dominant production case. R7+ may add automatic accept-order
+translation for cross-server replay.
+
+### 15.14.3 Player pump bridge (R6.5-3)
+
+Two new virtual seams on `INetworkSubSystem` (default no-op so
+non-AYNetwork test stubs stay non-abstract):
+
+- **`tickRecordedEvent(uint32_t eventType, const uint8_t* payload,
+  size_t size)`** — the live pump. `AYNetworkSubSystem` overrides with
+  a 7-arm switch that strips the adapter-prefix bytes (sizes match
+  `NetworkReplayRecorderAdapter` exactly) and routes to the matching
+  live seam:
+
+  | Recorded event | Action |
+  |---|---|
+  | `kEvtNet_InitialFullSnapshot` | strip 5-byte prefix; `_replicationManager.onReceive(kMsgTypeReplication, …)` |
+  | `kEvtNet_DeltaSnapshot` | strip 5-byte prefix; `_replicationManager.onReceive(kMsgTypeDelta, …)` |
+  | `kEvtNet_Spawn` | strip 16-byte prefix; `_replicationManager.onReceive(kMsgTypeEntitySpawn, …)` |
+  | `kEvtNet_Despawn` | strip 8-byte prefix; `_replicationManager.onReceive(kMsgTypeEntityDespawn, …)` |
+  | `kEvtNet_InputBatch` | strip 16-byte prefix; `_replicationManager.onClientInput(connId, body, len)` |
+  | `kEvtNet_RpcBatch` | strip 10-byte prefix; demux on `messageType` to `_rpcHandler.onRpcRequest / onRpcResponse / onRpcReject` |
+  | `kEvtNet_AuthorityChange` | strip 14-byte prefix; `_replicationManager.setObjectProxyKind(netId, newKind)` |
+
+  The `from` parameter to `onReceive` is `nullptr` — replay events
+  originate from the recording, not a live GnsConnection.
+
+- **`installReplayRngSeed(uint64_t)`** + read-back `hasReplayRngSeed()`
+  / `getReplayRngSeed()`. The v2 player exposes
+  `ReplayFileHeader.randomSeed` so a deterministic playback can latch
+  the seed for downstream RNG consumers. Today this is a stub field
+  on `AYNetworkSubSystem`; R7+ will route through
+  `TransportFaultController::setSessionSeed`.
+
+### 15.14.4 R6.5 ship definition
+
+1. ✅ `FileReplayPlayer` reads every record type from disk (event, checkpoint, compressed, uncompressed).
+2. ✅ `seekToTick` and `seekToCheckpoint` work; the latter is O(log N) via the checkpoint index.
+3. ✅ `NetworkReplayEventDecoder` unpacks all 7 `kEvtNet_*` payload layouts and applies the connectionId remap.
+4. ✅ `NetworkSubSystem::tickRecordedEvent` demuxes decoded events into the live subsystem seams.
+5. ✅ `B-10` flipped from "Deferred R6.5" to "FIXED" in `determinism-risk-register-2026-08-25.md`.
+6. ✅ Tests: `AYReplay_Test` = 12/12 (unchanged); `AYNetwork_Test::ReplayNetwork` = 12/12 (5 recorder + 4 decoder + 3 bridge); `AYNetwork_Test::StateEqual` = 36/36 (no regression).
+
+**Total commits: 3 (R6.5-1 player core, R6.5-2 decoder, R6.5-3 bridge) on submodule `dd2fdec` (R6.5-3 HEAD). R6.5 docs flip: `be34c9e`.**
+
+---
+
 ## 16. Changelog
 
 | 日期 | 变更 |
