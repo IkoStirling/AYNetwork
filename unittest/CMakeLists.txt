@@ -59,6 +59,22 @@ target_include_directories(${MODULE_NAME} PRIVATE
 
 ay_add_test(${MODULE_NAME})
 
+# Standalone process: GNS has one identity per process, and ResetIdentity is
+# intentionally rejected while any legacy IP test connection remains active.
+# Isolating P2P also mirrors production where each peer is a separate process.
+set(P2P_TEST_NAME AYNetwork_P2P_Test)
+add_executable(${P2P_TEST_NAME}
+    main.cpp
+    AYTest_P2P.cpp
+)
+target_compile_definitions(${P2P_TEST_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
+target_link_libraries(${P2P_TEST_NAME} PRIVATE AYNetwork AYTest AYCore)
+target_include_directories(${P2P_TEST_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+ay_add_test(${P2P_TEST_NAME})
+
 # AYEntity integration is optional at the AYNetwork library boundary. Keep its
 # test in a separate executable so transport/protocol/replication tests do not
 # pull the renderer-heavy AYEntity dependency graph into every network build.

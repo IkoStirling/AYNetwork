@@ -41,6 +41,8 @@ public:
 
     // Validity
     bool isValid() const { return _sockfd >= 0; }
+    uint16_t getBoundPort() const;
+    static bool resolveIPv4(const char* address, std::string& resolved);
 
     // Get native handle
     int getHandle() const { return _sockfd; }

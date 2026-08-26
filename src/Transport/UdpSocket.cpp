@@ -12,6 +12,7 @@
     #include <sys/socket.h>
     #include <netinet/in.h>
     #include <arpa/inet.h>
+    #include <netdb.h>
     #include <unistd.h>
     #include <fcntl.h>
     #include <errno.h>
@@ -109,7 +110,9 @@ bool UdpSocket::connect(const char* address, uint16_t port) {
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, address, &addr.sin_addr) != 1) return false;
+    std::string resolved;
+    if (!resolveIPv4(address, resolved) ||
+        inet_pton(AF_INET, resolved.c_str(), &addr.sin_addr) != 1) return false;
 
     if (::connect(_sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         return false;
@@ -123,10 +126,43 @@ int UdpSocket::sendTo(const char* address, uint16_t port, const void* data, size
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, address, &addr.sin_addr) != 1) return -1;
+    std::string resolved;
+    if (!resolveIPv4(address, resolved) ||
+        inet_pton(AF_INET, resolved.c_str(), &addr.sin_addr) != 1) return -1;
 
     return sendto(_sockfd, (const char*)data, (int)len, 0,
                   (struct sockaddr*)&addr, sizeof(addr));
+}
+
+uint16_t UdpSocket::getBoundPort() const {
+    if (_sockfd < 0) return 0;
+    struct sockaddr_in addr{};
+    socklen_t addrLen = sizeof(addr);
+    if (getsockname(_sockfd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) != 0) {
+        return 0;
+    }
+    return ntohs(addr.sin_port);
+}
+
+bool UdpSocket::resolveIPv4(const char* address, std::string& resolved) {
+    resolved.clear();
+    if (!address || !*address) return false;
+    struct in_addr numeric{};
+    if (inet_pton(AF_INET, address, &numeric) == 1) {
+        resolved = address;
+        return true;
+    }
+    struct addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    struct addrinfo* result = nullptr;
+    if (getaddrinfo(address, nullptr, &hints, &result) != 0 || !result) return false;
+    const auto* ipv4 = reinterpret_cast<const struct sockaddr_in*>(result->ai_addr);
+    char buffer[64]{};
+    const bool ok = inet_ntop(AF_INET, &ipv4->sin_addr, buffer, sizeof(buffer)) != nullptr;
+    freeaddrinfo(result);
+    if (ok) resolved = buffer;
+    return ok;
 }
 
 int UdpSocket::receiveFrom(char* address, uint16_t* port, void* buf, size_t len) {

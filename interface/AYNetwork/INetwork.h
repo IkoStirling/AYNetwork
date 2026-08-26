@@ -5,6 +5,7 @@
 #include <AYGameLoop.h>   // P0 audit fix (2026-07-26): ISubSystem lives in AYGameLoop's IAYGameLoop.h, not in a separate ISubSystem.h
 #include <functional>
 #include <bit>
+#include <memory>
 #include <vector>
 #include <cstdint>
 #include <map>
@@ -23,6 +24,7 @@
 // 0x02, 0x04, 0x08, 0x0F) — they intentionally do NOT depend on the
 // CHANNEL_* constants below — so this include is safe to put BEFORE them.
 #include <AYNetwork/TransportFaultProfile.h>
+#include <AYNetwork/P2P.h>
 
 // R5.5 (2026-08-25): ProfilerSnapshot is a header-only POD struct also
 // declared inside ayt::net — no transitive AYNetwork deps. We include it
@@ -266,6 +268,25 @@ public:
     virtual bool isConnected() const = 0;
     virtual bool isListening() const { return false; }
     virtual ConnectionMode getMode() const = 0;
+
+    // ===== P2P / NAT traversal =====
+    // Configure once after initialize() and before any process-wide GNS
+    // connection/listener becomes active (GNS identity changes close active
+    // links). The signaling backend is replaceable and contains no GNS types.
+    // Existing IP connect()/listen() remain fully supported.
+    virtual bool configureP2P(const P2PConfig& config,
+                              std::shared_ptr<ISignalingTransport> signaling) {
+        (void)config; (void)signaling; return false;
+    }
+    virtual bool listenP2P() { return false; }
+    virtual bool connectP2P(const PeerId& remotePeer) {
+        (void)remotePeer; return false;
+    }
+    virtual bool isP2PConfigured() const { return false; }
+    virtual PeerId getLocalPeerId() const { return {}; }
+    virtual P2PConnectionInfo getP2PConnectionInfo(NetConnection* connection = nullptr) const {
+        (void)connection; return {};
+    }
 
     // Must be configured before connect()/listen().  The production default
     // is kProtocolVersion; version 0 is an explicit legacy/test opt-out.

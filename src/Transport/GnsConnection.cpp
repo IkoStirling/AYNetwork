@@ -26,6 +26,7 @@
 #include <steam/isteamnetworkingutils.h> // SetGlobalCallback_SteamNetConnectionStatusChanged
 #include <steam/isteamnetworkingsockets.h>
 #include <steam/steamnetworkingsockets.h> // GameNetworkingSockets_Init / _Kill
+#include <steam/steamnetworkingcustomsignaling.h>
 
 #include <atomic>
 #include <algorithm>
@@ -33,6 +34,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ayt::net
@@ -65,6 +67,16 @@ listenerFactories() {
 static std::unordered_map<HSteamListenSocket, GnsConnection*>& listenerOwners() {
     static std::unordered_map<HSteamListenSocket, GnsConnection*> owners;
     return owners;
+}
+
+struct P2PListenerRoute {
+    std::shared_ptr<ISignalingTransport> signaling;
+    GnsConnection::P2PAdoptFactory factory;
+};
+
+static std::unordered_map<uint16_t, P2PListenerRoute>& p2pListenerRoutes() {
+    static std::unordered_map<uint16_t, P2PListenerRoute> routes;
+    return routes;
 }
 
 static std::recursive_mutex registryMutex;
@@ -220,6 +232,7 @@ namespace gns
             connMap().clear();
             listenerFactories().clear();
             listenerOwners().clear();
+            p2pListenerRoutes().clear();
         }
         GameNetworkingSockets_Kill();
     }
@@ -252,6 +265,161 @@ void GnsConnection::clearAdoptFactory(HSteamListenSocket listener) {
     if (listener == k_HSteamListenSocket_Invalid) return;
     std::lock_guard<std::recursive_mutex> lk(registryMutex);
     listenerFactories().erase(listener);
+}
+
+namespace
+{
+
+class GnsCustomConnectionSignaling final : public ISteamNetworkingConnectionSignaling {
+public:
+    GnsCustomConnectionSignaling(std::shared_ptr<ISignalingTransport> signaling,
+                                 PeerId remotePeer)
+        : _signaling(std::move(signaling)), _remotePeer(std::move(remotePeer)) {}
+
+    bool SendSignal(HSteamNetConnection,
+                    const SteamNetConnectionInfo_t&,
+                    const void* message, int messageBytes) override {
+        return _signaling && _signaling->isRunning() && messageBytes > 0 &&
+               _signaling->sendSignal(_remotePeer, message,
+                                      static_cast<size_t>(messageBytes));
+    }
+
+    void Release() override { delete this; }
+
+private:
+    std::shared_ptr<ISignalingTransport> _signaling;
+    PeerId _remotePeer;
+};
+
+class GnsCustomSignalReceiveContext final : public ISteamNetworkingSignalingRecvContext {
+public:
+    GnsCustomSignalReceiveContext(PeerId sender,
+                                  std::shared_ptr<ISignalingTransport> signaling)
+        : _sender(std::move(sender)), _signaling(std::move(signaling)) {}
+
+    ISteamNetworkingConnectionSignaling* OnConnectRequest(
+        HSteamNetConnection connection,
+        const SteamNetworkingIdentity& identityPeer,
+        int localVirtualPort) override {
+        if (localVirtualPort < 0 || localVirtualPort > UINT16_MAX) return nullptr;
+        P2PListenerRoute route;
+        {
+            std::lock_guard<std::recursive_mutex> lock(registryMutex);
+            const auto it = p2pListenerRoutes().find(static_cast<uint16_t>(localVirtualPort));
+            if (it == p2pListenerRoutes().end()) return nullptr;
+            route = it->second;
+        }
+        const char* identity = identityPeer.GetGenericString();
+        if (!identity) return nullptr;
+        PeerId remote{identity};
+        // The validated signaling envelope is the routing authority. An
+        // authenticated application backend can additionally bind it to an
+        // account. Missing or mismatching identity inside the GNS signal is
+        // always suspicious and is rejected here.
+        if (!remote.isValid() || remote != _sender) return nullptr;
+        if (!route.factory || !route.factory(connection, remote)) return nullptr;
+        return new GnsCustomConnectionSignaling(
+            route.signaling ? route.signaling : _signaling, std::move(remote));
+    }
+
+    void SendRejectionSignal(const SteamNetworkingIdentity&,
+                             const void* message, int messageBytes) override {
+        if (_signaling && messageBytes > 0) {
+            (void)_signaling->sendSignal(_sender, message,
+                                         static_cast<size_t>(messageBytes));
+        }
+    }
+
+private:
+    PeerId _sender;
+    std::shared_ptr<ISignalingTransport> _signaling;
+};
+
+std::string joinCommaSeparated(const std::vector<std::string>& values) {
+    std::string result;
+    for (const auto& value : values) {
+        if (value.empty()) continue;
+        if (!result.empty()) result.push_back(',');
+        result += value;
+    }
+    return result;
+}
+
+int iceCandidateMask(const P2PConfig& config) {
+    int mask = 0;
+    if (config.icePolicy != P2PIcePolicy::RelayOnly) {
+        if (config.allowPrivateCandidates) {
+            mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Private;
+        }
+        if (!config.stunServers.empty()) {
+            mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Public;
+        }
+    }
+    if (config.icePolicy != P2PIcePolicy::DirectOnly && !config.turnServers.empty()) {
+        mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Relay;
+    }
+    return mask;
+}
+
+} // namespace
+
+bool GnsConnection::setLocalP2PIdentity(const PeerId& localPeer) {
+    if (!s_gns || !localPeer.isValid()) return false;
+    SteamNetworkingIdentity current;
+    if (s_gns->GetIdentity(&current)) {
+        if (const char* currentText = current.GetGenericString()) {
+            if (localPeer.value == currentText) return true;
+        }
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(registryMutex);
+        if (!connMap().empty() || !listenerOwners().empty() ||
+            !p2pListenerRoutes().empty()) return false;
+    }
+    SteamNetworkingIdentity identity;
+    identity.Clear();
+    if (!identity.SetGenericString(localPeer.value.c_str())) return false;
+
+    // ResetIdentity invalidates interface-owned routing state in standalone
+    // GNS, including the poll group created by gns::init(). Destroy it before
+    // the reset and recreate it afterwards; otherwise the first P2P
+    // SetConnectionPollGroup fails and every receive pump returns -1.
+    if (s_pollGroup != k_HSteamNetPollGroup_Invalid) {
+        s_gns->DestroyPollGroup(s_pollGroup);
+        s_pollGroup = k_HSteamNetPollGroup_Invalid;
+    }
+    s_gns->ResetIdentity(&identity);
+    s_pollGroup = s_gns->CreatePollGroup();
+    if (s_pollGroup == k_HSteamNetPollGroup_Invalid) return false;
+    return true;
+}
+
+void GnsConnection::setP2PAdoptFactory(
+    uint16_t virtualPort,
+    std::shared_ptr<ISignalingTransport> signaling,
+    P2PAdoptFactory factory) {
+    std::lock_guard<std::recursive_mutex> lock(registryMutex);
+    if (signaling && factory) {
+        p2pListenerRoutes()[virtualPort] = {std::move(signaling), std::move(factory)};
+    } else {
+        p2pListenerRoutes().erase(virtualPort);
+    }
+}
+
+void GnsConnection::clearP2PAdoptFactory(uint16_t virtualPort) {
+    std::lock_guard<std::recursive_mutex> lock(registryMutex);
+    p2pListenerRoutes().erase(virtualPort);
+}
+
+bool GnsConnection::receiveP2PSignal(
+    const PeerId& sender,
+    const void* data, size_t size,
+    std::shared_ptr<ISignalingTransport> signaling) {
+    if (!s_gns || !sender.isValid() || !data || size == 0 || size > INT32_MAX || !signaling) {
+        return false;
+    }
+    GnsCustomSignalReceiveContext context(sender, std::move(signaling));
+    return s_gns->ReceivedP2PCustomSignal(data, static_cast<int>(size), &context);
 }
 
 void GnsConnection::initClient(const char* address, uint16_t virtualPort) {
@@ -302,6 +470,72 @@ void GnsConnection::initClient(const char* address, uint16_t virtualPort) {
     }
 
     setState(GnsConnectionState::Connecting);
+}
+
+bool GnsConnection::initP2PClient(
+    const PeerId& remotePeer,
+    const P2PConfig& config,
+    std::shared_ptr<ISignalingTransport> signaling) {
+    if (!s_gns || _state != GnsConnectionState::Disconnected ||
+        !remotePeer.isValid() || !config.isValid() ||
+        !signaling || !signaling->isRunning()) {
+        return false;
+    }
+    const int iceMask = iceCandidateMask(config);
+    if (iceMask == 0) return false;
+
+    SteamNetworkingIdentity remoteIdentity;
+    remoteIdentity.Clear();
+    if (!remoteIdentity.SetGenericString(remotePeer.value.c_str())) return false;
+
+    const std::string stun = joinCommaSeparated(config.stunServers);
+    const std::string turn = joinCommaSeparated(config.turnServers);
+    const std::string turnUsers = joinCommaSeparated(config.turnUsers);
+    const std::string turnPasswords = joinCommaSeparated(config.turnPasswords);
+    std::vector<SteamNetworkingConfigValue_t> options;
+    options.reserve(5);
+    SteamNetworkingConfigValue_t option;
+    option.SetInt32(k_ESteamNetworkingConfig_P2P_Transport_ICE_Enable, iceMask);
+    options.push_back(option);
+    if (!stun.empty()) {
+        option.SetString(k_ESteamNetworkingConfig_P2P_STUN_ServerList, stun.c_str());
+        options.push_back(option);
+    }
+    if (!turn.empty()) {
+        option.SetString(k_ESteamNetworkingConfig_P2P_TURN_ServerList, turn.c_str());
+        options.push_back(option);
+    }
+    if (!turnUsers.empty()) {
+        option.SetString(k_ESteamNetworkingConfig_P2P_TURN_UserList, turnUsers.c_str());
+        options.push_back(option);
+        option.SetString(k_ESteamNetworkingConfig_P2P_TURN_PassList, turnPasswords.c_str());
+        options.push_back(option);
+    }
+
+    auto* customSignaling =
+        new GnsCustomConnectionSignaling(std::move(signaling), remotePeer);
+    _conn = s_gns->ConnectP2PCustomSignaling(
+        customSignaling, &remoteIdentity, config.virtualPort,
+        static_cast<int>(options.size()), options.data());
+    // GNS assumes ownership and calls Release(), including the failure path.
+    if (_conn == k_HSteamNetConnection_Invalid) return false;
+    if (!s_gns->SetConnectionPollGroup(_conn, s_pollGroup)) {
+        s_gns->CloseConnection(_conn, 0, "poll group setup failed", false);
+        _conn = k_HSteamNetConnection_Invalid;
+        return false;
+    }
+
+    _address = "p2p:" + remotePeer.value;
+    _port = config.virtualPort;
+    _remotePeerId = remotePeer;
+    _isP2P = true;
+    _role = GnsConnectionRole::Client;
+    {
+        std::lock_guard<std::recursive_mutex> lock(registryMutex);
+        connMap()[_conn] = this;
+    }
+    setState(GnsConnectionState::Connecting);
+    return true;
 }
 
 void GnsConnection::initServer(uint16_t virtualPort) {
@@ -836,6 +1070,40 @@ void GnsConnection::adoptIncomingConnection(HSteamNetConnection conn) {
         connMap()[_conn] = this;
     }
     setState(GnsConnectionState::Connected);
+}
+
+void GnsConnection::adoptIncomingP2PConnection(HSteamNetConnection conn,
+                                               const PeerId& remotePeer,
+                                               uint16_t virtualPort) {
+    _remotePeerId = remotePeer;
+    _isP2P = true;
+    _address = "p2p:" + remotePeer.value;
+    _port = virtualPort;
+    adoptIncomingConnection(conn);
+    // P2P route identity is more useful than an empty pre-ICE IP address.
+    _address = "p2p:" + remotePeer.value;
+    _port = virtualPort;
+}
+
+P2PConnectionInfo GnsConnection::getP2PConnectionInfo(const PeerId& localPeer) const {
+    P2PConnectionInfo result;
+    result.localPeerId = localPeer;
+    result.remotePeerId = _remotePeerId;
+    result.pingMs = getPing();
+    if (!_isP2P || !s_gns || _conn == k_HSteamNetConnection_Invalid) return result;
+    if (_state != GnsConnectionState::Connected &&
+        _state != GnsConnectionState::Handshaking &&
+        _state != GnsConnectionState::Ready) return result;
+    SteamNetConnectionInfo_t info{};
+    if (!s_gns->GetConnectionInfo(_conn, &info)) return result;
+    result.path = (info.m_nFlags & k_nSteamNetworkConnectionInfoFlags_Relayed)
+        ? P2PPathKind::Relayed : P2PPathKind::Direct;
+    if (!info.m_addrRemote.IsIPv6AllZeros()) {
+        char address[SteamNetworkingIPAddr::k_cchMaxString]{};
+        info.m_addrRemote.ToString(address, sizeof(address), true);
+        result.remoteAddress = address;
+    }
+    return result;
 }
 
 void GnsConnection::setState(GnsConnectionState newState) {

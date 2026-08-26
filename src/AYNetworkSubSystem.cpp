@@ -46,6 +46,8 @@ class NetworkSubSystem : public INetworkSubSystem {
         None,
         Connect,
         Listen,
+        ConnectP2P,
+        ListenP2P,
         Disconnect,
         Shutdown,
     };
@@ -172,6 +174,10 @@ public:
 
     void shutdownNow() {
         disconnectNow();
+        if (_p2pSignaling) _p2pSignaling->stop();
+        _p2pSignaling.reset();
+        _p2pConfigured = false;
+        _p2pConfig = {};
         // R6 C6: single-thread; no lock.
         _simulationInbound.clear();
         _simulationInboundBytes = 0;
@@ -186,8 +192,10 @@ public:
     // Called from GnsConnection's global status callback when an incoming
     // connection arrives on _serverConn's listen socket. AcceptConnection +
     // SetConnectionPollGroup + adopt, then route through onMessage wiring.
-    GnsConnection* adoptIncomingClient(HSteamNetConnection incoming) {
-        if (!_serverConn) {
+    GnsConnection* adoptIncomingClient(HSteamNetConnection incoming,
+                                       const PeerId* remotePeer = nullptr,
+                                       uint16_t p2pVirtualPort = 0) {
+        if (!_serverConn && !_p2pListening) {
             ::fprintf(stderr, "[Network] incoming conn %u but server not listening\n", incoming);
             return nullptr;
         }
@@ -206,7 +214,11 @@ public:
         // Create the server-child GnsConnection, install it in our list.
         auto child = std::make_unique<GnsConnection>();
         child->setProtocolVersion(_protocolVersion);
-        child->adoptIncomingConnection(incoming);
+        if (remotePeer) {
+            child->adoptIncomingP2PConnection(incoming, *remotePeer, p2pVirtualPort);
+        } else {
+            child->adoptIncomingConnection(incoming);
+        }
 
         // R1.A: route onData to the registered message handler (if any).
         GnsConnection* rawChild = child.get();
@@ -509,6 +521,14 @@ public:
     }
 
     void pumpTransport() {
+        if (_p2pSignaling && _p2pSignaling->isRunning()) {
+            (void)_p2pSignaling->poll(
+                [this](const PeerId& sender, const void* data, size_t size) {
+                    (void)GnsConnection::receiveP2PSignal(
+                        sender, data, size, _p2pSignaling);
+                },
+                _limits.maxPumpMessages);
+        }
         const GnsPumpBudget budget{
             _limits.maxPumpMessages,
             _limits.maxPumpBytes,
@@ -562,6 +582,12 @@ public:
         case DeferredControlType::Listen:
             listenNow(control.port);
             break;
+        case DeferredControlType::ConnectP2P:
+            (void)connectP2PNow(PeerId{std::move(control.address)});
+            break;
+        case DeferredControlType::ListenP2P:
+            (void)listenP2PNow();
+            break;
         case DeferredControlType::Disconnect:
             disconnectNow();
             break;
@@ -574,6 +600,118 @@ public:
     }
 
     // ===== 连接管理 =====
+    bool configureP2P(const P2PConfig& config,
+                      std::shared_ptr<ISignalingTransport> signaling) override {
+        if (!_initialized || !config.isValid() || !signaling ||
+            _clientConn || _serverConn || !_serverClients.empty() || _p2pListening ||
+            GnsConnection::isPumping()) {
+            return false;
+        }
+        if (!signaling->start(config.localPeerId)) return false;
+        if (!GnsConnection::setLocalP2PIdentity(config.localPeerId)) {
+            signaling->stop();
+            return false;
+        }
+        if (_p2pSignaling && _p2pSignaling != signaling) _p2pSignaling->stop();
+        _p2pConfig = config;
+        _p2pSignaling = std::move(signaling);
+        _p2pConfigured = true;
+        return true;
+    }
+
+    bool listenP2P() override {
+        if (GnsConnection::isPumping()) {
+            _deferredControl = {DeferredControlType::ListenP2P, {}, 0};
+            return _p2pConfigured;
+        }
+        return listenP2PNow();
+    }
+
+    bool listenP2PNow() {
+        if (!_p2pConfigured || !_p2pSignaling || !_p2pSignaling->isRunning()) return false;
+        if (_serverConn) {
+            _serverConn->disconnect("superseded by listenP2P()");
+            _serverConn.reset();
+        }
+        clearServerClients("superseded by listenP2P()");
+        if (_p2pListening) {
+            GnsConnection::clearP2PAdoptFactory(_p2pConfig.virtualPort);
+        }
+        GnsConnection::setP2PAdoptFactory(
+            _p2pConfig.virtualPort, _p2pSignaling,
+            [this](HSteamNetConnection incoming, const PeerId& remotePeer) {
+                return adoptIncomingClient(incoming, &remotePeer, _p2pConfig.virtualPort);
+            });
+        _p2pListening = true;
+        _mode = ConnectionMode::ListenServer;
+        return true;
+    }
+
+    bool connectP2P(const PeerId& remotePeer) override {
+        if (!remotePeer.isValid()) return false;
+        if (GnsConnection::isPumping()) {
+            _deferredControl = {
+                DeferredControlType::ConnectP2P,
+                remotePeer.value,
+                _p2pConfig.virtualPort,
+            };
+            return _p2pConfigured;
+        }
+        return connectP2PNow(remotePeer);
+    }
+
+    bool connectP2PNow(const PeerId& remotePeer) {
+        if (!_p2pConfigured || !_p2pSignaling || !_p2pSignaling->isRunning() ||
+            !remotePeer.isValid() || remotePeer == _p2pConfig.localPeerId) {
+            return false;
+        }
+        if (_clientConn) {
+            _clientConn->disconnect("superseded by connectP2P()");
+            _clientConn.reset();
+            _clientNetConn.reset();
+        }
+        auto transport = std::make_unique<GnsConnection>();
+        transport->setProtocolVersion(_protocolVersion);
+        if (!transport->initP2PClient(remotePeer, _p2pConfig, _p2pSignaling)) return false;
+        const uint32_t clientNetId = allocateNetId();
+        transport->setNetId(clientNetId);
+        transport->attachFaultController(&_faultCtl);
+        hookGnsConnection(transport.get());
+        _clientConn = std::move(transport);
+        _clientNetConn = std::make_unique<NetConnectionImpl>(_clientConn.get(), clientNetId);
+        _mode = _p2pListening ? ConnectionMode::ListenServer : ConnectionMode::Client;
+        installInboundRoutes();
+        if (_connectionHandler) {
+            _clientConn->onStateChange([this](GnsConnectionState, GnsConnectionState newState) {
+                const bool connected = (newState == GnsConnectionState::Ready) ||
+                    (newState == GnsConnectionState::Connected &&
+                     _clientConn->getProtocolVersion() == 0);
+                const DisconnectReason reason = connected
+                    ? DisconnectReason::Unknown : _clientConn->getLastDisconnectReason();
+                _connectionHandler(_clientNetConn.get(), connected, reason);
+            });
+        }
+        return true;
+    }
+
+    bool isP2PConfigured() const override { return _p2pConfigured; }
+    PeerId getLocalPeerId() const override {
+        return _p2pConfigured ? _p2pConfig.localPeerId : PeerId{};
+    }
+
+    P2PConnectionInfo getP2PConnectionInfo(NetConnection* connection) const override {
+        if (!_p2pConfigured) return {};
+        if (!connection && _clientConn) {
+            return _clientConn->getP2PConnectionInfo(_p2pConfig.localPeerId);
+        }
+        for (const auto& record : _serverClients) {
+            if (record.facade.get() == connection && record.transport) {
+                return record.transport->getP2PConnectionInfo(_p2pConfig.localPeerId);
+            }
+        }
+        return {};
+    }
+
     void connect(const char* address, uint16_t port) override {
         if (GnsConnection::isPumping()) {
             _deferredControl = {
@@ -587,6 +725,10 @@ public:
     }
 
     void connectNow(const char* address, uint16_t port) {
+        if (_p2pListening) {
+            GnsConnection::clearP2PAdoptFactory(_p2pConfig.virtualPort);
+            _p2pListening = false;
+        }
         if (_clientConn) {
             _clientConn->disconnect("superseded by connect()");
             _clientConn.reset();
@@ -625,6 +767,10 @@ public:
     }
 
     void listenNow(uint16_t port) {
+        if (_p2pListening) {
+            GnsConnection::clearP2PAdoptFactory(_p2pConfig.virtualPort);
+            _p2pListening = false;
+        }
         if (_serverConn) {
             _serverConn->disconnect("superseded by listen()");
             _serverConn.reset();
@@ -661,6 +807,10 @@ public:
     }
 
     void disconnectNow() {
+        if (_p2pListening) {
+            GnsConnection::clearP2PAdoptFactory(_p2pConfig.virtualPort);
+            _p2pListening = false;
+        }
         if (_clientConn) {
             _clientConn->disconnect("client disconnect");
             _clientConn.reset();
@@ -686,8 +836,8 @@ public:
     }
 
     bool isListening() const override {
-        return _serverConn &&
-            _serverConn->getInnerListenSocket() != k_HSteamListenSocket_Invalid;
+        return _p2pListening || (_serverConn &&
+            _serverConn->getInnerListenSocket() != k_HSteamListenSocket_Invalid);
     }
 
     ConnectionMode getMode() const override {
@@ -1217,6 +1367,10 @@ private:
     std::unique_ptr<NetConnectionImpl> _clientNetConn;
     std::unique_ptr<GnsConnection> _serverConn;
     std::vector<ServerClientRecord> _serverClients;
+    P2PConfig _p2pConfig{};
+    std::shared_ptr<ISignalingTransport> _p2pSignaling;
+    bool _p2pConfigured = false;
+    bool _p2pListening = false;
     uint32_t _nextNetId = 0;
     uint32_t _protocolVersion = kProtocolVersion;
     NetworkLimits _limits{};

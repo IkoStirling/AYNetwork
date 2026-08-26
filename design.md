@@ -1749,6 +1749,36 @@ non-AYNetwork test stubs stay non-abstract):
 
 ---
 
+## 15.15 P2P / ICE transport (2026-08-26)
+
+P2P is an additional connection-establishment path below the existing packet,
+handshake, replication, RPC, prediction, replay, fault-injection, and profiler
+layers. It does not change their wire formats or authority rules.
+
+- Public backend-neutral contract: `interface/AYNetwork/P2P.h` (`PeerId`,
+  `P2PConfig`, `P2PConnectionInfo`, `ISignalingTransport`).
+- GNS adapter: `ConnectP2PCustomSignaling`, `ReceivedP2PCustomSignal`, and a
+  per-virtual-port incoming factory in `GnsConnection`.
+- ICE policy maps explicitly to private, STUN-derived public, and TURN relay
+  candidate bits. STUN/TURN lists and per-server credentials are supplied as
+  connection config values; `P2PPathKind` exposes direct versus relayed state.
+- Built-in self-hosted backend: a bounded UDP rendezvous protocol with PeerId
+  validation, registration, heartbeat, endpoint rebinding, opaque forwarding,
+  peer expiry, message/peer caps, and a standalone server target.
+- Security boundary: the built-in server does not authenticate accounts. A
+  production service replaces `ISignalingTransport` with an authenticated
+  HTTPS/WebSocket/platform implementation and issues short-lived TURN
+  credentials. GNS traffic encryption remains below this signaling layer.
+- Process model: standalone GNS owns one identity per process. P2P identity
+  setup is rejected while another GNS connection/listener is active, and P2P
+  tests run in a dedicated process for the same reason.
+- Topology: this milestone supports listen-host/client P2P with NAT traversal
+  and TURN fallback. Matchmaking rooms, host election/migration, and hostless
+  state consensus are separate session/authority concerns and do not belong in
+  the signaling relay.
+
+---
+
 ## 16. Changelog
 
 | 日期 | 变更 |

@@ -27,6 +27,7 @@
 
 #include <AYCore.h>
 #include <AYNetwork/INetwork.h>                // R1 done: DisconnectReason / HandshakeMsgType / kProtocolVersion
+#include <AYNetwork/P2P.h>
 #include <AYNetwork/Protocol/PacketAssembler.h>           // R2: receive-side reassembly
 #include <AYNetwork/Protocol/AckPipeline.h>      // R4.1-B: CHANNEL_ACK pipeline
 #include <atomic>
@@ -115,11 +116,26 @@ public:
     // (AcceptConnection + SetConnectionPollGroup) and adopting the handle.
     // Returning nullptr means "reject the incoming connection".
     using AdoptFactory = std::function<GnsConnection*(HSteamNetConnection incomingConn)>;
+    using P2PAdoptFactory =
+        std::function<GnsConnection*(HSteamNetConnection incomingConn,
+                                     const PeerId& remotePeer)>;
     // Register per-listener rather than process-global routing.  This permits
     // multiple worlds/listeners in one process without last-writer-wins
     // callback corruption.
     static void setAdoptFactory(HSteamListenSocket listener, AdoptFactory factory);
     static void clearAdoptFactory(HSteamListenSocket listener);
+
+    // Custom-signaling P2P routes are process-wide because standalone GNS
+    // exposes one interface/identity per process. A normal game process owns
+    // one local PeerId and may listen on several virtual ports.
+    static bool setLocalP2PIdentity(const PeerId& localPeer);
+    static void setP2PAdoptFactory(uint16_t virtualPort,
+                                   std::shared_ptr<ISignalingTransport> signaling,
+                                   P2PAdoptFactory factory);
+    static void clearP2PAdoptFactory(uint16_t virtualPort);
+    static bool receiveP2PSignal(const PeerId& sender,
+                                 const void* data, size_t size,
+                                 std::shared_ptr<ISignalingTransport> signaling);
 
     GnsConnection();
     ~GnsConnection();
@@ -137,10 +153,19 @@ public:
     //   Subsequent incoming connections are handed off via setAdoptFactory().
     void initServer(uint16_t virtualPort);
 
+    // Starts a GNS custom-signaling P2P connection. Returns false when the
+    // identity/config/signaling channel is invalid or GNS rejects creation.
+    bool initP2PClient(const PeerId& remotePeer,
+                       const P2PConfig& config,
+                       std::shared_ptr<ISignalingTransport> signaling);
+
     // R1.A: attach to an already-accepted GNS connection (server child path).
     // Used by the adopt factory: it AcceptConnection()s and SetConnectionPollGroup()s
     // the incoming conn, then calls this to bind it to the new GnsConnection.
     void adoptIncomingConnection(HSteamNetConnection conn);
+    void adoptIncomingP2PConnection(HSteamNetConnection conn,
+                                    const PeerId& remotePeer,
+                                    uint16_t virtualPort);
 
     // ===== Per-frame =====
     // Production path: pump the shared GNS callback/receive queue exactly once
@@ -178,6 +203,9 @@ public:
 
     const char* getAddress() const { return _address.c_str(); }
     uint16_t    getPort() const { return _port; }
+    bool        isP2P() const { return _isP2P; }
+    const PeerId& getRemotePeerId() const { return _remotePeerId; }
+    P2PConnectionInfo getP2PConnectionInfo(const PeerId& localPeer) const;
 
     // R1 done (2026-07-27): set the protocol version this endpoint
     // expects/announces. 0 disables the handshake (legacy loopback).
@@ -317,6 +345,8 @@ private:
 
     std::string _address;
     uint16_t    _port = 0;
+    bool        _isP2P = false;
+    PeerId      _remotePeerId;
 
     HSteamListenSocket  _listen = 0;
     HSteamNetConnection _conn   = 0;

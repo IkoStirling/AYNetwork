@@ -10,6 +10,7 @@ set(SRC_FILES
     src/BitStream.cpp
     src/Transport/GnsConnection.cpp
     src/Transport/UdpSocket.cpp
+    src/Signaling/UdpSignaling.cpp
     src/Protocol/PacketAssembler.cpp
     src/Protocol/PacketCodec.cpp
     src/Protocol/AckPipeline.cpp
@@ -70,6 +71,17 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
 # dependency will go away.
 if(WIN32)
     target_link_libraries(${PROJECT_NAME} PUBLIC ws2_32)
+endif()
+
+# Optional standalone rendezvous process for the built-in UDP signaling
+# backend. It hosts no simulation state and may be replaced by an application's
+# authenticated signaling service.
+option(AYNETWORK_BUILD_SIGNALING_SERVER "Build AYNetwork UDP signaling server" OFF)
+if(AYNETWORK_BUILD_SIGNALING_SERVER)
+    add_executable(AYNetwork_SignalingServer tools/signaling/main.cpp)
+    target_link_libraries(AYNetwork_SignalingServer PRIVATE AYNetwork)
+    add_executable(AYNetwork_P2PSmokePeer tools/p2p_smoke/main.cpp)
+    target_link_libraries(AYNetwork_P2PSmokePeer PRIVATE AYNetwork)
 endif()
 
 # P0 audit fix (2026-07-26): avoid winsock.h (v1) vs winsock2.h (v2) collision
