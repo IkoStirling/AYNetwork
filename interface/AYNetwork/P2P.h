@@ -73,6 +73,9 @@ enum class P2PHostMigrationState : uint8_t {
     Electing = 3,
     Promoting = 4,
     Failed = 5,
+    Preparing = 6,
+    AwaitingCommit = 7,
+    Committing = 8,
 };
 
 enum class P2PAdmissionState : uint8_t {
@@ -93,6 +96,7 @@ enum class P2PJoinRejectReason : uint8_t {
 
 constexpr size_t kP2PMaxJoinTicketBytes = 1024;
 constexpr size_t kP2PMaxSessionMembers = 64;
+constexpr size_t kP2PMaxMigrationStateBytes = 64 * 1024;
 
 struct P2PJoinDecision {
     bool accepted = false;
@@ -208,6 +212,34 @@ struct P2PSessionInfo {
     P2PHostMigrationState migration = P2PHostMigrationState::Disabled;
     PeerId previousHostPeerId;
     PeerId electedHostPeerId;
+    bool migrationFrozen = false;
+};
+
+struct P2PMigrationContext {
+    uint64_t sessionId = 0;
+    uint32_t currentEpoch = 0;
+    uint32_t nextEpoch = 0;
+    PeerId electedHostPeerId;
+    bool graceful = false;
+};
+
+// Optional game-state bridge for data that is not represented by registered
+// replication objects (match clock, rule state, AI director, etc.). The old
+// Host captures once after its final replication tick. Survivors validate the
+// bounded payload during Prepare, then apply it only after Commit. Validation
+// must not mutate externally visible game state; Apply is expected to be
+// infallible after a successful validation.
+struct P2PMigrationStateCallbacks {
+    using Capture = std::function<bool(
+        const P2PMigrationContext&, std::vector<uint8_t>&)>;
+    using Validate = std::function<bool(
+        const P2PMigrationContext&, const uint8_t*, size_t)>;
+    using Apply = std::function<void(
+        const P2PMigrationContext&, const uint8_t*, size_t)>;
+
+    Capture capture;
+    Validate validate;
+    Apply apply;
 };
 
 enum class P2PSessionEventType : uint8_t {

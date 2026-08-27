@@ -228,6 +228,9 @@ public:
     size_t pendingCount() const {
         return _pendingCalls.size();
     }
+    // Epoch changes invalidate response routing and retry destinations. Drops
+    // every pending call and optionally completes callbacks as rejected.
+    size_t cancelPendingForAuthorityEpoch(bool notifyCallbacks = true);
 
     // ===== Test seams =====
     void setModeForTesting(ConnectionMode mode) { _forcedMode = mode; }

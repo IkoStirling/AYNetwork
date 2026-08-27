@@ -221,6 +221,9 @@ constexpr uint16_t kMsgTypeSessionReadyState  = 0x0022;
 constexpr uint16_t kMsgTypeSessionBarrier     = 0x0023;
 constexpr uint16_t kMsgTypeSessionRoster      = 0x0024;
 constexpr uint16_t kMsgTypeSessionMigration   = 0x0025;
+constexpr uint16_t kMsgTypeSessionMigrationAck = 0x0026;
+constexpr uint16_t kMsgTypeSessionMigrationDecision = 0x0027;
+constexpr uint16_t kMsgTypeSessionMigrationDecisionAck = 0x0028;
 
 // R2: schema version stamped into every PacketHeader. Bump on breaking
 // wire-format changes (rare; major version bumps imply a parallel header
@@ -327,6 +330,11 @@ public:
     virtual void setP2PHostMigrationEnabled(bool enabled) { (void)enabled; }
     virtual bool reconnectP2P() { return false; }
     virtual bool requestP2PHostMigration() { return false; }
+    virtual void setP2PMigrationStateCallbacks(
+        P2PMigrationStateCallbacks callbacks) {
+        (void)callbacks;
+    }
+    virtual bool isP2PMigrationFrozen() const { return false; }
     using P2PSessionEventHandler = std::function<void(const P2PSessionEvent&)>;
     // Listener id 0 is invalid. Events remain installed across connection
     // cycles until explicitly removed or the subsystem is destroyed.
@@ -761,6 +769,11 @@ public:
     // new authority. Reset every object baseline so rejoining peers receive
     // a reliable Full snapshot from that promoted state.
     void forceReplicateAll();
+    // Clears transport-epoch state that must not survive a Host change:
+    // queued/acked inputs, stale connection ownership, interpolation history,
+    // and per-peer replication baselines. Registered objects and their latest
+    // reflected values are retained.
+    void resetForAuthorityEpoch(bool becomingAuthority);
 
     // R5.1: tell the authority that `netId` teleported this tick. The next
     // tick() emits a Full Snapshot with the kFlagTeleport flag set AND

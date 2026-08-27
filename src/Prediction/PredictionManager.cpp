@@ -172,4 +172,15 @@ uint32_t PredictionManager::lastPredictedInputSeq(uint32_t netId) const
     return it != _ghosts.end() ? it->second.lastPredictedForInputSeq : 0u;
 }
 
+void PredictionManager::resetForAuthorityEpoch()
+{
+    _rings.clear();
+    _ackedSeq.clear();
+    for (auto& [netId, ghost] : _ghosts) {
+        (void)netId;
+        ghost.lastPredictedForInputSeq = 0;
+        ghost.lastAckedInputTick = 0;
+    }
+}
+
 } // namespace ayt::net

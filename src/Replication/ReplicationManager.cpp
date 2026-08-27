@@ -860,6 +860,27 @@ void ReplicationManager::forceReplicateAll() {
     }
 }
 
+void ReplicationManager::resetForAuthorityEpoch(bool becomingAuthority) {
+    _lastAckedInputTick.clear();
+    _proxyOwnerConnections.clear();
+    if (_prediction) _prediction->resetForAuthorityEpoch();
+    if (_snapshotInterpolator) _snapshotInterpolator->clearBuffers();
+    _teleportPending.clear();
+    if (becomingAuthority) {
+        _spawnAnnouncements.clear();
+        for (auto& [netId, kind] : _proxyKinds) {
+            (void)netId;
+            if (kind == ProxyKind::AutonomousProxy) {
+                kind = ProxyKind::SimulatedProxy;
+            }
+        }
+    }
+    for (auto& [netId, entry] : _objects) {
+        (void)netId;
+        entry._peers.clear();
+    }
+}
+
 // =============================================================================
 // R5.1 (2026-08-24) markTeleported.
 //

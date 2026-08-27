@@ -1858,18 +1858,39 @@ temporary transport loss recoverable and permits the authority role to move.
 - The authoritative v2 roster scopes every update by session ID, epoch and
   monotonic revision. It rejects duplicate peers/seats, contradictory flags,
   and a Host flag that does not match the declared Host PeerId.
-- When enabled, graceful migration sends a reliable `MigrationPlan`, then the
-  old Host closes after a maintenance window. Election is deterministic among
-  connected non-Host members: lowest seat, then lexical PeerId. All survivors
-  retain session ID and seat while epoch advances exactly once.
+- When enabled, graceful migration is a bounded transaction. The old Host
+  closes the Ready barrier, freezes epoch-sensitive application/RPC/Input work,
+  emits reliable final Full snapshots, and then sends a `MigrationPlan` with a
+  deterministic replicated-state hash. Every connected survivor must validate
+  that state and ACK Prepare before the Host sends Commit. Commit is retried
+  until every survivor returns a Commit ACK or the three-second retry window
+  expires; the old Host never departs on a fixed sub-RTT timer.
+- Election is deterministic among connected non-Host members: lowest seat,
+  then lexical PeerId. Survivors retain session ID and seat while the epoch
+  advances exactly once, only on Commit. Abort restores the old authority and
+  barrier without advancing the epoch.
 - On an unplanned `ConnectionLost`, a Client first attempts its reserved route
   to the original Host. If that connection also fails, all survivors apply the
   same election rule. The winner installs the P2P listener; other survivors
   resume against it. The Ready barrier remains closed until reservations are
   restored or expire.
-- Promotion uses the winner's latest replicated object values and resets all
-  replication baselines so reconnecting peers receive reliable Full snapshots.
-  Data that existed only in old-Host memory is not transferred.
+- Promotion uses the winner's latest replicated object values and resets RPC
+  pending calls, Input sequence/ACK cursors, Prediction history, interpolation
+  buffers, stale connection ownership, and all per-peer replication baselines.
+  Reconnecting peers therefore receive reliable Full snapshots without stale
+  traffic from the previous authority epoch.
+- Graceful migration can carry at most 64 KiB of non-replicated application
+  state through `setP2PMigrationStateCallbacks()`. `capture` runs on the old
+  Host after its final replication tick; `validate` runs while survivors are
+  frozen and must have no externally visible side effects; `apply` runs only
+  after Commit. The callback payload is for state such as match clocks/rules,
+  not fields already owned by ReplicationManager. Crash migration cannot run
+  this bridge and therefore retains only the latest replicated state.
+- `isP2PMigrationFrozen()` and `P2PSessionInfo::migrationFrozen` are the engine
+  integration gate. Systems that mutate authority-owned, non-replicated state
+  must pause while it is true. Unencoded application sends and receives are
+  suppressed by AYNetwork during the freeze; replication control remains active
+  for the final Full/Prepare/Commit sequence.
 - This is deterministic failover, not consensus. A network partition can form
   competing authorities, and stale/mismatched epochs are rejected only within
   a connected session. A matchmaking/backend epoch lease is required when
@@ -1882,6 +1903,7 @@ temporary transport loss recoverable and permits the authority role to move.
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-28 | **Host Migration correctness transaction**：final Full → Prepare/hash/optional 64 KiB app state → all Prepare ACK → Commit/retry → Commit ACK → departure；Abort 不推进 epoch；迁移冻结 RPC/Input/应用发送并重置 RPC、Prediction、ownership、interpolation 与 replication baselines。AYEditor 暂停迁移期 Play 更新。 |
 | 2026-07-26 | 工业级审计；R1–R6 重置；GNS 选型 §14 |
 | 2026-07-27 | **设计审计补丁**：§1/§3/§4 统一 GNS；§3.3 Protocol↔GNS 切分；§4.2 多连接+断线；§5 应用消息头；**§6.6 Authority**；§8/§10/§12/§14.6 同步；废止 KCP 正文 |
 | 2026-07-27 | **R1.A 多连接 pump**：GnsConnection 引入 `s_adoptFactory` + `serverAdopters()` fallback；AYNetworkSubSystem 持 `_serverClients` 列表，`update()` pump server parent + N children，`broadcast()` 真广播；新增 `MultiClientEcho` 测试（1 server + 2 clients）；53/53 PASS |

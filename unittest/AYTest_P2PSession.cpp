@@ -144,6 +144,9 @@ TEST_CASE(MigrationPlanAdvancesExactlyOneEpoch) {
     plan.currentEpoch = 7;
     plan.nextEpoch = 8;
     plan.electedHostPeerId = PeerId{"client-a"};
+    plan.replicatedStateHash = 0xAABBCCDDEEFF0011ull;
+    plan.applicationStateHash = 0x1122334455667788ull;
+    plan.applicationState = {1, 3, 5, 7, 9};
     std::vector<uint8_t> wire;
     session::MigrationPlan decoded;
     CHECK(session::encodeMigrationPlan(plan, wire));
@@ -152,12 +155,71 @@ TEST_CASE(MigrationPlanAdvancesExactlyOneEpoch) {
     CHECK_INT_EQ(decoded.currentEpoch, 7);
     CHECK_INT_EQ(decoded.nextEpoch, 8);
     CHECK(decoded.electedHostPeerId == PeerId{"client-a"});
+    CHECK(decoded.replicatedStateHash == plan.replicatedStateHash);
+    CHECK(decoded.applicationStateHash == plan.applicationStateHash);
+    CHECK(decoded.applicationState == plan.applicationState);
 
     plan.nextEpoch = 9;
     CHECK(!session::encodeMigrationPlan(plan, wire));
     plan.currentEpoch = std::numeric_limits<uint32_t>::max();
     plan.nextEpoch = 0;
     CHECK(!session::encodeMigrationPlan(plan, wire));
+
+    plan.currentEpoch = 7;
+    plan.nextEpoch = 8;
+    plan.applicationState.resize(kP2PMaxMigrationStateBytes + 1);
+    CHECK(!session::encodeMigrationPlan(plan, wire));
+}
+
+TEST_CASE(MigrationAckAndDecisionRoundTrip) {
+    ayt::test::setCurrentCase("MigrationAckAndDecisionRoundTrip");
+    session::MigrationAck ack;
+    ack.sessionId = 91;
+    ack.currentEpoch = 4;
+    ack.nextEpoch = 5;
+    ack.replicatedStateHash = 0x1234;
+    ack.applicationStateHash = 0x5678;
+    ack.accepted = true;
+    std::vector<uint8_t> wire;
+    session::MigrationAck decodedAck;
+    CHECK(session::encodeMigrationAck(ack, wire));
+    CHECK(session::decodeMigrationAck(wire.data(), wire.size(), decodedAck));
+    CHECK(decodedAck.sessionId == ack.sessionId);
+    CHECK(decodedAck.accepted);
+    CHECK(decodedAck.replicatedStateHash == ack.replicatedStateHash);
+
+    session::MigrationDecision decision;
+    decision.sessionId = ack.sessionId;
+    decision.currentEpoch = ack.currentEpoch;
+    decision.nextEpoch = ack.nextEpoch;
+    decision.electedHostPeerId = PeerId{"next-host"};
+    decision.commit = true;
+    session::MigrationDecision decodedDecision;
+    CHECK(session::encodeMigrationDecision(decision, wire));
+    CHECK(session::decodeMigrationDecision(
+        wire.data(), wire.size(), decodedDecision));
+    CHECK(decodedDecision.commit);
+    CHECK(decodedDecision.electedHostPeerId == decision.electedHostPeerId);
+
+    session::MigrationDecisionAck decisionAck;
+    decisionAck.sessionId = decision.sessionId;
+    decisionAck.currentEpoch = decision.currentEpoch;
+    decisionAck.nextEpoch = decision.nextEpoch;
+    decisionAck.electedHostPeerId = decision.electedHostPeerId;
+    session::MigrationDecisionAck decodedDecisionAck;
+    CHECK(session::encodeMigrationDecisionAck(decisionAck, wire));
+    CHECK(session::decodeMigrationDecisionAck(
+        wire.data(), wire.size(), decodedDecisionAck));
+    CHECK(decodedDecisionAck.sessionId == decisionAck.sessionId);
+    CHECK(decodedDecisionAck.currentEpoch == decisionAck.currentEpoch);
+    CHECK(decodedDecisionAck.nextEpoch == decisionAck.nextEpoch);
+    CHECK(decodedDecisionAck.electedHostPeerId ==
+          decisionAck.electedHostPeerId);
+
+    decision.nextEpoch = 7;
+    CHECK(!session::encodeMigrationDecision(decision, wire));
+    decisionAck.nextEpoch = 7;
+    CHECK(!session::encodeMigrationDecisionAck(decisionAck, wire));
 }
 
 TEST_SUITE_END

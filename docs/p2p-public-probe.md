@@ -130,6 +130,14 @@ RPC plus replicated state. Force-terminating the old Host after both clients
 emit `phase=armed` exercises crash recovery instead; it may take longer because
 clients first retry the original Host reservation.
 
+The graceful handoff is a reliable transaction: final Full snapshots precede
+Prepare, all survivors ACK matching replicated/application-state hashes, Commit
+is retried until Commit ACKs arrive, and only then does the old Host leave. This
+is intentionally safe on paths whose RTT is greater than 100 ms. A rejection or
+Prepare timeout aborts without advancing the epoch. After Commit, loss of the
+old Host accelerates the already-decided election rather than starting a second
+epoch.
+
 ## Engine lifecycle integration
 
 Applications should subscribe with `addP2PSessionEventListener()` after the
@@ -144,6 +152,13 @@ spawns. `MigrationFailed` ends the transition without granting authority.
 reconnect-grace lifecycle to lobby/game code. The event includes a snapshot of
 `P2PSessionInfo`, the affected peer, and its seat. Listeners remain installed
 across disconnect/reconnect cycles until explicitly removed.
+
+`isP2PMigrationFrozen()` is the synchronous pause gate for game systems. For
+non-replicated authority state, install `setP2PMigrationStateCallbacks()`:
+capture is limited to 64 KiB, validation must be side-effect-free, and apply is
+called only after Commit. Do not duplicate ReplicationManager-owned fields in
+this payload. Crash recovery has no old Host to capture from and therefore does
+not provide this optional state bridge.
 
 AYEditor consumes this contract directly. A promoted client keeps its launch
 role for World teardown, marks retained `NetworkComponent` instances as owned,

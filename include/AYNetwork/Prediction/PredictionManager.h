@@ -132,6 +132,11 @@ public:
     void   setLayoutHash(uint32_t netId, uint64_t h);
     uint32_t lastPredictedInputSeq(uint32_t netId) const;
 
+    // A session epoch changes every transport identity and invalidates input
+    // sequence/ack cursors. Preserve predicted bytes/layout registrations so
+    // gameplay can continue from the latest replicated state.
+    void resetForAuthorityEpoch();
+
 private:
     uint32_t _ringCapacity;
     // R6 C2 (2026-08-25): std::map (was std::unordered_map) so iteration

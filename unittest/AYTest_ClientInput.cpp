@@ -258,6 +258,35 @@ TEST_CASE(AckTail_IsolatedByOwningConnection)
     CHECK(manager.buildAckTailForConnection(22u, 0u).present);
 }
 
+TEST_CASE(ReplicationManager_AuthorityEpochResetDropsStaleOwnership)
+{
+    ayt::test::setCurrentCase(
+        "ReplicationManager_AuthorityEpochResetDropsStaleOwnership");
+    ReplicationManager manager(nullptr);
+    manager.setModeForTesting(ConnectionMode::Server);
+    int32_t value = 17;
+    const auto* type = ayt::reflect::TypeRegistryImpl::instance()
+                           .findType<int32_t>();
+    CHECK(type != nullptr);
+    manager.registerObject(&value, type, 301u);
+    manager.setObjectProxyKind(
+        301u, ProxyKind::AutonomousProxy, 44u);
+    const uint8_t payload = 1;
+    std::vector<uint8_t> inputBody(9u);
+    CHECK(ClientInputCodec::write(
+        inputBody.data(), 5u, 10u, &payload, 1u) == inputBody.size());
+    CHECK(manager.onClientInput(44u, inputBody.data(), inputBody.size()));
+    manager.consumeClientInputs(10u);
+    CHECK(manager.buildAckTailForConnection(44u, 0u).present);
+
+    manager.resetForAuthorityEpoch(true);
+
+    CHECK(manager.findObject(301u) == &value);
+    CHECK(manager.getObjectProxyKind(301u) == ProxyKind::SimulatedProxy);
+    CHECK(!manager.buildAckTailForConnection(44u, 0u).present);
+    CHECK_INT_EQ(manager.getLastAckedInputTick(44u), 0);
+}
+
 // =============================================================================
 // Case 7: MispredictionResolver skips ServerAuthoritative fields.
 // =============================================================================
@@ -458,6 +487,31 @@ TEST_CASE(PredictionManager_ConfiguredRingCapacity)
         CHECK(pm.onClientInput(77, body.data(), body.size()));
     }
     CHECK(pm.pendingInputCount(77) == 2u);
+}
+
+TEST_CASE(PredictionManager_AuthorityEpochResetPreservesGhostState)
+{
+    ayt::test::setCurrentCase(
+        "PredictionManager_AuthorityEpochResetPreservesGhostState");
+    PredictionManager pm(8);
+    std::vector<uint8_t> input(8, 0);
+    ClientInputCodec::write(input.data(), 9, 100, nullptr, 0);
+    CHECK(pm.onClientInput(77, input.data(), input.size()));
+    pm.markAcked(77, 8);
+    pm.registerPredictedGhost(42, 0xCAFE);
+    const uint8_t predicted[] = {4, 2, 1};
+    pm.setPredictedBytes(42, predicted, sizeof(predicted));
+
+    pm.resetForAuthorityEpoch();
+
+    CHECK_INT_EQ(pm.trackedConnections(), 0);
+    CHECK_INT_EQ(pm.pendingInputCount(77), 0);
+    CHECK_INT_EQ(pm.lastAckedInputTick(77), 0);
+    CHECK(pm.isPredictedGhost(42));
+    CHECK_INT_EQ(pm.getLayoutHash(42), 0xCAFE);
+    std::vector<uint8_t> retained;
+    CHECK(pm.tryGetPredictedBytes(42, retained));
+    CHECK(retained == std::vector<uint8_t>({4, 2, 1}));
 }
 
 TEST_CASE(Misprediction_NumericLerpUsesValues)

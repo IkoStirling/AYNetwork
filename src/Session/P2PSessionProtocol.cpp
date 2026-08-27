@@ -256,29 +256,141 @@ bool encodeMigrationPlan(const MigrationPlan& plan, std::vector<uint8_t>& out) {
     if (plan.sessionId == 0 || plan.currentEpoch == 0 ||
         plan.currentEpoch == std::numeric_limits<uint32_t>::max() ||
         plan.nextEpoch != plan.currentEpoch + 1 ||
+        plan.applicationState.size() > kP2PMaxMigrationStateBytes ||
         !plan.electedHostPeerId.isValid()) return false;
-    out.reserve(18 + plan.electedHostPeerId.value.size());
+    out.reserve(38 + plan.electedHostPeerId.value.size() +
+                plan.applicationState.size());
     out.push_back(kSessionWireVersion);
     out.push_back(0);
     appendU64(out, plan.sessionId);
     appendU32(out, plan.currentEpoch);
     appendU32(out, plan.nextEpoch);
-    return appendPeerId(out, plan.electedHostPeerId);
+    appendU64(out, plan.replicatedStateHash);
+    appendU64(out, plan.applicationStateHash);
+    appendU32(out, static_cast<uint32_t>(plan.applicationState.size()));
+    if (!appendPeerId(out, plan.electedHostPeerId)) return false;
+    out.insert(out.end(), plan.applicationState.begin(),
+               plan.applicationState.end());
+    return true;
 }
 
 bool decodeMigrationPlan(const uint8_t* data, size_t size, MigrationPlan& plan) {
     plan = {};
-    if (!data || size < 19 || data[0] != kSessionWireVersion || data[1] != 0) {
+    if (!data || size < 39 || data[0] != kSessionWireVersion || data[1] != 0) {
         return false;
     }
     plan.sessionId = readU64(data + 2);
     plan.currentEpoch = readU32(data + 10);
     plan.nextEpoch = readU32(data + 14);
-    size_t cursor = 18;
+    plan.replicatedStateHash = readU64(data + 18);
+    plan.applicationStateHash = readU64(data + 26);
+    const size_t applicationStateSize = readU32(data + 34);
+    if (applicationStateSize > kP2PMaxMigrationStateBytes) return false;
+    size_t cursor = 38;
     if (!readPeerId(data, size, cursor, plan.electedHostPeerId)) return false;
-    return cursor == size && plan.sessionId != 0 && plan.currentEpoch != 0 &&
+    if (cursor + applicationStateSize != size) return false;
+    plan.applicationState.assign(data + cursor, data + size);
+    return plan.sessionId != 0 && plan.currentEpoch != 0 &&
            plan.currentEpoch != std::numeric_limits<uint32_t>::max() &&
            plan.nextEpoch == plan.currentEpoch + 1;
+}
+
+bool encodeMigrationAck(const MigrationAck& ack, std::vector<uint8_t>& out) {
+    out.clear();
+    if (ack.sessionId == 0 || ack.currentEpoch == 0 ||
+        ack.currentEpoch == std::numeric_limits<uint32_t>::max() ||
+        ack.nextEpoch != ack.currentEpoch + 1) return false;
+    out.reserve(34);
+    out.push_back(kSessionWireVersion);
+    out.push_back(ack.accepted ? 1u : 0u);
+    appendU64(out, ack.sessionId);
+    appendU32(out, ack.currentEpoch);
+    appendU32(out, ack.nextEpoch);
+    appendU64(out, ack.replicatedStateHash);
+    appendU64(out, ack.applicationStateHash);
+    return true;
+}
+
+bool decodeMigrationAck(const uint8_t* data, size_t size, MigrationAck& ack) {
+    ack = {};
+    if (!data || size != 34 || data[0] != kSessionWireVersion || data[1] > 1) {
+        return false;
+    }
+    ack.accepted = data[1] != 0;
+    ack.sessionId = readU64(data + 2);
+    ack.currentEpoch = readU32(data + 10);
+    ack.nextEpoch = readU32(data + 14);
+    ack.replicatedStateHash = readU64(data + 18);
+    ack.applicationStateHash = readU64(data + 26);
+    return ack.sessionId != 0 && ack.currentEpoch != 0 &&
+           ack.currentEpoch != std::numeric_limits<uint32_t>::max() &&
+           ack.nextEpoch == ack.currentEpoch + 1;
+}
+
+bool encodeMigrationDecision(const MigrationDecision& decision,
+                             std::vector<uint8_t>& out) {
+    out.clear();
+    if (decision.sessionId == 0 || decision.currentEpoch == 0 ||
+        decision.currentEpoch == std::numeric_limits<uint32_t>::max() ||
+        decision.nextEpoch != decision.currentEpoch + 1 ||
+        !decision.electedHostPeerId.isValid()) return false;
+    out.reserve(19 + decision.electedHostPeerId.value.size());
+    out.push_back(kSessionWireVersion);
+    out.push_back(decision.commit ? 1u : 0u);
+    appendU64(out, decision.sessionId);
+    appendU32(out, decision.currentEpoch);
+    appendU32(out, decision.nextEpoch);
+    return appendPeerId(out, decision.electedHostPeerId);
+}
+
+bool decodeMigrationDecision(const uint8_t* data, size_t size,
+                             MigrationDecision& decision) {
+    decision = {};
+    if (!data || size < 19 || data[0] != kSessionWireVersion || data[1] > 1) {
+        return false;
+    }
+    decision.commit = data[1] != 0;
+    decision.sessionId = readU64(data + 2);
+    decision.currentEpoch = readU32(data + 10);
+    decision.nextEpoch = readU32(data + 14);
+    size_t cursor = 18;
+    if (!readPeerId(data, size, cursor, decision.electedHostPeerId)) return false;
+    return cursor == size && decision.sessionId != 0 &&
+           decision.currentEpoch != 0 &&
+           decision.currentEpoch != std::numeric_limits<uint32_t>::max() &&
+           decision.nextEpoch == decision.currentEpoch + 1;
+}
+
+bool encodeMigrationDecisionAck(const MigrationDecisionAck& ack,
+                                std::vector<uint8_t>& out) {
+    out.clear();
+    if (ack.sessionId == 0 || ack.currentEpoch == 0 ||
+        ack.currentEpoch == std::numeric_limits<uint32_t>::max() ||
+        ack.nextEpoch != ack.currentEpoch + 1 ||
+        !ack.electedHostPeerId.isValid()) return false;
+    out.reserve(19 + ack.electedHostPeerId.value.size());
+    out.push_back(kSessionWireVersion);
+    out.push_back(0);
+    appendU64(out, ack.sessionId);
+    appendU32(out, ack.currentEpoch);
+    appendU32(out, ack.nextEpoch);
+    return appendPeerId(out, ack.electedHostPeerId);
+}
+
+bool decodeMigrationDecisionAck(const uint8_t* data, size_t size,
+                                MigrationDecisionAck& ack) {
+    ack = {};
+    if (!data || size < 19 || data[0] != kSessionWireVersion || data[1] != 0) {
+        return false;
+    }
+    ack.sessionId = readU64(data + 2);
+    ack.currentEpoch = readU32(data + 10);
+    ack.nextEpoch = readU32(data + 14);
+    size_t cursor = 18;
+    if (!readPeerId(data, size, cursor, ack.electedHostPeerId)) return false;
+    return cursor == size && ack.sessionId != 0 && ack.currentEpoch != 0 &&
+           ack.currentEpoch != std::numeric_limits<uint32_t>::max() &&
+           ack.nextEpoch == ack.currentEpoch + 1;
 }
 
 } // namespace ayt::net::session

@@ -46,6 +46,33 @@ struct MigrationPlan {
     uint32_t currentEpoch = 0;
     uint32_t nextEpoch = 0;
     PeerId electedHostPeerId;
+    uint64_t replicatedStateHash = 0;
+    uint64_t applicationStateHash = 0;
+    std::vector<uint8_t> applicationState;
+};
+
+struct MigrationAck {
+    uint64_t sessionId = 0;
+    uint32_t currentEpoch = 0;
+    uint32_t nextEpoch = 0;
+    uint64_t replicatedStateHash = 0;
+    uint64_t applicationStateHash = 0;
+    bool accepted = false;
+};
+
+struct MigrationDecision {
+    uint64_t sessionId = 0;
+    uint32_t currentEpoch = 0;
+    uint32_t nextEpoch = 0;
+    PeerId electedHostPeerId;
+    bool commit = false;
+};
+
+struct MigrationDecisionAck {
+    uint64_t sessionId = 0;
+    uint32_t currentEpoch = 0;
+    uint32_t nextEpoch = 0;
+    PeerId electedHostPeerId;
 };
 
 bool encodeJoinRequest(const JoinRequest& request, std::vector<uint8_t>& out);
@@ -71,5 +98,15 @@ bool encodeRoster(const Roster& roster, std::vector<uint8_t>& out);
 bool decodeRoster(const uint8_t* data, size_t size, Roster& roster);
 bool encodeMigrationPlan(const MigrationPlan& plan, std::vector<uint8_t>& out);
 bool decodeMigrationPlan(const uint8_t* data, size_t size, MigrationPlan& plan);
+bool encodeMigrationAck(const MigrationAck& ack, std::vector<uint8_t>& out);
+bool decodeMigrationAck(const uint8_t* data, size_t size, MigrationAck& ack);
+bool encodeMigrationDecision(const MigrationDecision& decision,
+                             std::vector<uint8_t>& out);
+bool decodeMigrationDecision(const uint8_t* data, size_t size,
+                             MigrationDecision& decision);
+bool encodeMigrationDecisionAck(const MigrationDecisionAck& ack,
+                                std::vector<uint8_t>& out);
+bool decodeMigrationDecisionAck(const uint8_t* data, size_t size,
+                                MigrationDecisionAck& ack);
 
 } // namespace ayt::net::session

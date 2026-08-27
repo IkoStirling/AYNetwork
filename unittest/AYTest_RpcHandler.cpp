@@ -1147,4 +1147,24 @@ TEST_CASE(PendingCalls_IterateInCallIdOrder) {
     CHECK_INT_EQ(static_cast<uint64_t>(fireOrder[2]), static_cast<uint64_t>(kA));
     CHECK_INT_EQ(static_cast<size_t>(handler.pendingCount()), static_cast<size_t>(0));
 }
+
+TEST_CASE(PendingCalls_AuthorityEpochCancellationRejectsInOrder) {
+    ayt::test::setCurrentCase(
+        "PendingCalls_AuthorityEpochCancellationRejectsInOrder");
+    RpcHandler handler(/*network=*/ nullptr);
+    std::vector<uint64_t> rejected;
+    handler.registerPending(30, [&](bool accepted, const void*) {
+        if (!accepted) rejected.push_back(30);
+    });
+    handler.registerPending(10, [&](bool accepted, const void*) {
+        if (!accepted) rejected.push_back(10);
+    });
+    handler.registerPending(20, [&](bool accepted, const void*) {
+        if (!accepted) rejected.push_back(20);
+    });
+
+    CHECK_INT_EQ(handler.cancelPendingForAuthorityEpoch(true), 3);
+    CHECK_INT_EQ(handler.pendingCount(), 0);
+    CHECK(rejected == std::vector<uint64_t>({10, 20, 30}));
+}
 TEST_SUITE_END

@@ -399,6 +399,7 @@ void RpcHandler::emitRpcRejectIfTracked(ayt::reflect::RpcKind rpcKind, uint64_t 
 bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream& body,
                       NetConnection* target) {
     if (!_network && !_broadcastSink) return false;
+    if (_network && _network->isP2PMigrationFrozen()) return false;
     const uint8_t* bodyBytes = static_cast<const uint8_t*>(body.getData());
     const size_t bodyLen = body.getSize();
     const bool compress =
@@ -460,6 +461,18 @@ bool RpcHandler::emit(uint8_t channel, uint16_t envelopeMsgType, const BitStream
                       static_cast<uint64_t>(sealed.size()));
     }
     return true;
+}
+
+size_t RpcHandler::cancelPendingForAuthorityEpoch(bool notifyCallbacks) {
+    std::map<uint64_t, PendingEntry> pending;
+    pending.swap(_pendingCalls);
+    if (notifyCallbacks) {
+        for (auto& [callId, entry] : pending) {
+            (void)callId;
+            if (entry.cb) entry.cb(false, nullptr);
+        }
+    }
+    return pending.size();
 }
 
 NetConnection* RpcHandler::findNetConnectionById(uint32_t netId) const {
