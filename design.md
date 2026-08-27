@@ -1792,6 +1792,33 @@ layers. It does not change their wire formats or authority rules.
 
 ---
 
+## 15.16 P2P session view v1 (2026-08-27)
+
+The first session-layer increment is intentionally a local, backend-neutral
+view over live AYNetwork connections. It does not add lobby state to the UDP
+signaling relay and does not introduce a new wire message.
+
+- `P2PSessionInfo` exposes local role, lifecycle state, host PeerId, virtual
+  port, and the number of protocol-Ready remote peers.
+- `P2PPeerInfo` binds a stable application `PeerId` to the current AYNetwork
+  connection id, path, address, ping, readiness, and host flag. Results are
+  sorted by PeerId then connection id for deterministic consumers.
+- `findP2PPeer` and `disconnectP2PPeer` let gameplay address a peer without
+  retaining raw connection pointers across reconnect replacement.
+- AYNetwork disconnect reasons use GNS's reserved application range
+  (`1000..1999`). `UserQuit`, `Kicked`, and `HostShutdown` therefore reach the
+  remote endpoint; unmapped GNS/system failures remain `ConnectionLost`.
+- The public NAT probe requires `AY_P2P_SESSION_VIEW ... roster=ok` on both
+  host and client in addition to ICE, handshake, RPC, replication, and quality
+  checks.
+
+Deferred after v1: authoritative lobby membership, join tickets, ready/load
+barriers, host election/migration, and hostless consensus. Those require an
+account/session service or a new session wire protocol and are not inferred
+from the signaling relay's transient endpoint table.
+
+---
+
 ## 16. Changelog
 
 | 日期 | 变更 |

@@ -47,6 +47,29 @@ enum class P2PPathKind : uint8_t {
     Relayed = 2,
 };
 
+// Backend-neutral view of the engine-level P2P session. Signaling rooms are
+// deliberately not exposed here: a platform lobby, account service, or the
+// built-in UDP rendezvous backend may own that discovery metadata.
+enum class P2PSessionRole : uint8_t {
+    None = 0,
+    Host = 1,
+    Client = 2,
+};
+
+enum class P2PSessionState : uint8_t {
+    Unconfigured = 0,
+    Idle = 1,
+    Hosting = 2,
+    Connecting = 3,
+    Active = 4,
+};
+
+enum class P2PPeerState : uint8_t {
+    Connecting = 0,
+    Ready = 1,
+    Disconnecting = 2,
+};
+
 struct P2PConfig {
     PeerId localPeerId;
     uint16_t virtualPort = 0;
@@ -91,6 +114,27 @@ struct P2PConnectionInfo {
     P2PPathKind path = P2PPathKind::Unknown;
     std::string remoteAddress;
     int pingMs = -1;
+};
+
+// One remote engine peer. connectionId is the stable AYNetwork id for this
+// concrete connection; a reconnect can replace it while retaining peerId.
+struct P2PPeerInfo {
+    PeerId peerId;
+    uint32_t connectionId = 0;
+    P2PPeerState state = P2PPeerState::Connecting;
+    P2PPathKind path = P2PPathKind::Unknown;
+    std::string remoteAddress;
+    int pingMs = -1;
+    bool isSessionHost = false;
+};
+
+struct P2PSessionInfo {
+    P2PSessionRole role = P2PSessionRole::None;
+    P2PSessionState state = P2PSessionState::Unconfigured;
+    PeerId localPeerId;
+    PeerId hostPeerId;
+    uint16_t virtualPort = 0;
+    size_t readyPeerCount = 0;
 };
 
 // Signaling carries opaque GNS rendezvous blobs.  Implementations may use the

@@ -287,6 +287,17 @@ public:
     virtual P2PConnectionInfo getP2PConnectionInfo(NetConnection* connection = nullptr) const {
         (void)connection; return {};
     }
+    // Session/roster v1 is a read-mostly facade over live engine connections;
+    // it does not turn the signaling relay into a lobby or game-state server.
+    virtual P2PSessionInfo getP2PSessionInfo() const { return {}; }
+    virtual std::vector<P2PPeerInfo> getP2PPeers() const { return {}; }
+    virtual NetConnection* findP2PPeer(const PeerId& peer) const {
+        (void)peer; return nullptr;
+    }
+    virtual bool disconnectP2PPeer(const PeerId& peer,
+                                   const char* reason = nullptr) {
+        (void)peer; (void)reason; return false;
+    }
 
     // Must be configured before connect()/listen().  The production default
     // is kProtocolVersion; version 0 is an explicit legacy/test opt-out.

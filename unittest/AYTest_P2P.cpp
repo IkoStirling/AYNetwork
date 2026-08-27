@@ -247,12 +247,41 @@ TEST_CASE(SubsystemConfiguresAndStartsP2PRoute) {
     CHECK(network->configureP2P(config, signaling));
     CHECK(network->isP2PConfigured());
     CHECK(network->getLocalPeerId() == config.localPeerId);
+    {
+        const P2PSessionInfo session = network->getP2PSessionInfo();
+        CHECK(session.role == P2PSessionRole::None);
+        CHECK(session.state == P2PSessionState::Idle);
+        CHECK(session.localPeerId == config.localPeerId);
+        CHECK_INT_EQ(session.virtualPort, config.virtualPort);
+        CHECK_INT_EQ(session.readyPeerCount, 0);
+    }
     CHECK(network->listenP2P());
     CHECK(network->isListening());
+    {
+        const P2PSessionInfo session = network->getP2PSessionInfo();
+        CHECK(session.role == P2PSessionRole::Host);
+        CHECK(session.state == P2PSessionState::Hosting);
+        CHECK(session.hostPeerId == config.localPeerId);
+        CHECK(network->getP2PPeers().empty());
+    }
     network->disconnect();
     CHECK(!network->isListening());
 
-    CHECK(network->connectP2P(PeerId{"p2p-test-remote"}));
+    const PeerId remote{"p2p-test-remote"};
+    CHECK(network->connectP2P(remote));
+    {
+        const P2PSessionInfo session = network->getP2PSessionInfo();
+        CHECK(session.role == P2PSessionRole::Client);
+        CHECK(session.state == P2PSessionState::Connecting);
+        CHECK(session.hostPeerId == remote);
+        const auto peers = network->getP2PPeers();
+        CHECK_INT_EQ(peers.size(), 1);
+        CHECK(peers.front().peerId == remote);
+        CHECK(peers.front().state == P2PPeerState::Connecting);
+        CHECK(peers.front().isSessionHost);
+        CHECK(peers.front().connectionId != 0);
+        CHECK(network->findP2PPeer(remote) == network->getConnection());
+    }
     const auto signalDeadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (signaling->sendCount.load() == 0 &&
@@ -263,7 +292,11 @@ TEST_CASE(SubsystemConfiguresAndStartsP2PRoute) {
     CHECK(signaling->sendCount.load() >= 1);
     const P2PConnectionInfo info = network->getP2PConnectionInfo();
     CHECK(info.localPeerId == config.localPeerId);
-    CHECK(info.remotePeerId == PeerId{"p2p-test-remote"});
+    CHECK(info.remotePeerId == remote);
+    CHECK(network->disconnectP2PPeer(remote, "session test complete"));
+    CHECK(network->findP2PPeer(remote) == nullptr);
+    CHECK(network->getP2PPeers().empty());
+    CHECK(!network->disconnectP2PPeer(PeerId{"missing-peer"}));
     network->disconnect();
     network->shutdown();
 }

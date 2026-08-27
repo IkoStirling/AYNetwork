@@ -429,6 +429,44 @@ TEST_CASE(OnePeerCanReconnectWhileAnotherPeerRemainsUsable) {
     client2->shutdown();
 }
 
+TEST_CASE(KickReasonReachesRemoteEndpoint) {
+    ayt::test::setCurrentCase("KickReasonReachesRemoteEndpoint");
+
+    std::unique_ptr<INetworkSubSystem> server(createNetworkSubSystemForTest());
+    std::unique_ptr<INetworkSubSystem> client(createNetworkSubSystemForTest());
+    CHECK(server && client);
+    CHECK(server->initialize());
+    CHECK(client->initialize());
+
+    std::atomic<bool> kicked{false};
+    client->onConnectionChange(
+        [&](NetConnection*, bool connected, DisconnectReason reason) {
+            if (!connected && reason == DisconnectReason::Kicked) {
+                kicked.store(true);
+            }
+        });
+
+    constexpr uint16_t kPort = 27554;
+    server->listen(kPort);
+    client->connect("127.0.0.1", kPort);
+    std::vector<INetworkSubSystem*> systems{server.get(), client.get()};
+    CHECK(pumpUntil(std::chrono::seconds(8), [&]() {
+        pumpAll(systems);
+        return client->isConnected() && server->getConnections().size() == 1;
+    }));
+
+    server->kickConnection(server->getConnections().front(), "test kick");
+    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
+        pumpAll(systems);
+        return kicked.load();
+    }));
+
+    server->disconnect();
+    client->disconnect();
+    server->shutdown();
+    client->shutdown();
+}
+
 TEST_CASE(ProductionDefaultsAndAdmissionGate) {
     ayt::test::setCurrentCase("ProductionDefaultsAndAdmissionGate");
 

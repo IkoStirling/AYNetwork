@@ -207,7 +207,8 @@ public:
             for (auto it = _serverClients.begin(); it != _serverClients.end();) {
                 if (it->transport && it->transport->isP2P() &&
                     it->transport->getRemotePeerId() == *remotePeer) {
-                    it->transport->disconnect("superseded P2P peer session");
+                    it->transport->disconnect("superseded P2P peer session",
+                                              DisconnectReason::Kicked);
                     if (_extension && it->facade &&
                         !it->extensionDisconnectNotified) {
                         _extension->onConnectionDisconnected(it->facade.get());
@@ -255,7 +256,8 @@ public:
             accepted = _extension->onIncomingConnection(netPtr);
         }
         if (!accepted) {
-            rawChild->disconnect("connection admission rejected");
+            rawChild->disconnect("connection admission rejected",
+                                 DisconnectReason::Kicked);
             ++_rejectedConnections;
             return nullptr;
         }
@@ -578,14 +580,15 @@ public:
         }
     }
 
-    void clearServerClients(const char* reason) {
+    void clearServerClients(const char* reason,
+                            DisconnectReason code = DisconnectReason::HostShutdown) {
         for (auto& record : _serverClients) {
             if (_extension && record.facade &&
                 !record.extensionDisconnectNotified) {
                 _extension->onConnectionDisconnected(record.facade.get());
                 record.extensionDisconnectNotified = true;
             }
-            if (record.transport) record.transport->disconnect(reason);
+            if (record.transport) record.transport->disconnect(reason, code);
         }
         _serverClients.clear();
     }
@@ -735,6 +738,120 @@ public:
         return {};
     }
 
+    std::vector<P2PPeerInfo> getP2PPeers() const override {
+        std::vector<P2PPeerInfo> peers;
+        const auto append = [this, &peers](const GnsConnection* transport,
+                                           const NetConnection* facade,
+                                           bool remoteIsHost) {
+            if (!transport || !transport->isP2P() ||
+                transport->getState() == GnsConnectionState::Disconnected) {
+                return;
+            }
+            const auto connection =
+                transport->getP2PConnectionInfo(_p2pConfig.localPeerId);
+            if (!connection.remotePeerId.isValid()) return;
+
+            P2PPeerInfo peer;
+            peer.peerId = connection.remotePeerId;
+            peer.connectionId = facade ? facade->getId() : transport->getNetId();
+            peer.path = connection.path;
+            peer.remoteAddress = connection.remoteAddress;
+            peer.pingMs = connection.pingMs;
+            peer.isSessionHost = remoteIsHost;
+            switch (transport->getState()) {
+            case GnsConnectionState::Ready:
+                peer.state = P2PPeerState::Ready;
+                break;
+            case GnsConnectionState::Disconnecting:
+                peer.state = P2PPeerState::Disconnecting;
+                break;
+            case GnsConnectionState::Connected:
+                peer.state = transport->getProtocolVersion() == 0
+                    ? P2PPeerState::Ready : P2PPeerState::Connecting;
+                break;
+            default:
+                peer.state = P2PPeerState::Connecting;
+                break;
+            }
+            peers.push_back(std::move(peer));
+        };
+
+        append(_clientConn.get(), _clientNetConn.get(), !_p2pListening);
+        for (const auto& record : _serverClients) {
+            append(record.transport.get(), record.facade.get(), false);
+        }
+        std::sort(peers.begin(), peers.end(),
+                  [](const P2PPeerInfo& lhs, const P2PPeerInfo& rhs) {
+                      if (lhs.peerId.value != rhs.peerId.value) {
+                          return lhs.peerId.value < rhs.peerId.value;
+                      }
+                      return lhs.connectionId < rhs.connectionId;
+                  });
+        return peers;
+    }
+
+    P2PSessionInfo getP2PSessionInfo() const override {
+        P2PSessionInfo session;
+        if (!_p2pConfigured) return session;
+
+        session.state = P2PSessionState::Idle;
+        session.localPeerId = _p2pConfig.localPeerId;
+        session.virtualPort = _p2pConfig.virtualPort;
+        if (_p2pListening) {
+            session.role = P2PSessionRole::Host;
+            session.hostPeerId = _p2pConfig.localPeerId;
+            session.state = P2PSessionState::Hosting;
+        } else if (_clientConn && _clientConn->isP2P()) {
+            session.role = P2PSessionRole::Client;
+            session.hostPeerId = _clientConn->getRemotePeerId();
+            session.state = P2PSessionState::Connecting;
+        }
+
+        for (const auto& peer : getP2PPeers()) {
+            if (peer.state == P2PPeerState::Ready) ++session.readyPeerCount;
+        }
+        if (session.readyPeerCount != 0) session.state = P2PSessionState::Active;
+        return session;
+    }
+
+    NetConnection* findP2PPeer(const PeerId& peer) const override {
+        if (!peer.isValid()) return nullptr;
+        if (_clientConn && _clientNetConn && _clientConn->isP2P() &&
+            _clientConn->getState() != GnsConnectionState::Disconnected &&
+            _clientConn->getRemotePeerId() == peer) {
+            return _clientNetConn.get();
+        }
+        for (const auto& record : _serverClients) {
+            if (record.transport && record.facade && record.transport->isP2P() &&
+                record.transport->getState() != GnsConnectionState::Disconnected &&
+                record.transport->getRemotePeerId() == peer) {
+                return record.facade.get();
+            }
+        }
+        return nullptr;
+    }
+
+    bool disconnectP2PPeer(const PeerId& peer, const char* reason) override {
+        if (!peer.isValid()) return false;
+        if (_clientConn && _clientConn->isP2P() &&
+            _clientConn->getState() != GnsConnectionState::Disconnected &&
+            _clientConn->getRemotePeerId() == peer) {
+            _clientConn->disconnect(reason ? reason : "left P2P session",
+                                    DisconnectReason::UserQuit);
+            return true;
+        }
+        for (auto& record : _serverClients) {
+            if (record.transport && record.transport->isP2P() &&
+                record.transport->getState() != GnsConnectionState::Disconnected &&
+                record.transport->getRemotePeerId() == peer) {
+                record.transport->disconnect(reason ? reason : "removed from P2P session",
+                                             DisconnectReason::Kicked);
+                return true;
+            }
+        }
+        return false;
+    }
+
     void connect(const char* address, uint16_t port) override {
         if (GnsConnection::isPumping()) {
             _deferredControl = {
@@ -836,7 +953,7 @@ public:
             _p2pListening = false;
         }
         if (_clientConn) {
-            _clientConn->disconnect("client disconnect");
+            _clientConn->disconnect("client disconnect", DisconnectReason::UserQuit);
             _clientConn.reset();
             _clientNetConn.reset();
         }
@@ -991,6 +1108,13 @@ public:
         // R4.1: real impl — NetConnection::disconnect forwards through the
         // adapter to the underlying GnsConnection.
         if (!conn) return;
+        for (auto& record : _serverClients) {
+            if (record.facade.get() == conn && record.transport) {
+                record.transport->disconnect(reason ? reason : "kicked by server",
+                                             DisconnectReason::Kicked);
+                return;
+            }
+        }
         conn->disconnect(reason ? reason : "kicked by server");
     }
 

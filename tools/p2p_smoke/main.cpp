@@ -403,6 +403,7 @@ int runHost(const PeerId& local,
             const ProbeOptions& options) {
     uint32_t completedSessions = 0;
     bool pathOk = true;
+    bool rosterOk = true;
     ProbeReplicatedState authorityState;
     authorityState.value = 4242;
     ProbeRpcReceiver rpcReceiver;
@@ -449,6 +450,26 @@ int runHost(const PeerId& local,
             }
             ++completedSessions;
             const auto info = network.getP2PConnectionInfo(from);
+            const auto peers = network.getP2PPeers();
+            const auto peerIt = std::find_if(
+                peers.begin(), peers.end(), [&](const P2PPeerInfo& peer) {
+                    return peer.peerId == info.remotePeerId &&
+                           peer.connectionId == from->getId();
+                });
+            const auto sessionInfo = network.getP2PSessionInfo();
+            const bool sessionViewOk =
+                network.findP2PPeer(info.remotePeerId) == from &&
+                peerIt != peers.end() && peerIt->state == P2PPeerState::Ready &&
+                sessionInfo.role == P2PSessionRole::Host &&
+                sessionInfo.state == P2PSessionState::Active &&
+                sessionInfo.hostPeerId == local && sessionInfo.readyPeerCount >= 1;
+            rosterOk = rosterOk && sessionViewOk;
+            std::printf(
+                "AY_P2P_SESSION_VIEW local=%s remote=%s session=%u role=host "
+                "roster=%s ready_peers=%zu connection_id=%u\n",
+                local.value.c_str(), info.remotePeerId.value.c_str(), completedSessions,
+                sessionViewOk ? "ok" : "invalid", sessionInfo.readyPeerCount,
+                from->getId());
             printResult(local, info, completedSessions);
             pathOk = pathOk && pathMatches(info.path, expected);
             std::printf("AY_P2P_SESSION local=%s remote=%s phase=complete index=%u\n",
@@ -474,6 +495,7 @@ int runHost(const PeerId& local,
         printSignalingStatus(local, signaling, "host-session-timeout");
         return 3;
     }
+    if (!rosterOk) return 12;
     return pathOk ? 0 : 7;
 }
 
@@ -521,6 +543,32 @@ bool runJoinSession(const PeerId& local, const PeerId& remote,
     }
     std::printf("AY_P2P_SESSION local=%s remote=%s phase=connected index=%u\n",
                 local.value.c_str(), remote.value.c_str(), session);
+
+    const auto sessionInfo = network.getP2PSessionInfo();
+    const auto peers = network.getP2PPeers();
+    const auto peerIt = std::find_if(
+        peers.begin(), peers.end(), [&](const P2PPeerInfo& peer) {
+            return peer.peerId == remote && peer.state == P2PPeerState::Ready;
+        });
+    const bool sessionViewOk =
+        sessionInfo.role == P2PSessionRole::Client &&
+        sessionInfo.state == P2PSessionState::Active &&
+        sessionInfo.hostPeerId == remote && sessionInfo.readyPeerCount == 1 &&
+        peerIt != peers.end() && peerIt->isSessionHost &&
+        network.findP2PPeer(remote) == network.getConnection();
+    std::printf(
+        "AY_P2P_SESSION_VIEW local=%s remote=%s session=%u role=client "
+        "roster=%s ready_peers=%zu connection_id=%u\n",
+        local.value.c_str(), remote.value.c_str(), session,
+        sessionViewOk ? "ok" : "invalid", sessionInfo.readyPeerCount,
+        peerIt == peers.end() ? 0u : peerIt->connectionId);
+    if (!sessionViewOk) {
+        std::fprintf(stderr,
+                     "AY_P2P_FAILURE local=%s remote=%s phase=session-roster\n",
+                     local.value.c_str(), remote.value.c_str());
+        failureCode = 12;
+        return false;
+    }
 
     const int32_t authorityValue = static_cast<int32_t>(9000 + session);
     const void* rpcArgs[1] = {&authorityValue};

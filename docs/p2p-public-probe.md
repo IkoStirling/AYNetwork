@@ -69,9 +69,15 @@ Success includes these machine-readable records:
 
 ```text
 AY_P2P_ENGINE ... handshake=ok rpc=ok replication=ok
+AY_P2P_SESSION_VIEW ... role=host|client roster=ok ready_peers=...
 AY_P2P_QUALITY ... loss_pct=... rtt_p50_ms=... rtt_p95_ms=... jitter_ms=...
 AY_P2P_RESULT ... path=direct ...
 ```
+
+`roster=ok` verifies that the connected `PeerId` resolves to the same live
+`NetConnection`, that the session role/state is correct, and that the peer is
+visible as Ready. Exit code 12 means this engine-session view was inconsistent
+even if ICE itself connected.
 
 For two connection cycles from the same Join process, set
 `AY_P2P_RECONNECTS=1` on Join and `AY_P2P_EXPECT_SESSIONS=2` on Host. For

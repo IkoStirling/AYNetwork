@@ -85,6 +85,12 @@ AYNetwork_P2PSmokePeer join smoke-client smoke-host 127.0.0.1 28080 17
 和期望 direct 路径，用于两个真实 NAT 网络间的自动化门禁，见
 [docs/p2p-public-probe.md](docs/p2p-public-probe.md)。
 
+会话层 v1 提供后端无关的本地视图：`getP2PSessionInfo()` 查询 Host/Client 与
+Hosting/Connecting/Active 状态，`getP2PPeers()` 返回按 PeerId 稳定排序的远端
+成员，`findP2PPeer()` / `disconnectP2PPeer()` 用 PeerId 定位或移除连接。断线
+原因通过 GNS 应用码跨端传递，因此 `UserQuit`、`Kicked`、`HostShutdown` 与真实
+链路丢失可以被游戏逻辑可靠区分。
+
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。
 

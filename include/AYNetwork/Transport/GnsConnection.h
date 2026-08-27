@@ -190,7 +190,8 @@ public:
     // the peer echoes kMsgTypeAppAck on CHANNEL_ACK.
     int  sendRequireAck(uint16_t msgType, uint8_t channel, const void* data, size_t len,
                         AckTracker::Callback onAck = nullptr);
-    void disconnect(const char* reason = nullptr);
+    void disconnect(const char* reason = nullptr,
+                    DisconnectReason code = DisconnectReason::UserQuit);
 
     // ===== State / info =====
     GnsConnectionState getState() const { return _state; }
@@ -229,8 +230,8 @@ public:
     TransportFaultInterceptor* getFaultInterceptor(); // lazy-creates
 
     // R1 done: reason for the last disconnect (Unknown if none / not yet).
-    // After a peer-initiated disconnect this carries the wire-encoded
-    // DisconnectReason; for local-initiated disconnect it's Unknown.
+    // Application reasons are carried in GNS's reserved 1xxx range and
+    // decoded on the remote endpoint. System failures map to ConnectionLost.
     DisconnectReason getLastDisconnectReason() const { return _lastDisconnectReason; }
 
     // ===== Callback registration =====
@@ -250,7 +251,7 @@ public:
     static HSteamNetPollGroup       s_pollGroup;
 
     // GNS state -> our state mapping. Called from gns_status_callback.
-    void handleStatusChange(int oldGnsState, int newGnsState);
+    void handleStatusChange(int oldGnsState, int newGnsState, int endReason);
 
     // R1 done: receive-side handshake parser. Called from update() when
     // data arrives on a Handshaking/Connected conn. If the bytes look

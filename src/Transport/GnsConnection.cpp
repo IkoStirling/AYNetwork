@@ -87,6 +87,30 @@ static std::recursive_mutex registryMutex;
 static std::mutex pumpMutex;
 static thread_local bool insidePump = false;
 
+// GNS reserves 1000..1999 for normal application disconnects. Keep AYNetwork
+// in a small private sub-range so the remote endpoint can recover the stable
+// DisconnectReason enum instead of collapsing every graceful close into
+// ConnectionLost.
+constexpr int kAyDisconnectReasonBase = k_ESteamNetConnectionEnd_App_Min + 100;
+
+static int encodeDisconnectReason(DisconnectReason reason) {
+    const int value = static_cast<int>(reason);
+    if (value <= static_cast<int>(DisconnectReason::Unknown) ||
+        value > static_cast<int>(DisconnectReason::ConnectionLost)) {
+        return k_ESteamNetConnectionEnd_App_Generic;
+    }
+    return kAyDisconnectReasonBase + value;
+}
+
+static DisconnectReason decodeDisconnectReason(int reason) {
+    const int value = reason - kAyDisconnectReasonBase;
+    if (value <= static_cast<int>(DisconnectReason::Unknown) ||
+        value > static_cast<int>(DisconnectReason::ConnectionLost)) {
+        return DisconnectReason::Unknown;
+    }
+    return static_cast<DisconnectReason>(value);
+}
+
 static void gns_status_callback(SteamNetConnectionStatusChangedCallback_t* info) {
     if (!info) return;
 
@@ -148,7 +172,8 @@ static void gns_status_callback(SteamNetConnectionStatusChangedCallback_t* info)
                   info->m_hConn, info->m_eOldState, info->m_info.m_eState);
         return;
     }
-    owner->handleStatusChange(info->m_eOldState, info->m_info.m_eState);
+    owner->handleStatusChange(info->m_eOldState, info->m_info.m_eState,
+                              info->m_info.m_eEndReason);
 }
 
 namespace gns
@@ -1147,7 +1172,7 @@ void GnsConnection::runMaintenance(uint32_t monotonicNowMs) {
     _assembler.reapExpired(monotonicNowMs);
 }
 
-void GnsConnection::disconnect(const char* reason) {
+void GnsConnection::disconnect(const char* reason, DisconnectReason code) {
     if (!s_gns) return;
     if (_state == GnsConnectionState::Disconnected) return;
 
@@ -1158,17 +1183,15 @@ void GnsConnection::disconnect(const char* reason) {
             std::lock_guard<std::recursive_mutex> lk(registryMutex);
             connMap().erase(_conn);
         }
-        // R1 done: local-initiated disconnect reports UserQuit. R2 will
-        // add a richer API to specify the reason.
-        if (_lastDisconnectReason == DisconnectReason::Unknown) {
-            _lastDisconnectReason = DisconnectReason::UserQuit;
-        }
+        _lastDisconnectReason = code == DisconnectReason::Unknown
+            ? DisconnectReason::UserQuit : code;
         // Ask GNS to push queued reliable frames before closing. Keeping the
         // connection in GNS linger state is unsafe here because this wrapper
         // intentionally releases its handle synchronously; the close itself
         // still carries the reason to a reachable peer.
         (void)s_gns->FlushMessagesOnConnection(_conn);
-        s_gns->CloseConnection(_conn, 0, reason, false);
+        s_gns->CloseConnection(_conn, encodeDisconnectReason(_lastDisconnectReason),
+                               reason, false);
         _conn = k_HSteamNetConnection_Invalid;
     }
     if (_listen != k_HSteamListenSocket_Invalid) {
@@ -1265,7 +1288,8 @@ void GnsConnection::setState(GnsConnectionState newState) {
     }
 }
 
-void GnsConnection::handleStatusChange(int /*oldGnsState*/, int newGnsState) {
+void GnsConnection::handleStatusChange(int /*oldGnsState*/, int newGnsState,
+                                       int endReason) {
     switch (newGnsState) {
         case k_ESteamNetworkingConnectionState_Connected: {
             // Custom-signaling P2P can deliver and complete the protocol
@@ -1293,14 +1317,16 @@ void GnsConnection::handleStatusChange(int /*oldGnsState*/, int newGnsState) {
         }
         case k_ESteamNetworkingConnectionState_ClosedByPeer:
         case k_ESteamNetworkingConnectionState_ProblemDetectedLocally: {
-            // R1 done: capture the reason into _lastDisconnectReason so the
-            // state-change callback / subsystem can surface it.
-            // GNS doesn't carry a structured reason; we infer:
-            //   ProblemDetectedLocally -> ConnectionLost
-            //   ClosedByPeer            -> ConnectionLost (peer walked away)
-            // The wire-encoded reason (REJECT during handshake) is captured
-            // separately in _handleHandshake() and overrides this.
-            _lastDisconnectReason = DisconnectReason::ConnectionLost;
+            // Graceful peer closes carry AYNetwork's code in GNS's 1xxx app
+            // range. Transport/system failures have no AY code and remain
+            // ConnectionLost. A handshake REJECT may already have installed
+            // the more specific ProtocolMismatch reason, which we preserve.
+            const DisconnectReason remoteReason = decodeDisconnectReason(endReason);
+            if (remoteReason != DisconnectReason::Unknown) {
+                _lastDisconnectReason = remoteReason;
+            } else if (_lastDisconnectReason == DisconnectReason::Unknown) {
+                _lastDisconnectReason = DisconnectReason::ConnectionLost;
+            }
             setState(GnsConnectionState::Disconnecting);
             if (s_gns && _conn != k_HSteamNetConnection_Invalid) {
                 s_gns->CloseConnection(_conn, 0, "peer closed", false);

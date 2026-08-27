@@ -139,10 +139,8 @@ TEST_CASE(HandshakeVersionMismatch) {
     gns::shutdown();
 }
 
-// R1 done (2026-07-27): peer-initiated disconnect propagates the reason.
-// Server disconnects after handshake; client sees connected=false and
-// reason=ConnectionLost (because the local peer closed the connection from
-// the GNS ProblemDetectedLocally / ClosedByPeer path).
+// Session lifecycle: an application disconnect reason is encoded in GNS's
+// reserved 1xxx range and recovered by the remote endpoint.
 TEST_CASE(DisconnectReasonOnPeerClose) {
     ayt::test::setCurrentCase("DisconnectReasonOnPeerClose");
 
@@ -183,7 +181,7 @@ TEST_CASE(DisconnectReasonOnPeerClose) {
     CHECK(ready);
 
     // Server drops.
-    server.disconnect("server going away");
+    server.disconnect("server going away", DisconnectReason::HostShutdown);
 
     // Wait for the client to fire its state change with connected=false.
     bool fired = pumpUntil(client, server, std::chrono::seconds(5), [&] {
@@ -191,11 +189,7 @@ TEST_CASE(DisconnectReasonOnPeerClose) {
     }, "client onStateChange fired");
     CHECK(fired);
     CHECK(!lastConnected.load());
-    // Server-initiated disconnect reports HostShutdown on the server side.
-    // On the *client* side, GNS signals ProblemDetectedLocally because the
-    // remote peer closed — so client sees ConnectionLost.
-    CHECK(lastReason == DisconnectReason::ConnectionLost ||
-          lastReason == DisconnectReason::Unknown);  // allow either if GNS races
+    CHECK(lastReason == DisconnectReason::HostShutdown);
 
     client.disconnect("test done");
     gns::shutdown();
