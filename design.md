@@ -1812,10 +1812,33 @@ signaling relay and does not introduce a new wire message.
   host and client in addition to ICE, handshake, RPC, replication, and quality
   checks.
 
-Deferred after v1: authoritative lobby membership, join tickets, ready/load
-barriers, host election/migration, and hostless consensus. Those require an
-account/session service or a new session wire protocol and are not inferred
-from the signaling relay's transient endpoint table.
+### 15.17 Authority session admission and ready barrier (2026-08-27)
+
+The second session-layer increment adds an engine-owned control protocol over
+the encrypted GNS connection. The rendezvous server remains a stateless opaque
+signal forwarder and never evaluates gameplay membership.
+
+- `SessionJoinRequest` carries an opaque ticket of at most 1024 bytes. The Host
+  evaluates it through `setP2PJoinValidator`; no validator means explicit
+  development-compatible auto-admission.
+- `SessionJoinResult` returns an accepted bit or a typed reason (`MissingTicket`,
+  `InvalidTicket`, `SessionFull`, `SessionClosed`, `MalformedRequest`). A denied
+  transport closes with public `DisconnectReason::AdmissionRejected`.
+- Before admission, application messages, RPC, replication, connection-list
+  publication, and public connected callbacks are gated. Session-control frames
+  are the only accepted traffic.
+- `SessionReadyState` is Client to Host. The Host computes a barrier over itself
+  plus all admitted live peers and broadcasts `revision/ready/total/open`.
+  Revision advances on membership or ready-state changes; stale Client updates
+  are ignored.
+- The public probe now requires admission and `ready == total && open` before
+  testing RPC, replication, or application traffic. A wrong ticket is verified
+  to close with application reason 1107 (`AdmissionRejected`).
+
+Deferred after this increment: account-service ticket issuance/cryptographic
+verification policy, lobby directory metadata, reconnect reservation, host
+election/migration, and hostless consensus. None is inferred from the signaling
+relay's transient endpoint table.
 
 ---
 

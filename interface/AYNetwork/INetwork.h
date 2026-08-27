@@ -131,6 +131,7 @@ enum class DisconnectReason : uint8_t {
     ProtocolMismatch     = 4,    // handshake rejected (version, etc.)
     HostShutdown         = 5,    // Server shutting down
     ConnectionLost       = 6,    // Network error / GNS ProblemDetectedLocally
+    AdmissionRejected    = 7,    // P2P session join ticket/admission denied
 };
 
 // =============================================================================
@@ -211,6 +212,13 @@ constexpr uint16_t kMsgTypeAppAck       = 0x0013;
 // AYNetwork/Prediction/ClientInputCodec.h. Sent client → server over
 // CHANNEL_UNRELIABLE for input traffic (loss tolerated; server reconciles).
 constexpr uint16_t kMsgTypeClientInput  = 0x0014;
+
+// P2P authority-session control. These frames travel inside the established
+// encrypted GNS connection and are never interpreted by the signaling relay.
+constexpr uint16_t kMsgTypeSessionJoinRequest = 0x0020;
+constexpr uint16_t kMsgTypeSessionJoinResult  = 0x0021;
+constexpr uint16_t kMsgTypeSessionReadyState  = 0x0022;
+constexpr uint16_t kMsgTypeSessionBarrier     = 0x0023;
 
 // R2: schema version stamped into every PacketHeader. Bump on breaking
 // wire-format changes (rare; major version bumps imply a parallel header
@@ -298,6 +306,16 @@ public:
                                    const char* reason = nullptr) {
         (void)peer; (void)reason; return false;
     }
+    using P2PJoinValidator = std::function<P2PJoinDecision(
+        const PeerId& peer, const uint8_t* ticket, size_t ticketSize)>;
+    virtual bool setP2PJoinTicket(const void* ticket, size_t size) {
+        (void)ticket; (void)size; return false;
+    }
+    virtual void setP2PJoinValidator(P2PJoinValidator validator) {
+        (void)validator;
+    }
+    virtual bool setP2PLocalReady(bool ready) { (void)ready; return false; }
+    virtual P2PReadyBarrierInfo getP2PReadyBarrierInfo() const { return {}; }
 
     // Must be configured before connect()/listen().  The production default
     // is kProtocolVersion; version 0 is an explicit legacy/test opt-out.

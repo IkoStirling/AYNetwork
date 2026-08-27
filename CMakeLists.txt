@@ -12,6 +12,7 @@ set(SRC_FILES
     src/Transport/UdpSocket.cpp
     src/Signaling/UdpSignaling.cpp
     src/Signaling/SecureUdpSignaling.cpp
+    src/Session/P2PSessionProtocol.cpp
     src/Protocol/PacketAssembler.cpp
     src/Protocol/PacketCodec.cpp
     src/Protocol/AckPipeline.cpp
@@ -111,6 +112,7 @@ target_include_directories(${MODULE_NAME} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Transport        # R5.4 (2026-08-25): TransportFault* headers are implementation-detail
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Session
 )
 
 # 协议支持选项

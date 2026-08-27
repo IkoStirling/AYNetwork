@@ -7,6 +7,7 @@
 #include <AYTest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -263,11 +264,21 @@ TEST_CASE(SubsystemConfiguresAndStartsP2PRoute) {
         CHECK(session.state == P2PSessionState::Hosting);
         CHECK(session.hostPeerId == config.localPeerId);
         CHECK(network->getP2PPeers().empty());
+        const auto barrier = network->getP2PReadyBarrierInfo();
+        CHECK_INT_EQ(barrier.totalMemberCount, 1);
+        CHECK_INT_EQ(barrier.readyMemberCount, 0);
+        CHECK(!barrier.open);
     }
+    CHECK(network->setP2PLocalReady(true));
+    CHECK(network->getP2PReadyBarrierInfo().open);
     network->disconnect();
     CHECK(!network->isListening());
 
     const PeerId remote{"p2p-test-remote"};
+    const std::array<uint8_t, 4> ticket{0xde, 0xad, 0xbe, 0xef};
+    CHECK(network->setP2PJoinTicket(ticket.data(), ticket.size()));
+    std::vector<uint8_t> oversizedTicket(kP2PMaxJoinTicketBytes + 1, 0);
+    CHECK(!network->setP2PJoinTicket(oversizedTicket.data(), oversizedTicket.size()));
     CHECK(network->connectP2P(remote));
     {
         const P2PSessionInfo session = network->getP2PSessionInfo();
@@ -279,6 +290,7 @@ TEST_CASE(SubsystemConfiguresAndStartsP2PRoute) {
         CHECK(peers.front().peerId == remote);
         CHECK(peers.front().state == P2PPeerState::Connecting);
         CHECK(peers.front().isSessionHost);
+        CHECK(!peers.front().admitted);
         CHECK(peers.front().connectionId != 0);
         CHECK(network->findP2PPeer(remote) == network->getConnection());
     }

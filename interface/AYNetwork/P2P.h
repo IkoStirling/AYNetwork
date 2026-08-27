@@ -62,6 +62,38 @@ enum class P2PSessionState : uint8_t {
     Hosting = 2,
     Connecting = 3,
     Active = 4,
+    Joining = 5,
+};
+
+enum class P2PAdmissionState : uint8_t {
+    NotRequired = 0,
+    Pending = 1,
+    Admitted = 2,
+    Rejected = 3,
+};
+
+enum class P2PJoinRejectReason : uint8_t {
+    None = 0,
+    MissingTicket = 1,
+    InvalidTicket = 2,
+    SessionFull = 3,
+    SessionClosed = 4,
+    MalformedRequest = 5,
+};
+
+constexpr size_t kP2PMaxJoinTicketBytes = 1024;
+
+struct P2PJoinDecision {
+    bool accepted = false;
+    P2PJoinRejectReason reason = P2PJoinRejectReason::InvalidTicket;
+
+    static P2PJoinDecision accept() {
+        return {true, P2PJoinRejectReason::None};
+    }
+    static P2PJoinDecision reject(P2PJoinRejectReason why) {
+        return {false, why == P2PJoinRejectReason::None
+            ? P2PJoinRejectReason::InvalidTicket : why};
+    }
 };
 
 enum class P2PPeerState : uint8_t {
@@ -126,6 +158,15 @@ struct P2PPeerInfo {
     std::string remoteAddress;
     int pingMs = -1;
     bool isSessionHost = false;
+    bool admitted = false;
+};
+
+struct P2PReadyBarrierInfo {
+    uint32_t revision = 0;
+    size_t readyMemberCount = 0;
+    size_t totalMemberCount = 0;
+    bool localReady = false;
+    bool open = false;
 };
 
 struct P2PSessionInfo {
@@ -135,6 +176,8 @@ struct P2PSessionInfo {
     PeerId hostPeerId;
     uint16_t virtualPort = 0;
     size_t readyPeerCount = 0;
+    P2PAdmissionState admission = P2PAdmissionState::NotRequired;
+    P2PJoinRejectReason rejectionReason = P2PJoinRejectReason::None;
 };
 
 // Signaling carries opaque GNS rendezvous blobs.  Implementations may use the

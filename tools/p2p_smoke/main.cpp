@@ -40,6 +40,8 @@ struct ProbeOptions {
     uint32_t hostTimeoutSeconds = 60;
     uint32_t expectedSessions = 1;
     uint32_t reconnects = 0;
+    std::string joinTicket;
+    std::string expectedJoinTicket;
 };
 
 struct ProbeStats {
@@ -259,6 +261,14 @@ bool makeP2PConfig(const PeerId& local, uint16_t virtualPort,
 
 bool makeProbeOptions(ProbeOptions& options) {
     uint32_t seconds = 0;
+    if (const char* ticket = std::getenv("AY_P2P_JOIN_TICKET")) {
+        options.joinTicket = ticket;
+    }
+    if (const char* expected = std::getenv("AY_P2P_EXPECT_JOIN_TICKET")) {
+        options.expectedJoinTicket = expected;
+    }
+    if (options.joinTicket.size() > kP2PMaxJoinTicketBytes ||
+        options.expectedJoinTicket.size() > kP2PMaxJoinTicketBytes) return false;
     return envUnsigned("AY_P2P_PROBE_SECONDS", 0, 0, 3600, seconds) &&
            envUnsigned("AY_P2P_PROBE_INTERVAL_MS", 100, 10, 60000, options.intervalMs) &&
            envUnsigned("AY_P2P_PROBE_REPLY_WAIT_MS", 2000, 100, 30000, options.replyWaitMs) &&
@@ -421,6 +431,20 @@ int runHost(const PeerId& local,
     network.getReplicationManager()->registerObject(
         &authorityState, probeType, kProbeNetId);
 
+    if (!options.expectedJoinTicket.empty()) {
+        network.setP2PJoinValidator(
+            [expected = options.expectedJoinTicket](
+                const PeerId&, const uint8_t* ticket, size_t ticketSize) {
+                if (ticketSize == 0) {
+                    return P2PJoinDecision::reject(P2PJoinRejectReason::MissingTicket);
+                }
+                const bool matches = ticketSize == expected.size() &&
+                    std::memcmp(ticket, expected.data(), ticketSize) == 0;
+                return matches ? P2PJoinDecision::accept() :
+                    P2PJoinDecision::reject(P2PJoinRejectReason::InvalidTicket);
+            });
+    }
+
     network.onConnectionChange([&](NetConnection* connection, bool connected,
                                     DisconnectReason reason) {
         const auto info = network.getP2PConnectionInfo(connection);
@@ -457,12 +481,17 @@ int runHost(const PeerId& local,
                            peer.connectionId == from->getId();
                 });
             const auto sessionInfo = network.getP2PSessionInfo();
+            const auto barrier = network.getP2PReadyBarrierInfo();
             const bool sessionViewOk =
                 network.findP2PPeer(info.remotePeerId) == from &&
                 peerIt != peers.end() && peerIt->state == P2PPeerState::Ready &&
+                peerIt->admitted &&
                 sessionInfo.role == P2PSessionRole::Host &&
                 sessionInfo.state == P2PSessionState::Active &&
-                sessionInfo.hostPeerId == local && sessionInfo.readyPeerCount >= 1;
+                sessionInfo.hostPeerId == local && sessionInfo.readyPeerCount >= 1 &&
+                barrier.open && barrier.localReady &&
+                barrier.readyMemberCount == barrier.totalMemberCount &&
+                barrier.totalMemberCount >= 2;
             rosterOk = rosterOk && sessionViewOk;
             std::printf(
                 "AY_P2P_SESSION_VIEW local=%s remote=%s session=%u role=host "
@@ -470,6 +499,14 @@ int runHost(const PeerId& local,
                 local.value.c_str(), info.remotePeerId.value.c_str(), completedSessions,
                 sessionViewOk ? "ok" : "invalid", sessionInfo.readyPeerCount,
                 from->getId());
+            std::printf(
+                "AY_P2P_ADMISSION local=%s remote=%s session=%u state=admitted ticket=accepted\n",
+                local.value.c_str(), info.remotePeerId.value.c_str(), completedSessions);
+            std::printf(
+                "AY_P2P_BARRIER local=%s session=%u revision=%u ready=%zu total=%zu open=%s\n",
+                local.value.c_str(), completedSessions, barrier.revision,
+                barrier.readyMemberCount, barrier.totalMemberCount,
+                barrier.open ? "true" : "false");
             printResult(local, info, completedSessions);
             pathOk = pathOk && pathMatches(info.path, expected);
             std::printf("AY_P2P_SESSION local=%s remote=%s phase=complete index=%u\n",
@@ -483,6 +520,11 @@ int runHost(const PeerId& local,
     if (!network.listenP2P()) {
         printSignalingStatus(local, signaling, "listen-route-failed");
         return 9;
+    }
+    if (!network.setP2PLocalReady(true)) {
+        std::fprintf(stderr, "AY_P2P_FAILURE local=%s phase=host-ready\n",
+                     local.value.c_str());
+        return 14;
     }
     std::printf("AY_P2P_HOST_READY local=%s vport=%u protocol=%u expected_sessions=%u\n",
                 local.value.c_str(), config.virtualPort,
@@ -525,14 +567,41 @@ bool runJoinSession(const PeerId& local, const PeerId& remote,
     network.onMessage(CHANNEL_UNRELIABLE, receiveProbe);
     network.onMessage(CHANNEL_RELIABLE, receiveProbe);
 
+    if (!network.setP2PJoinTicket(options.joinTicket.data(),
+                                  options.joinTicket.size())) {
+        std::fprintf(stderr,
+                     "AY_P2P_FAILURE local=%s remote=%s phase=join-ticket\n",
+                     local.value.c_str(), remote.value.c_str());
+        failureCode = 13;
+        return false;
+    }
+
     if (!network.connectP2P(remote)) {
         printSignalingStatus(local, signaling, "connect-start-failed");
         failureCode = 4;
         return false;
     }
+    if (!network.setP2PLocalReady(true)) {
+        std::fprintf(stderr,
+                     "AY_P2P_FAILURE local=%s remote=%s phase=client-ready\n",
+                     local.value.c_str(), remote.value.c_str());
+        failureCode = 14;
+        return false;
+    }
     const auto connectDeadline = Clock::now() + std::chrono::seconds(30);
     while (!network.isConnected() && !disconnected && Clock::now() < connectDeadline) pump(network);
     if (!network.isConnected()) {
+        const auto rejectedSession = network.getP2PSessionInfo();
+        if (disconnectReason == DisconnectReason::AdmissionRejected ||
+            rejectedSession.admission == P2PAdmissionState::Rejected) {
+            std::fprintf(stderr,
+                         "AY_P2P_FAILURE local=%s remote=%s phase=admission-rejected "
+                         "reason=%u\n",
+                         local.value.c_str(), remote.value.c_str(),
+                         static_cast<unsigned>(rejectedSession.rejectionReason));
+            failureCode = 13;
+            return false;
+        }
         std::fprintf(stderr,
                      "AY_P2P_FAILURE local=%s remote=%s phase=ice-connect reason=%u\n",
                      local.value.c_str(), remote.value.c_str(),
@@ -544,6 +613,31 @@ bool runJoinSession(const PeerId& local, const PeerId& remote,
     std::printf("AY_P2P_SESSION local=%s remote=%s phase=connected index=%u\n",
                 local.value.c_str(), remote.value.c_str(), session);
 
+    const auto barrierDeadline = Clock::now() + std::chrono::seconds(10);
+    while (!network.getP2PReadyBarrierInfo().open && network.isConnected() &&
+           Clock::now() < barrierDeadline) pump(network);
+    const auto barrier = network.getP2PReadyBarrierInfo();
+    if (!barrier.open || !barrier.localReady ||
+        barrier.readyMemberCount != barrier.totalMemberCount ||
+        barrier.totalMemberCount < 2) {
+        std::fprintf(stderr,
+                     "AY_P2P_FAILURE local=%s remote=%s phase=ready-barrier "
+                     "revision=%u ready=%zu total=%zu open=%u\n",
+                     local.value.c_str(), remote.value.c_str(), barrier.revision,
+                     barrier.readyMemberCount, barrier.totalMemberCount,
+                     barrier.open ? 1u : 0u);
+        failureCode = 14;
+        return false;
+    }
+    std::printf(
+        "AY_P2P_ADMISSION local=%s remote=%s session=%u state=admitted ticket=%s\n",
+        local.value.c_str(), remote.value.c_str(), session,
+        options.joinTicket.empty() ? "empty" : "accepted");
+    std::printf(
+        "AY_P2P_BARRIER local=%s session=%u revision=%u ready=%zu total=%zu open=true\n",
+        local.value.c_str(), session, barrier.revision,
+        barrier.readyMemberCount, barrier.totalMemberCount);
+
     const auto sessionInfo = network.getP2PSessionInfo();
     const auto peers = network.getP2PPeers();
     const auto peerIt = std::find_if(
@@ -554,7 +648,8 @@ bool runJoinSession(const PeerId& local, const PeerId& remote,
         sessionInfo.role == P2PSessionRole::Client &&
         sessionInfo.state == P2PSessionState::Active &&
         sessionInfo.hostPeerId == remote && sessionInfo.readyPeerCount == 1 &&
-        peerIt != peers.end() && peerIt->isSessionHost &&
+        sessionInfo.admission == P2PAdmissionState::Admitted &&
+        peerIt != peers.end() && peerIt->isSessionHost && peerIt->admitted &&
         network.findP2PPeer(remote) == network.getConnection();
     std::printf(
         "AY_P2P_SESSION_VIEW local=%s remote=%s session=%u role=client "
@@ -683,7 +778,8 @@ int main(int argc, char** argv) {
             "env: AY_P2P_SIGNAL_ROOM/TOKEN, AY_P2P_ICE_POLICY, AY_P2P_STUN, AY_P2P_TURN,\n"
             "     AY_P2P_TURN_USER/PASS, AY_P2P_ALLOW_PRIVATE, AY_P2P_EXPECT_PATH,\n"
             "     AY_P2P_PROBE_SECONDS/INTERVAL_MS/REPLY_WAIT_MS, AY_P2P_RECONNECTS,\n"
-            "     AY_P2P_EXPECT_SESSIONS, AY_P2P_HOST_TIMEOUT_SECONDS\n");
+            "     AY_P2P_EXPECT_SESSIONS, AY_P2P_HOST_TIMEOUT_SECONDS,\n"
+            "     AY_P2P_JOIN_TICKET (join), AY_P2P_EXPECT_JOIN_TICKET (host)\n");
         return 2;
     }
     const bool host = std::strcmp(argv[1], "host") == 0;

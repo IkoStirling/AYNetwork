@@ -49,6 +49,24 @@ AY_P2P_PROBE_SECONDS=60
 AY_P2P_PROBE_INTERVAL_MS=100
 ```
 
+The signaling token above authenticates access to the rendezvous room. It is
+not the gameplay-session join ticket. To exercise Host-authoritative admission,
+set the same opaque test value using different variable names:
+
+```text
+# Host only
+AY_P2P_EXPECT_JOIN_TICKET=<temporary-session-ticket>
+
+# Join only
+AY_P2P_JOIN_TICKET=<temporary-session-ticket>
+```
+
+In an actual game, the account/matchmaking service supplies the opaque Join
+ticket and the Host validator checks it. The built-in probe compares text only;
+that comparison is a test harness, not a production ticket issuer. If the Host
+does not install a validator, AYNetwork intentionally auto-admits for local
+development compatibility.
+
 Run the host first:
 
 ```text
@@ -69,6 +87,8 @@ Success includes these machine-readable records:
 
 ```text
 AY_P2P_ENGINE ... handshake=ok rpc=ok replication=ok
+AY_P2P_ADMISSION ... state=admitted ticket=accepted
+AY_P2P_BARRIER ... ready=2 total=2 open=true
 AY_P2P_SESSION_VIEW ... role=host|client roster=ok ready_peers=...
 AY_P2P_QUALITY ... loss_pct=... rtt_p50_ms=... rtt_p95_ms=... jitter_ms=...
 AY_P2P_RESULT ... path=direct ...
@@ -76,8 +96,11 @@ AY_P2P_RESULT ... path=direct ...
 
 `roster=ok` verifies that the connected `PeerId` resolves to the same live
 `NetConnection`, that the session role/state is correct, and that the peer is
-visible as Ready. Exit code 12 means this engine-session view was inconsistent
-even if ICE itself connected.
+visible as Ready and admitted. Exit code 12 means this engine-session view was
+inconsistent even if ICE itself connected. Exit code 13 is a join-ticket or
+admission failure; exit code 14 means all admitted members did not reach the
+Ready barrier. Application/RPC/replication probing starts only after admission
+and the barrier opens.
 
 For two connection cycles from the same Join process, set
 `AY_P2P_RECONNECTS=1` on Join and `AY_P2P_EXPECT_SESSIONS=2` on Host. For
@@ -93,6 +116,8 @@ Run at least these gates before calling a release internet-ready:
 | Public direct | `direct`, STUN set, private disabled | `path=direct` |
 | Signaling auth | invalid/expired peer token | registration fails |
 | Room isolation | target in another room | signal rejected |
+| Session admission | wrong/missing gameplay Join ticket | reason `AdmissionRejected` |
+| Ready barrier | Host + Join set local Ready | `ready=2 total=2 open=true` |
 | Reconnect | Join reconnects with the same PeerId | stale Host route is replaced |
 | Sustained path | 60 seconds, 100 ms interval | engine/quality/result all pass |
 

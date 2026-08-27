@@ -96,7 +96,7 @@ constexpr int kAyDisconnectReasonBase = k_ESteamNetConnectionEnd_App_Min + 100;
 static int encodeDisconnectReason(DisconnectReason reason) {
     const int value = static_cast<int>(reason);
     if (value <= static_cast<int>(DisconnectReason::Unknown) ||
-        value > static_cast<int>(DisconnectReason::ConnectionLost)) {
+        value > static_cast<int>(DisconnectReason::AdmissionRejected)) {
         return k_ESteamNetConnectionEnd_App_Generic;
     }
     return kAyDisconnectReasonBase + value;
@@ -105,7 +105,7 @@ static int encodeDisconnectReason(DisconnectReason reason) {
 static DisconnectReason decodeDisconnectReason(int reason) {
     const int value = reason - kAyDisconnectReasonBase;
     if (value <= static_cast<int>(DisconnectReason::Unknown) ||
-        value > static_cast<int>(DisconnectReason::ConnectionLost)) {
+        value > static_cast<int>(DisconnectReason::AdmissionRejected)) {
         return DisconnectReason::Unknown;
     }
     return static_cast<DisconnectReason>(value);

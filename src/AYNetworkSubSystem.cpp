@@ -8,6 +8,7 @@
 #include <AYNetwork/Protocol/PacketCodec.h>
 #include <AYNetwork/RPC/RpcHandler.h>
 #include <AYNetwork/Transport/NetConnectionImpl.h>
+#include "Session/P2PSessionProtocol.h"
 // R5.3 (2026-08-24): Replay wire-tap hooks. Use forward declaration + the
 // foundation interface only so we don't pull NetworkReplayRecorderAdapter.h
 // (which includes INetwork.h → would create a cycle).
@@ -40,6 +41,9 @@ class NetworkSubSystem : public INetworkSubSystem {
         std::unique_ptr<GnsConnection> transport;
         std::unique_ptr<NetConnectionImpl> facade;
         bool extensionDisconnectNotified = false;
+        bool sessionAdmitted = false;
+        bool sessionReady = false;
+        bool connectionPublished = false;
     };
 
     enum class DeferredControlType : uint8_t {
@@ -178,6 +182,12 @@ public:
         _p2pSignaling.reset();
         _p2pConfigured = false;
         _p2pConfig = {};
+        _p2pJoinTicket.clear();
+        _p2pJoinValidator = {};
+        _clientAdmission = P2PAdmissionState::NotRequired;
+        _clientJoinRejection = P2PJoinRejectReason::None;
+        _p2pBarrier = {};
+        _p2pLocalReady = false;
         // R6 C6: single-thread; no lock.
         _simulationInbound.clear();
         _simulationInboundBytes = 0;
@@ -204,9 +214,11 @@ public:
         // changes), so replace the stale route deterministically instead of
         // retaining two authoritative connections for the same peer.
         if (remotePeer) {
+            bool membershipChanged = false;
             for (auto it = _serverClients.begin(); it != _serverClients.end();) {
                 if (it->transport && it->transport->isP2P() &&
                     it->transport->getRemotePeerId() == *remotePeer) {
+                    membershipChanged = membershipChanged || it->sessionAdmitted;
                     it->transport->disconnect("superseded P2P peer session",
                                               DisconnectReason::Kicked);
                     if (_extension && it->facade &&
@@ -219,6 +231,7 @@ public:
                     ++it;
                 }
             }
+            if (membershipChanged) refreshHostBarrier(true);
         }
         if (_serverClients.size() >= _limits.maxConnections) {
             GnsConnection::s_gns->CloseConnection(
@@ -263,43 +276,38 @@ public:
         }
 
         child->onPacket(makePacketHandler(netPtr));
-
-        if (_connectionHandler) {
-            rawChild->onStateChange([this, rawChild, netPtr](GnsConnectionState /*oldS*/,
-                                                             GnsConnectionState newS) {
-                const bool connected = (newS == GnsConnectionState::Ready)
-                    || (newS == GnsConnectionState::Connected
-                        && rawChild->getProtocolVersion() == 0);
-                if (!connected && newS != GnsConnectionState::Disconnected) return;
-                const DisconnectReason reason = connected
-                    ? DisconnectReason::Unknown
-                    : rawChild->getLastDisconnectReason();
-                _connectionHandler(netPtr, connected, reason);
-            });
-            // If handshake finished before the handler was installed, synthesize
-            // the connected callback so late-join rebroadcast is not missed.
-            if (rawChild->isConnected()) {
-                _connectionHandler(netPtr, true, DisconnectReason::Unknown);
-            }
-        } else if (_pendingConnHandler) {
-            rawChild->onStateChange([this, rawChild](GnsConnectionState /*oldS*/,
-                                                     GnsConnectionState newS) {
-                const bool connected = (newS == GnsConnectionState::Ready)
-                    || (newS == GnsConnectionState::Connected
-                        && rawChild->getProtocolVersion() == 0);
-                if (!connected && newS != GnsConnectionState::Disconnected) return;
-                const DisconnectReason reason = connected
-                    ? DisconnectReason::Unknown
-                    : rawChild->getLastDisconnectReason();
-                _pendingConnHandler(connected, reason);
-            });
-        }
-
         GnsConnection* raw = child.get();
         ServerClientRecord record;
         record.transport = std::move(child);
         record.facade = std::move(netConn);
         _serverClients.push_back(std::move(record));
+        rawChild->onStateChange([this, rawChild, netPtr](GnsConnectionState,
+                                                         GnsConnectionState newS) {
+            ServerClientRecord* active = findServerRecord(netPtr);
+            const bool connected = (newS == GnsConnectionState::Ready) ||
+                (newS == GnsConnectionState::Connected &&
+                 rawChild->getProtocolVersion() == 0);
+            if (connected) {
+                // P2P peers become public only after the session JoinRequest
+                // passes the host validator. Legacy IP peers publish at the
+                // transport handshake as before.
+                if (active && !rawChild->isP2P()) publishServerConnection(*active);
+                return;
+            }
+            if (newS != GnsConnectionState::Disconnected || !active) return;
+            if (active->connectionPublished) {
+                const DisconnectReason reason = rawChild->getLastDisconnectReason();
+                if (_connectionHandler) {
+                    _connectionHandler(netPtr, false, reason);
+                } else if (_pendingConnHandler) {
+                    _pendingConnHandler(false, reason);
+                }
+                active->connectionPublished = false;
+            }
+        });
+        if (rawChild->isConnected() && !rawChild->isP2P()) {
+            publishServerConnection(_serverClients.back());
+        }
         ::printf("[Network] accepted incoming client (now %zu clients)\n", _serverClients.size());
         return raw;
     }
@@ -310,8 +318,246 @@ public:
         };
     }
 
+    ServerClientRecord* findServerRecord(NetConnection* connection) {
+        for (auto& record : _serverClients) {
+            if (record.facade.get() == connection) return &record;
+        }
+        return nullptr;
+    }
+
+    const ServerClientRecord* findServerRecord(const NetConnection* connection) const {
+        for (const auto& record : _serverClients) {
+            if (record.facade.get() == connection) return &record;
+        }
+        return nullptr;
+    }
+
+    bool sendSessionControl(GnsConnection* transport, uint16_t messageType,
+                            const std::vector<uint8_t>& body) {
+        if (!transport || !transport->isConnected()) return false;
+        const auto wire = PacketCodec::encode(
+            body.data(), body.size(), messageType, kSchemaVersion,
+            CHANNEL_RELIABLE, 0, 0, false);
+        return transport->sendEncoded(CHANNEL_RELIABLE, wire.data(), wire.size()) == 0;
+    }
+
+    void publishServerConnection(ServerClientRecord& record) {
+        if (record.connectionPublished || !record.facade) return;
+        record.connectionPublished = true;
+        if (_connectionHandler) {
+            _connectionHandler(record.facade.get(), true, DisconnectReason::Unknown);
+        } else if (_pendingConnHandler) {
+            _pendingConnHandler(true, DisconnectReason::Unknown);
+        }
+    }
+
+    void refreshHostBarrier(bool incrementRevision) {
+        if (!_p2pListening) return;
+        if (incrementRevision || _p2pBarrier.revision == 0) {
+            ++_p2pBarrier.revision;
+            if (_p2pBarrier.revision == 0) ++_p2pBarrier.revision;
+        }
+        size_t total = 1;
+        size_t ready = _p2pLocalReady ? 1 : 0;
+        for (const auto& record : _serverClients) {
+            if (!record.sessionAdmitted || !record.transport ||
+                !record.transport->isP2P() || !record.transport->isConnected()) continue;
+            ++total;
+            if (record.sessionReady) ++ready;
+        }
+        _p2pBarrier.totalMemberCount = total;
+        _p2pBarrier.readyMemberCount = ready;
+        _p2pBarrier.localReady = _p2pLocalReady;
+        _p2pBarrier.open = ready == total;
+
+        std::vector<uint8_t> body;
+        session::encodeBarrier(
+            _p2pBarrier.revision,
+            static_cast<uint16_t>(std::min<size_t>(ready, UINT16_MAX)),
+            static_cast<uint16_t>(std::min<size_t>(total, UINT16_MAX)),
+            _p2pBarrier.open, body);
+        for (auto& record : _serverClients) {
+            if (record.sessionAdmitted && record.transport &&
+                record.transport->isP2P()) {
+                (void)sendSessionControl(record.transport.get(),
+                                         kMsgTypeSessionBarrier, body);
+            }
+        }
+    }
+
+    void beginClientAdmission() {
+        if (!_clientConn || !_clientConn->isP2P() || !_clientConn->isConnected()) return;
+        _clientAdmission = P2PAdmissionState::Pending;
+        _clientJoinRejection = P2PJoinRejectReason::None;
+        std::vector<uint8_t> body;
+        if (!session::encodeJoinRequest(
+                _p2pJoinTicket.data(), _p2pJoinTicket.size(), body) ||
+            !sendSessionControl(_clientConn.get(), kMsgTypeSessionJoinRequest, body)) {
+            _clientJoinRejection = P2PJoinRejectReason::MalformedRequest;
+        }
+    }
+
+    void installClientStateHandler() {
+        if (!_clientConn) return;
+        GnsConnection* observed = _clientConn.get();
+        observed->onStateChange(
+            [this, observed](GnsConnectionState, GnsConnectionState newState) {
+                if (_clientConn.get() != observed) return;
+                const bool connected = (newState == GnsConnectionState::Ready) ||
+                    (newState == GnsConnectionState::Connected &&
+                     observed->getProtocolVersion() == 0);
+                if (connected) {
+                    if (observed->isP2P()) {
+                        beginClientAdmission();
+                    } else if (!_clientConnectionPublished) {
+                        _clientConnectionPublished = true;
+                        if (_connectionHandler) {
+                            _connectionHandler(_clientNetConn.get(), true,
+                                               DisconnectReason::Unknown);
+                        }
+                    }
+                    return;
+                }
+                if (newState != GnsConnectionState::Disconnected) return;
+                const DisconnectReason reason = observed->getLastDisconnectReason();
+                if (observed->isP2P() &&
+                    reason == DisconnectReason::AdmissionRejected &&
+                    _clientAdmission != P2PAdmissionState::Rejected) {
+                    // A host may close immediately after its reliable reject
+                    // frame. Preserve a useful public state even when the
+                    // transport close overtakes that frame on the wire.
+                    _clientAdmission = P2PAdmissionState::Rejected;
+                    if (_clientJoinRejection == P2PJoinRejectReason::None) {
+                        _clientJoinRejection = P2PJoinRejectReason::InvalidTicket;
+                    }
+                    _p2pBarrier.open = false;
+                }
+                if (_connectionHandler) {
+                    _connectionHandler(_clientNetConn.get(), false, reason);
+                }
+                _clientConnectionPublished = false;
+            });
+    }
+
+    bool handleSessionControl(NetConnection* from, uint16_t messageType,
+                              const uint8_t* body, size_t size) {
+        switch (messageType) {
+        case kMsgTypeSessionJoinRequest: {
+            ServerClientRecord* record = findServerRecord(from);
+            if (!record || !record->transport || !record->transport->isP2P()) return true;
+            std::vector<uint8_t> ticket;
+            P2PJoinDecision decision;
+            if (!session::decodeJoinRequest(body, size, ticket)) {
+                decision = P2PJoinDecision::reject(
+                    P2PJoinRejectReason::MalformedRequest);
+            } else if (_p2pJoinValidator) {
+                decision = _p2pJoinValidator(
+                    record->transport->getRemotePeerId(), ticket.data(), ticket.size());
+                if (decision.accepted) decision.reason = P2PJoinRejectReason::None;
+                else if (decision.reason == P2PJoinRejectReason::None) {
+                    decision.reason = P2PJoinRejectReason::InvalidTicket;
+                }
+            } else {
+                decision = P2PJoinDecision::accept();
+            }
+
+            std::vector<uint8_t> result;
+            session::encodeJoinResult(decision, result);
+            (void)sendSessionControl(record->transport.get(),
+                                     kMsgTypeSessionJoinResult, result);
+            if (!decision.accepted) {
+                record->transport->disconnect("P2P session admission rejected",
+                                              DisconnectReason::AdmissionRejected);
+                return true;
+            }
+            if (!record->sessionAdmitted) {
+                record->sessionAdmitted = true;
+                record->sessionReady = false;
+                publishServerConnection(*record);
+                refreshHostBarrier(true);
+            } else {
+                refreshHostBarrier(false);
+            }
+            return true;
+        }
+        case kMsgTypeSessionJoinResult: {
+            if (from != _clientNetConn.get() || !_clientConn || !_clientConn->isP2P()) {
+                return true;
+            }
+            P2PJoinDecision decision;
+            if (!session::decodeJoinResult(body, size, decision)) {
+                _clientAdmission = P2PAdmissionState::Rejected;
+                _clientJoinRejection = P2PJoinRejectReason::MalformedRequest;
+                _clientConn->disconnect("malformed P2P join result",
+                                        DisconnectReason::AdmissionRejected);
+                return true;
+            }
+            if (!decision.accepted) {
+                _clientAdmission = P2PAdmissionState::Rejected;
+                _clientJoinRejection = decision.reason;
+                return true;
+            }
+            _clientAdmission = P2PAdmissionState::Admitted;
+            _clientJoinRejection = P2PJoinRejectReason::None;
+            if (!_clientConnectionPublished) {
+                _clientConnectionPublished = true;
+                if (_connectionHandler) {
+                    _connectionHandler(_clientNetConn.get(), true,
+                                       DisconnectReason::Unknown);
+                }
+            }
+            std::vector<uint8_t> readyBody;
+            session::encodeReadyState(_p2pLocalReady, readyBody);
+            (void)sendSessionControl(_clientConn.get(),
+                                     kMsgTypeSessionReadyState, readyBody);
+            return true;
+        }
+        case kMsgTypeSessionReadyState: {
+            ServerClientRecord* record = findServerRecord(from);
+            if (!record || !record->sessionAdmitted) return true;
+            bool ready = false;
+            if (!session::decodeReadyState(body, size, ready)) return true;
+            if (record->sessionReady != ready) {
+                record->sessionReady = ready;
+                refreshHostBarrier(true);
+            } else {
+                refreshHostBarrier(false);
+            }
+            return true;
+        }
+        case kMsgTypeSessionBarrier: {
+            if (from != _clientNetConn.get() ||
+                _clientAdmission != P2PAdmissionState::Admitted) return true;
+            uint32_t revision = 0;
+            uint16_t ready = 0;
+            uint16_t total = 0;
+            bool open = false;
+            if (!session::decodeBarrier(body, size, revision, ready, total, open) ||
+                revision < _p2pBarrier.revision) return true;
+            _p2pBarrier.revision = revision;
+            _p2pBarrier.readyMemberCount = ready;
+            _p2pBarrier.totalMemberCount = total;
+            _p2pBarrier.localReady = _p2pLocalReady;
+            _p2pBarrier.open = open;
+            return true;
+        }
+        default:
+            return false;
+        }
+    }
+
     void dispatchIncoming(NetConnection* from, const PacketHeader& header,
                           const uint8_t* body, size_t len) {
+        if (handleSessionControl(from, header.msgType, body, len)) return;
+        if (_p2pListening) {
+            const ServerClientRecord* record = findServerRecord(from);
+            if (record && record->transport && record->transport->isP2P() &&
+                !record->sessionAdmitted) return;
+        } else if (from == _clientNetConn.get() && _clientConn &&
+                   _clientConn->isP2P() &&
+                   _clientAdmission != P2PAdmissionState::Admitted) {
+            return;
+        }
         const uint8_t channel = header.channel;
         switch (header.msgType) {
             case kMsgTypeRpcRequest:
@@ -564,10 +810,12 @@ public:
     }
 
     void reapDisconnectedClients() {
+        bool p2pMembershipChanged = false;
         auto it = _serverClients.begin();
         while (it != _serverClients.end()) {
             if (!it->transport ||
                 it->transport->getState() == GnsConnectionState::Disconnected) {
+                p2pMembershipChanged = p2pMembershipChanged || it->sessionAdmitted;
                 if (_extension && it->facade &&
                     !it->extensionDisconnectNotified) {
                     _extension->onConnectionDisconnected(it->facade.get());
@@ -578,6 +826,7 @@ public:
                 ++it;
             }
         }
+        if (p2pMembershipChanged) refreshHostBarrier(true);
     }
 
     void clearServerClients(const char* reason,
@@ -591,6 +840,7 @@ public:
             if (record.transport) record.transport->disconnect(reason, code);
         }
         _serverClients.clear();
+        if (_p2pListening) refreshHostBarrier(true);
     }
 
     void processDeferredControl() {
@@ -641,6 +891,10 @@ public:
         _p2pConfig = config;
         _p2pSignaling = std::move(signaling);
         _p2pConfigured = true;
+        _clientAdmission = P2PAdmissionState::NotRequired;
+        _clientJoinRejection = P2PJoinRejectReason::None;
+        _p2pBarrier = {};
+        _p2pLocalReady = false;
         return true;
     }
 
@@ -668,6 +922,9 @@ public:
                 return adoptIncomingClient(incoming, &remotePeer, _p2pConfig.virtualPort);
             })) return false;
         _p2pListening = true;
+        _p2pLocalReady = false;
+        _p2pBarrier = {};
+        refreshHostBarrier(true);
         _mode = ConnectionMode::ListenServer;
         return true;
     }
@@ -695,6 +952,7 @@ public:
             _clientConn.reset();
             _clientNetConn.reset();
         }
+        _p2pLocalReady = false;
         auto transport = std::make_unique<GnsConnection>();
         transport->setProtocolVersion(_protocolVersion);
         if (!transport->initP2PClient(remotePeer, _p2pConfig, _p2pSignaling)) return false;
@@ -704,19 +962,14 @@ public:
         hookGnsConnection(transport.get());
         _clientConn = std::move(transport);
         _clientNetConn = std::make_unique<NetConnectionImpl>(_clientConn.get(), clientNetId);
+        _clientAdmission = P2PAdmissionState::Pending;
+        _clientJoinRejection = P2PJoinRejectReason::None;
+        _clientConnectionPublished = false;
+        _p2pBarrier = {};
+        _p2pBarrier.localReady = _p2pLocalReady;
         _mode = _p2pListening ? ConnectionMode::ListenServer : ConnectionMode::Client;
         installInboundRoutes();
-        if (_connectionHandler) {
-            _clientConn->onStateChange([this](GnsConnectionState, GnsConnectionState newState) {
-                const bool connected = (newState == GnsConnectionState::Ready) ||
-                    (newState == GnsConnectionState::Connected &&
-                     _clientConn->getProtocolVersion() == 0);
-                if (!connected && newState != GnsConnectionState::Disconnected) return;
-                const DisconnectReason reason = connected
-                    ? DisconnectReason::Unknown : _clientConn->getLastDisconnectReason();
-                _connectionHandler(_clientNetConn.get(), connected, reason);
-            });
-        }
+        installClientStateHandler();
         return true;
     }
 
@@ -742,7 +995,7 @@ public:
         std::vector<P2PPeerInfo> peers;
         const auto append = [this, &peers](const GnsConnection* transport,
                                            const NetConnection* facade,
-                                           bool remoteIsHost) {
+                                           bool remoteIsHost, bool admitted) {
             if (!transport || !transport->isP2P() ||
                 transport->getState() == GnsConnectionState::Disconnected) {
                 return;
@@ -758,6 +1011,7 @@ public:
             peer.remoteAddress = connection.remoteAddress;
             peer.pingMs = connection.pingMs;
             peer.isSessionHost = remoteIsHost;
+            peer.admitted = admitted;
             switch (transport->getState()) {
             case GnsConnectionState::Ready:
                 peer.state = P2PPeerState::Ready;
@@ -776,9 +1030,11 @@ public:
             peers.push_back(std::move(peer));
         };
 
-        append(_clientConn.get(), _clientNetConn.get(), !_p2pListening);
+        append(_clientConn.get(), _clientNetConn.get(), !_p2pListening,
+               _clientAdmission == P2PAdmissionState::Admitted);
         for (const auto& record : _serverClients) {
-            append(record.transport.get(), record.facade.get(), false);
+            append(record.transport.get(), record.facade.get(), false,
+                   record.sessionAdmitted);
         }
         std::sort(peers.begin(), peers.end(),
                   [](const P2PPeerInfo& lhs, const P2PPeerInfo& rhs) {
@@ -801,16 +1057,25 @@ public:
             session.role = P2PSessionRole::Host;
             session.hostPeerId = _p2pConfig.localPeerId;
             session.state = P2PSessionState::Hosting;
+            session.admission = P2PAdmissionState::NotRequired;
         } else if (_clientConn && _clientConn->isP2P()) {
             session.role = P2PSessionRole::Client;
             session.hostPeerId = _clientConn->getRemotePeerId();
-            session.state = P2PSessionState::Connecting;
+            session.admission = _clientAdmission;
+            session.rejectionReason = _clientJoinRejection;
+            session.state = _clientConn->isConnected()
+                ? P2PSessionState::Joining : P2PSessionState::Connecting;
         }
 
         for (const auto& peer : getP2PPeers()) {
-            if (peer.state == P2PPeerState::Ready) ++session.readyPeerCount;
+            if (peer.admitted && peer.state == P2PPeerState::Ready) {
+                ++session.readyPeerCount;
+            }
         }
-        if (session.readyPeerCount != 0) session.state = P2PSessionState::Active;
+        if ((_p2pListening && session.readyPeerCount != 0) ||
+            (!_p2pListening && _clientAdmission == P2PAdmissionState::Admitted)) {
+            session.state = P2PSessionState::Active;
+        }
         return session;
     }
 
@@ -852,6 +1117,49 @@ public:
         return false;
     }
 
+    bool setP2PJoinTicket(const void* ticket, size_t size) override {
+        if ((_clientConn && _clientConn->getState() != GnsConnectionState::Disconnected) ||
+            (ticket == nullptr && size != 0) || size > kP2PMaxJoinTicketBytes) {
+            return false;
+        }
+        const auto* bytes = static_cast<const uint8_t*>(ticket);
+        _p2pJoinTicket.clear();
+        if (size != 0) _p2pJoinTicket.assign(bytes, bytes + size);
+        return true;
+    }
+
+    void setP2PJoinValidator(P2PJoinValidator validator) override {
+        if (_p2pListening || !_serverClients.empty()) {
+            ::fprintf(stderr,
+                "[Network] setP2PJoinValidator ignored while P2P host is active\n");
+            return;
+        }
+        _p2pJoinValidator = std::move(validator);
+    }
+
+    bool setP2PLocalReady(bool ready) override {
+        if (!_p2pConfigured) return false;
+        if (_p2pLocalReady == ready) return true;
+        _p2pLocalReady = ready;
+        _p2pBarrier.localReady = ready;
+        if (_p2pListening) {
+            refreshHostBarrier(true);
+            return true;
+        }
+        if (_clientConn && _clientConn->isP2P() &&
+            _clientAdmission == P2PAdmissionState::Admitted) {
+            std::vector<uint8_t> body;
+            session::encodeReadyState(ready, body);
+            return sendSessionControl(_clientConn.get(),
+                                      kMsgTypeSessionReadyState, body);
+        }
+        return _clientConn && _clientConn->isP2P();
+    }
+
+    P2PReadyBarrierInfo getP2PReadyBarrierInfo() const override {
+        return _p2pBarrier;
+    }
+
     void connect(const char* address, uint16_t port) override {
         if (GnsConnection::isPumping()) {
             _deferredControl = {
@@ -883,20 +1191,12 @@ public:
         hookGnsConnection(_clientConn.get());                 // R5.5
         _clientNetConn = std::make_unique<NetConnectionImpl>(
             _clientConn.get(), clientNetId);
+        _clientAdmission = P2PAdmissionState::NotRequired;
+        _clientJoinRejection = P2PJoinRejectReason::None;
+        _clientConnectionPublished = false;
         _mode = ConnectionMode::Client;
         installInboundRoutes();
-        if (_connectionHandler) {
-            _clientConn->onStateChange([this](GnsConnectionState /*oldS*/, GnsConnectionState newS) {
-                bool connected = (newS == GnsConnectionState::Ready) ||
-                                 (newS == GnsConnectionState::Connected &&
-                                  _clientConn->getProtocolVersion() == 0);
-                if (!connected && newS != GnsConnectionState::Disconnected) return;
-                DisconnectReason reason = connected
-                    ? DisconnectReason::Unknown
-                    : _clientConn->getLastDisconnectReason();
-                _connectionHandler(_clientNetConn.get(), connected, reason);
-            });
-        }
+        installClientStateHandler();
     }
 
     void listen(uint16_t port) override {
@@ -965,13 +1265,21 @@ public:
         // R6 C6: single-thread; no lock.
         _simulationInbound.clear();
         _simulationInboundBytes = 0;
+        _clientAdmission = P2PAdmissionState::NotRequired;
+        _clientJoinRejection = P2PJoinRejectReason::None;
+        _clientConnectionPublished = false;
+        _p2pBarrier = {};
+        _p2pLocalReady = false;
         _mode = ConnectionMode::Disconnected;
     }
 
     bool isConnected() const override {
-        if (_clientConn && _clientConn->isConnected()) return true;
-        for (auto& child : _serverClients) {
-            if (child.transport && child.transport->isConnected()) return true;
+        if (_clientConn && _clientConn->isConnected() &&
+            (!_clientConn->isP2P() ||
+             _clientAdmission == P2PAdmissionState::Admitted)) return true;
+        for (const auto& child : _serverClients) {
+            if (child.transport && child.transport->isConnected() &&
+                (!child.transport->isP2P() || child.sessionAdmitted)) return true;
         }
         return false;
     }
@@ -1010,7 +1318,8 @@ public:
 
     // ===== 消息发送 =====
     void send(uint8_t channel, const void* data, size_t size) override {
-        if (_clientConn) {
+        if (_clientConn && (!_clientConn->isP2P() ||
+            _clientAdmission == P2PAdmissionState::Admitted)) {
             _clientConn->send(channel, data, size);
         }
     }
@@ -1021,13 +1330,18 @@ public:
         // _rawSend switch (R4.0). Single-call indirection cost; identical
         // wire behavior to broadcast().
         if (!conn) return;
+        if (const ServerClientRecord* record = findServerRecord(conn)) {
+            if (record->transport && record->transport->isP2P() &&
+                !record->sessionAdmitted) return;
+        }
         conn->send(channel, data, size);
     }
 
     void broadcast(uint8_t channel, const void* data, size_t size) override {
         // R1.A: actually iterate all server children and send to each.
         for (auto& child : _serverClients) {
-            if (child.transport && child.transport->isConnected()) {
+            if (child.transport && child.transport->isConnected() &&
+                (!child.transport->isP2P() || child.sessionAdmitted)) {
                 child.transport->send(channel, data, size);
             }
         }
@@ -1036,24 +1350,32 @@ public:
     void broadcastExcept(NetConnection* exclude, uint8_t channel, const void* data, size_t size) override {
         for (auto& record : _serverClients) {
             if (!record.facade || !record.facade->isConnected()) continue;
+            if (record.transport && record.transport->isP2P() &&
+                !record.sessionAdmitted) continue;
             if (exclude && record.facade.get() == exclude) continue;
             record.facade->send(channel, data, size);
         }
     }
 
     void sendEncoded(uint8_t channel, const void* data, size_t size) override {
-        if (_clientConn) _clientConn->sendEncoded(channel, data, size);
+        if (_clientConn && (!_clientConn->isP2P() ||
+            _clientAdmission == P2PAdmissionState::Admitted)) {
+            _clientConn->sendEncoded(channel, data, size);
+        }
     }
 
     void sendEncodedTo(NetConnection* conn, uint8_t channel,
                        const void* data, size_t size) override {
         if (!conn) return;
         if (_clientNetConn.get() == conn && _clientConn) {
+            if (_clientConn->isP2P() &&
+                _clientAdmission != P2PAdmissionState::Admitted) return;
             _clientConn->sendEncoded(channel, data, size);
             return;
         }
         for (auto& record : _serverClients) {
             if (record.facade.get() == conn && record.transport) {
+                if (record.transport->isP2P() && !record.sessionAdmitted) return;
                 record.transport->sendEncoded(channel, data, size);
                 return;
             }
@@ -1062,7 +1384,8 @@ public:
 
     void broadcastEncoded(uint8_t channel, const void* data, size_t size) override {
         for (auto& record : _serverClients) {
-            if (record.transport && record.transport->isConnected()) {
+            if (record.transport && record.transport->isConnected() &&
+                (!record.transport->isP2P() || record.sessionAdmitted)) {
                 record.transport->sendEncoded(channel, data, size);
             }
         }
@@ -1077,23 +1400,7 @@ public:
     // ===== 连接状态 =====
     void onConnectionChange(ConnectionHandler handler) override {
         _connectionHandler = handler;
-        if (_clientConn) {
-            _clientConn->onStateChange([this](GnsConnectionState oldS, GnsConnectionState newS) {
-                if (_connectionHandler) {
-                    // R1 done: surface DisconnectReason. connected=true ->
-                    // Unknown. connected=false -> whatever the GnsConnection
-                    // captured (UserQuit, ConnectionLost, etc.).
-                    bool connected = (newS == GnsConnectionState::Ready) ||
-                                     (newS == GnsConnectionState::Connected &&
-                                      _clientConn->getProtocolVersion() == 0);
-                    if (!connected && newS != GnsConnectionState::Disconnected) return;
-                    DisconnectReason reason = connected
-                        ? DisconnectReason::Unknown
-                        : _clientConn->getLastDisconnectReason();
-                    _connectionHandler(nullptr, connected, reason);
-                }
-            });
-        }
+        installClientStateHandler();
         _pendingConnHandler = [this](bool connected, DisconnectReason reason) {
             if (_connectionHandler) _connectionHandler(nullptr, connected, reason);
         };
@@ -1122,7 +1429,9 @@ public:
         _connections.clear();
         _connections.reserve(_serverClients.size());
         for (auto& record : _serverClients) {
-            if (record.facade && record.facade->isConnected()) {
+            if (record.facade && record.facade->isConnected() &&
+                (!record.transport || !record.transport->isP2P() ||
+                 record.sessionAdmitted)) {
                 _connections.push_back(record.facade.get());
             }
         }
@@ -1520,6 +1829,13 @@ private:
     std::shared_ptr<ISignalingTransport> _p2pSignaling;
     bool _p2pConfigured = false;
     bool _p2pListening = false;
+    std::vector<uint8_t> _p2pJoinTicket;
+    P2PJoinValidator _p2pJoinValidator;
+    P2PAdmissionState _clientAdmission = P2PAdmissionState::NotRequired;
+    P2PJoinRejectReason _clientJoinRejection = P2PJoinRejectReason::None;
+    P2PReadyBarrierInfo _p2pBarrier{};
+    bool _p2pLocalReady = false;
+    bool _clientConnectionPublished = false;
     uint32_t _nextNetId = 0;
     uint32_t _protocolVersion = kProtocolVersion;
     NetworkLimits _limits{};

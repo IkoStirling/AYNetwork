@@ -66,6 +66,7 @@ set(P2P_TEST_NAME AYNetwork_P2P_Test)
 add_executable(${P2P_TEST_NAME}
     main.cpp
     AYTest_P2P.cpp
+    AYTest_P2PSession.cpp
     AYTest_SecureSignaling.cpp
 )
 target_compile_definitions(${P2P_TEST_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
@@ -73,6 +74,7 @@ target_link_libraries(${P2P_TEST_NAME} PRIVATE AYNetwork AYTest AYCore)
 target_include_directories(${P2P_TEST_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Session
 )
 ay_add_test(${P2P_TEST_NAME})
 
