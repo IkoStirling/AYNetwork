@@ -210,6 +210,25 @@ struct P2PSessionInfo {
     PeerId electedHostPeerId;
 };
 
+enum class P2PSessionEventType : uint8_t {
+    SeatReserved = 0,
+    SeatRestored = 1,
+    SeatReservationExpired = 2,
+    MigrationStarted = 3,
+    AuthorityChanged = 4,
+    MigrationFailed = 5,
+};
+
+// Application-facing lifecycle notification. Delivery occurs from the
+// network update thread after transport pumping has completed, so handlers
+// may safely update game/session state without running inside a GNS callback.
+struct P2PSessionEvent {
+    P2PSessionEventType type = P2PSessionEventType::MigrationFailed;
+    P2PSessionInfo session;
+    PeerId subjectPeerId;
+    uint32_t seatId = 0;
+};
+
 // Signaling carries opaque GNS rendezvous blobs.  Implementations may use the
 // built-in UDP rendezvous protocol, WebSocket/HTTPS, a platform SDK, or an
 // application-specific authenticated service.  sendSignal() can be called by

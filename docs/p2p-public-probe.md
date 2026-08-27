@@ -130,6 +130,27 @@ RPC plus replicated state. Force-terminating the old Host after both clients
 emit `phase=armed` exercises crash recovery instead; it may take longer because
 clients first retry the original Host reservation.
 
+## Engine lifecycle integration
+
+Applications should subscribe with `addP2PSessionEventListener()` after the
+network subsystem is registered and remove the returned non-zero listener id
+before the application object is destroyed. Events are delivered after the
+transport pump, not from a GNS callback. `MigrationStarted` pauses
+authority-sensitive application work; `AuthorityChanged` is the commit point
+for switching simulation ownership and rebroadcasting retained replication
+spawns. `MigrationFailed` ends the transition without granting authority.
+
+`SeatReserved`, `SeatRestored`, and `SeatReservationExpired` expose the
+reconnect-grace lifecycle to lobby/game code. The event includes a snapshot of
+`P2PSessionInfo`, the affected peer, and its seat. Listeners remain installed
+across disconnect/reconnect cycles until explicitly removed.
+
+AYEditor consumes this contract directly. A promoted client keeps its launch
+role for World teardown, marks retained `NetworkComponent` instances as owned,
+and uses the new session role as the live authority source. New peers therefore
+receive spawn announcements from the migrated Host without recreating the
+replicated entities.
+
 ## Required matrix
 
 Run at least these gates before calling a release internet-ready:

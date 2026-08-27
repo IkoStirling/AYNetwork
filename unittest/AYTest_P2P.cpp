@@ -248,6 +248,18 @@ TEST_CASE(SubsystemConfiguresAndStartsP2PRoute) {
     CHECK(network->configureP2P(config, signaling));
     CHECK(network->isP2PConfigured());
     CHECK(network->getLocalPeerId() == config.localPeerId);
+    CHECK_INT_EQ(network->addP2PSessionEventListener({}), 0);
+    const uint64_t firstListener = network->addP2PSessionEventListener(
+        [](const P2PSessionEvent&) {});
+    const uint64_t secondListener = network->addP2PSessionEventListener(
+        [](const P2PSessionEvent&) {});
+    CHECK(firstListener != 0);
+    CHECK(secondListener != 0);
+    CHECK(firstListener != secondListener);
+    CHECK(network->removeP2PSessionEventListener(firstListener));
+    CHECK(!network->removeP2PSessionEventListener(firstListener));
+    CHECK(!network->removeP2PSessionEventListener(0));
+    CHECK(network->removeP2PSessionEventListener(secondListener));
     {
         const P2PSessionInfo session = network->getP2PSessionInfo();
         CHECK(session.role == P2PSessionRole::None);

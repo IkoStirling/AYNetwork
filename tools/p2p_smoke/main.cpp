@@ -805,6 +805,41 @@ bool runJoinSession(const PeerId& local, const PeerId& remote,
 int runMigrationJoin(const PeerId& local, const PeerId& remote,
                      const std::shared_ptr<ISignalingTransport>& signaling,
                      INetworkSubSystem& network, const ProbeOptions& options) {
+    struct SessionEventCounts {
+        uint32_t migrationStarted = 0;
+        uint32_t authorityChanged = 0;
+        uint32_t seatRestored = 0;
+        uint32_t migrationFailed = 0;
+    } events;
+    const uint64_t eventListenerId = network.addP2PSessionEventListener(
+        [&events](const P2PSessionEvent& event) {
+            switch (event.type) {
+            case P2PSessionEventType::MigrationStarted:
+                ++events.migrationStarted;
+                break;
+            case P2PSessionEventType::AuthorityChanged:
+                ++events.authorityChanged;
+                break;
+            case P2PSessionEventType::SeatRestored:
+                ++events.seatRestored;
+                break;
+            case P2PSessionEventType::MigrationFailed:
+                ++events.migrationFailed;
+                break;
+            case P2PSessionEventType::SeatReserved:
+            case P2PSessionEventType::SeatReservationExpired:
+                break;
+            }
+        });
+    if (eventListenerId == 0) return 16;
+    struct SessionEventListenerReset {
+        INetworkSubSystem& network;
+        uint64_t id;
+        ~SessionEventListenerReset() {
+            (void)network.removeP2PSessionEventListener(id);
+        }
+    } eventListenerReset{network, eventListenerId};
+
     ProbeReplicatedState state;
     ProbeRpcReceiver rpcReceiver;
     auto* probeType = registerProbeReflection();
@@ -872,17 +907,22 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
         after.localSeatId != before.localSeatId ||
         after.migration != P2PHostMigrationState::Stable ||
         !migratedBarrier.open ||
-        migratedBarrier.totalMemberCount != options.migrationMembers - 1) {
+        migratedBarrier.totalMemberCount != options.migrationMembers - 1 ||
+        events.migrationStarted == 0 || events.authorityChanged != 1 ||
+        events.migrationFailed != 0 ||
+        (after.role == P2PSessionRole::Client && events.seatRestored == 0)) {
         std::fprintf(stderr,
                      "AY_P2P_FAILURE local=%s phase=migration-converge "
                      "old_epoch=%u new_epoch=%u seat=%u role=%u state=%u "
-                     "ready=%zu total=%zu open=%u\n",
+                     "ready=%zu total=%zu open=%u events=%u/%u/%u/%u\n",
                      local.value.c_str(), before.epoch, after.epoch,
                      after.localSeatId, static_cast<unsigned>(after.role),
                      static_cast<unsigned>(after.migration),
                      migratedBarrier.readyMemberCount,
                      migratedBarrier.totalMemberCount,
-                     migratedBarrier.open ? 1u : 0u);
+                     migratedBarrier.open ? 1u : 0u,
+                     events.migrationStarted, events.authorityChanged,
+                     events.seatRestored, events.migrationFailed);
         return 16;
     }
 
@@ -913,12 +953,14 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
     }
     std::printf(
         "AY_P2P_MIGRATION local=%s phase=complete role=%s old_host=%s new_host=%s "
-        "epoch=%u seat=%u barrier=%zu/%zu authority=%d\n",
+        "epoch=%u seat=%u barrier=%zu/%zu authority=%d events=%u/%u/%u/%u\n",
         local.value.c_str(),
         after.role == P2PSessionRole::Host ? "host" : "client",
         before.hostPeerId.value.c_str(), after.hostPeerId.value.c_str(),
         after.epoch, after.localSeatId, migratedBarrier.readyMemberCount,
-        migratedBarrier.totalMemberCount, state.value);
+        migratedBarrier.totalMemberCount, state.value,
+        events.migrationStarted, events.authorityChanged,
+        events.seatRestored, events.migrationFailed);
     return 0;
 }
 

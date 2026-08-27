@@ -327,6 +327,15 @@ public:
     virtual void setP2PHostMigrationEnabled(bool enabled) { (void)enabled; }
     virtual bool reconnectP2P() { return false; }
     virtual bool requestP2PHostMigration() { return false; }
+    using P2PSessionEventHandler = std::function<void(const P2PSessionEvent&)>;
+    // Listener id 0 is invalid. Events remain installed across connection
+    // cycles until explicitly removed or the subsystem is destroyed.
+    virtual uint64_t addP2PSessionEventListener(P2PSessionEventHandler handler) {
+        (void)handler; return 0;
+    }
+    virtual bool removeP2PSessionEventListener(uint64_t listenerId) {
+        (void)listenerId; return false;
+    }
 
     // Must be configured before connect()/listen().  The production default
     // is kProtocolVersion; version 0 is an explicit legacy/test opt-out.
