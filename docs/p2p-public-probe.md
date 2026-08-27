@@ -106,6 +106,30 @@ For two connection cycles from the same Join process, set
 `AY_P2P_RECONNECTS=1` on Join and `AY_P2P_EXPECT_SESSIONS=2` on Host. For
 multiple joining processes, set Host's expected session count to their total.
 
+To validate seat-preserving recovery instead of a fresh repeated join, set
+`AY_P2P_RESUME_RECONNECTS=true` on both Host and Join, keep
+`AY_P2P_RECONNECTS=1`, and expect two sessions. Success includes
+`AY_P2P_RESUME ... seat=N next_session=2`; the probe separately asserts that
+this seat equals the first connection's seat. The barrier stays closed while
+the seat is reserved.
+
+Host Migration needs one Host and at least two Join processes. Set these values
+on all three before starting them:
+
+```text
+AY_P2P_HOST_MIGRATION=true
+AY_P2P_MIGRATION_MEMBERS=3
+```
+
+Start Host first, then launch both Join commands with distinct local PeerIds.
+After the three-member barrier opens, the probe Host requests a graceful
+handoff. The lowest client seat becomes Host. Both survivors must emit
+`AY_P2P_MIGRATION ... phase=complete`, preserve their seats, advance exactly
+one epoch, report `barrier=2/2`, and observe `authority=17777` through Server
+RPC plus replicated state. Force-terminating the old Host after both clients
+emit `phase=armed` exercises crash recovery instead; it may take longer because
+clients first retry the original Host reservation.
+
 ## Required matrix
 
 Run at least these gates before calling a release internet-ready:
@@ -118,7 +142,9 @@ Run at least these gates before calling a release internet-ready:
 | Room isolation | target in another room | signal rejected |
 | Session admission | wrong/missing gameplay Join ticket | reason `AdmissionRejected` |
 | Ready barrier | Host + Join set local Ready | `ready=2 total=2 open=true` |
-| Reconnect | Join reconnects with the same PeerId | stale Host route is replaced |
+| Seat recovery | resume reconnect with the same PeerId | old seat equals new seat |
+| Graceful migration | Host + two clients | epoch +1, lowest seat is Host, barrier 2/2 |
+| Crash migration | force-terminate armed Host | survivors elect once and preserve seats |
 | Sustained path | 60 seconds, 100 ms interval | engine/quality/result all pass |
 
 Repeat public-direct across home broadband, mobile hotspot and other available

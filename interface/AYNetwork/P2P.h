@@ -63,6 +63,16 @@ enum class P2PSessionState : uint8_t {
     Connecting = 3,
     Active = 4,
     Joining = 5,
+    Migrating = 6,
+};
+
+enum class P2PHostMigrationState : uint8_t {
+    Disabled = 0,
+    Stable = 1,
+    Reconnecting = 2,
+    Electing = 3,
+    Promoting = 4,
+    Failed = 5,
 };
 
 enum class P2PAdmissionState : uint8_t {
@@ -82,6 +92,7 @@ enum class P2PJoinRejectReason : uint8_t {
 };
 
 constexpr size_t kP2PMaxJoinTicketBytes = 1024;
+constexpr size_t kP2PMaxSessionMembers = 64;
 
 struct P2PJoinDecision {
     bool accepted = false;
@@ -100,6 +111,7 @@ enum class P2PPeerState : uint8_t {
     Connecting = 0,
     Ready = 1,
     Disconnecting = 2,
+    Reserved = 3,
 };
 
 struct P2PConfig {
@@ -159,6 +171,17 @@ struct P2PPeerInfo {
     int pingMs = -1;
     bool isSessionHost = false;
     bool admitted = false;
+    uint32_t seatId = 0;
+    bool reserved = false;
+};
+
+struct P2PSessionMemberInfo {
+    PeerId peerId;
+    uint32_t seatId = 0;
+    bool connected = false;
+    bool ready = false;
+    bool isHost = false;
+    bool reserved = false;
 };
 
 struct P2PReadyBarrierInfo {
@@ -178,6 +201,13 @@ struct P2PSessionInfo {
     size_t readyPeerCount = 0;
     P2PAdmissionState admission = P2PAdmissionState::NotRequired;
     P2PJoinRejectReason rejectionReason = P2PJoinRejectReason::None;
+    uint64_t sessionId = 0;
+    uint32_t epoch = 0;
+    uint32_t localSeatId = 0;
+    size_t reservedPeerCount = 0;
+    P2PHostMigrationState migration = P2PHostMigrationState::Disabled;
+    PeerId previousHostPeerId;
+    PeerId electedHostPeerId;
 };
 
 // Signaling carries opaque GNS rendezvous blobs.  Implementations may use the

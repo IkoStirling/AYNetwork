@@ -263,12 +263,33 @@ TEST_CASE(SubsystemConfiguresAndStartsP2PRoute) {
         CHECK(session.role == P2PSessionRole::Host);
         CHECK(session.state == P2PSessionState::Hosting);
         CHECK(session.hostPeerId == config.localPeerId);
+        CHECK(session.sessionId != 0);
+        CHECK_INT_EQ(session.epoch, 1);
+        CHECK_INT_EQ(session.localSeatId, 1);
+        CHECK(session.migration == P2PHostMigrationState::Disabled);
         CHECK(network->getP2PPeers().empty());
+        const auto members = network->getP2PSessionMembers();
+        CHECK_INT_EQ(members.size(), 1);
+        CHECK(members.front().peerId == config.localPeerId);
+        CHECK_INT_EQ(members.front().seatId, 1);
+        CHECK(members.front().isHost);
+        CHECK(members.front().connected);
+        CHECK(!members.front().reserved);
         const auto barrier = network->getP2PReadyBarrierInfo();
         CHECK_INT_EQ(barrier.totalMemberCount, 1);
         CHECK_INT_EQ(barrier.readyMemberCount, 0);
         CHECK(!barrier.open);
     }
+    CHECK(network->setP2PReconnectGracePeriodMs(30000));
+    CHECK(!network->setP2PReconnectGracePeriodMs(600001));
+    network->setP2PHostMigrationEnabled(true);
+    CHECK(network->getP2PSessionInfo().migration ==
+          P2PHostMigrationState::Stable);
+    CHECK(!network->requestP2PHostMigration());
+    CHECK(!network->reconnectP2P());
+    network->setP2PHostMigrationEnabled(false);
+    CHECK(network->getP2PSessionInfo().migration ==
+          P2PHostMigrationState::Disabled);
     CHECK(network->setP2PLocalReady(true));
     CHECK(network->getP2PReadyBarrierInfo().open);
     network->disconnect();

@@ -1786,9 +1786,9 @@ layers. It does not change their wire formats or authority rules.
   before running the app RTT/loss/jitter probe. It supports repeated sessions
   and multi-peer host gates through environment settings.
 - Topology: this milestone supports listen-host/client P2P with NAT traversal
-  and TURN fallback. Matchmaking rooms, host election/migration, and hostless
-  state consensus are separate session/authority concerns and do not belong in
-  the signaling relay.
+  and TURN fallback. Session-level seat recovery and Host Migration are layered
+  above it; matchmaking rooms and hostless state consensus remain outside the
+  stateless signaling relay.
 
 ---
 
@@ -1796,7 +1796,8 @@ layers. It does not change their wire formats or authority rules.
 
 The first session-layer increment is intentionally a local, backend-neutral
 view over live AYNetwork connections. It does not add lobby state to the UDP
-signaling relay and does not introduce a new wire message.
+signaling relay. Later increments extend this view with engine-owned control
+messages while preserving that signaling boundary.
 
 - `P2PSessionInfo` exposes local role, lifecycle state, host PeerId, virtual
   port, and the number of protocol-Ready remote peers.
@@ -1836,9 +1837,44 @@ signal forwarder and never evaluates gameplay membership.
   to close with application reason 1107 (`AdmissionRejected`).
 
 Deferred after this increment: account-service ticket issuance/cryptographic
-verification policy, lobby directory metadata, reconnect reservation, host
-election/migration, and hostless consensus. None is inferred from the signaling
+verification policy, lobby directory metadata, cross-partition authority
+arbitration, and hostless consensus. None is inferred from the signaling
 relay's transient endpoint table.
+
+### 15.18 Reconnect reservation and Host Migration (2026-08-27)
+
+The third session increment keeps the listen-host authority model but makes a
+temporary transport loss recoverable and permits the authority role to move.
+
+- The Host assigns monotonic, non-zero seat IDs. `ConnectionLost` reserves the
+  `PeerId/sessionId/epoch/seatId` tuple for 30 seconds by default (configurable
+  from zero through ten minutes). Explicit quit, kick, and admission rejection
+  release membership immediately.
+- A reserved member remains in the roster and Ready-barrier total but is not
+  Ready. `reconnectP2P` submits a v2 resume Join request; matching PeerId and
+  tuple restore the same seat and local Ready intent without re-running the
+  application ticket validator. Authenticated signaling/platform identity must
+  bind PeerId to the account for this to be a security boundary.
+- The authoritative v2 roster scopes every update by session ID, epoch and
+  monotonic revision. It rejects duplicate peers/seats, contradictory flags,
+  and a Host flag that does not match the declared Host PeerId.
+- When enabled, graceful migration sends a reliable `MigrationPlan`, then the
+  old Host closes after a maintenance window. Election is deterministic among
+  connected non-Host members: lowest seat, then lexical PeerId. All survivors
+  retain session ID and seat while epoch advances exactly once.
+- On an unplanned `ConnectionLost`, a Client first attempts its reserved route
+  to the original Host. If that connection also fails, all survivors apply the
+  same election rule. The winner installs the P2P listener; other survivors
+  resume against it. The Ready barrier remains closed until reservations are
+  restored or expire.
+- Promotion uses the winner's latest replicated object values and resets all
+  replication baselines so reconnecting peers receive reliable Full snapshots.
+  Data that existed only in old-Host memory is not transferred.
+- This is deterministic failover, not consensus. A network partition can form
+  competing authorities, and stale/mismatched epochs are rejected only within
+  a connected session. A matchmaking/backend epoch lease is required when
+  split-brain safety matters; hostless lockstep/consensus remains a separate
+  architecture.
 
 ---
 

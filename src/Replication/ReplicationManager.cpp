@@ -850,6 +850,16 @@ void ReplicationManager::forceReplicate(uint32_t netId) {
     }
 }
 
+void ReplicationManager::forceReplicateAll() {
+    for (auto& [netId, entry] : _objects) {
+        (void)netId;
+        for (auto& [connectionId, peer] : entry._peers) {
+            (void)connectionId;
+            peer.initialized = false;
+        }
+    }
+}
+
 // =============================================================================
 // R5.1 (2026-08-24) markTeleported.
 //

@@ -219,6 +219,8 @@ constexpr uint16_t kMsgTypeSessionJoinRequest = 0x0020;
 constexpr uint16_t kMsgTypeSessionJoinResult  = 0x0021;
 constexpr uint16_t kMsgTypeSessionReadyState  = 0x0022;
 constexpr uint16_t kMsgTypeSessionBarrier     = 0x0023;
+constexpr uint16_t kMsgTypeSessionRoster      = 0x0024;
+constexpr uint16_t kMsgTypeSessionMigration   = 0x0025;
 
 // R2: schema version stamped into every PacketHeader. Bump on breaking
 // wire-format changes (rare; major version bumps imply a parallel header
@@ -316,6 +318,15 @@ public:
     }
     virtual bool setP2PLocalReady(bool ready) { (void)ready; return false; }
     virtual P2PReadyBarrierInfo getP2PReadyBarrierInfo() const { return {}; }
+    virtual std::vector<P2PSessionMemberInfo> getP2PSessionMembers() const {
+        return {};
+    }
+    virtual bool setP2PReconnectGracePeriodMs(uint32_t graceMs) {
+        (void)graceMs; return false;
+    }
+    virtual void setP2PHostMigrationEnabled(bool enabled) { (void)enabled; }
+    virtual bool reconnectP2P() { return false; }
+    virtual bool requestP2PHostMigration() { return false; }
 
     // Must be configured before connect()/listen().  The production default
     // is kProtocolVersion; version 0 is an explicit legacy/test opt-out.
@@ -737,6 +748,10 @@ public:
     // Useful after a client reconnects, after a teleport, or after the user
     // explicitly changes a server-side field that all clients must observe.
     void forceReplicate(uint32_t netId);
+    // Host migration promotes the client's latest replicated state to the
+    // new authority. Reset every object baseline so rejoining peers receive
+    // a reliable Full snapshot from that promoted state.
+    void forceReplicateAll();
 
     // R5.1: tell the authority that `netId` teleported this tick. The next
     // tick() emits a Full Snapshot with the kFlagTeleport flag set AND

@@ -22,9 +22,13 @@
 #include <steam/steamclientpublic.h>
 #include <steam/isteamnetworkingsockets.h>
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <deque>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -44,6 +48,16 @@ class NetworkSubSystem : public INetworkSubSystem {
         bool sessionAdmitted = false;
         bool sessionReady = false;
         bool connectionPublished = false;
+        uint32_t sessionSeatId = 0;
+    };
+
+    struct SessionMemberRecord {
+        PeerId peerId;
+        uint32_t seatId = 0;
+        bool connected = false;
+        bool ready = false;
+        bool host = false;
+        uint64_t reservationExpiresAtMs = 0;
     };
 
     enum class DeferredControlType : uint8_t {
@@ -188,6 +202,18 @@ public:
         _clientJoinRejection = P2PJoinRejectReason::None;
         _p2pBarrier = {};
         _p2pLocalReady = false;
+        _p2pSessionId = 0;
+        _p2pSessionEpoch = 0;
+        _p2pRosterRevision = 0;
+        _p2pLocalSeatId = 0;
+        _p2pSessionHost = {};
+        _p2pPreviousHost = {};
+        _p2pElectedHost = {};
+        _sessionMembers.clear();
+        _p2pResumeRequested = false;
+        _p2pPreserveReadyOnConnect = false;
+        _p2pMigrationState = P2PHostMigrationState::Disabled;
+        _p2pPlannedHostDepartureAtMs = 0;
         // R6 C6: single-thread; no lock.
         _simulationInbound.clear();
         _simulationInboundBytes = 0;
@@ -351,19 +377,287 @@ public:
         }
     }
 
+    static uint64_t sessionNowMs() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    static uint64_t createSessionId(const PeerId& host, uint16_t virtualPort) {
+        static std::atomic<uint64_t> generation{1};
+        uint64_t hash = 1469598103934665603ull;
+        for (unsigned char ch : host.value) {
+            hash ^= ch;
+            hash *= 1099511628211ull;
+        }
+        hash ^= virtualPort;
+        hash *= 1099511628211ull;
+        hash ^= generation.fetch_add(1, std::memory_order_relaxed);
+        hash ^= sessionNowMs();
+        return hash == 0 ? 1 : hash;
+    }
+
+    SessionMemberRecord* findSessionMember(const PeerId& peer) {
+        const auto it = _sessionMembers.find(peer.value);
+        return it == _sessionMembers.end() ? nullptr : &it->second;
+    }
+
+    const SessionMemberRecord* findSessionMember(const PeerId& peer) const {
+        const auto it = _sessionMembers.find(peer.value);
+        return it == _sessionMembers.end() ? nullptr : &it->second;
+    }
+
+    session::Roster buildSessionRoster() const {
+        session::Roster roster;
+        roster.sessionId = _p2pSessionId;
+        roster.epoch = _p2pSessionEpoch;
+        roster.revision = _p2pRosterRevision;
+        roster.hostPeerId = _p2pSessionHost;
+        roster.members.reserve(_sessionMembers.size());
+        for (const auto& [key, member] : _sessionMembers) {
+            (void)key;
+            roster.members.push_back({
+                member.peerId, member.seatId, member.connected,
+                member.ready, member.host,
+            });
+        }
+        return roster;
+    }
+
+    void broadcastSessionRoster(bool incrementRevision) {
+        if (!_p2pListening || _p2pSessionId == 0) return;
+        if (incrementRevision || _p2pRosterRevision == 0) {
+            ++_p2pRosterRevision;
+            if (_p2pRosterRevision == 0) ++_p2pRosterRevision;
+        }
+        std::vector<uint8_t> body;
+        if (!session::encodeRoster(buildSessionRoster(), body)) return;
+        for (auto& record : _serverClients) {
+            if (record.sessionAdmitted && record.transport &&
+                record.transport->isP2P() && record.transport->isConnected()) {
+                (void)sendSessionControl(record.transport.get(),
+                                         kMsgTypeSessionRoster, body);
+            }
+        }
+    }
+
+    void initializeHostedSession() {
+        _p2pSessionId = createSessionId(
+            _p2pConfig.localPeerId, _p2pConfig.virtualPort);
+        _p2pSessionEpoch = 1;
+        _p2pRosterRevision = 0;
+        _p2pSessionHost = _p2pConfig.localPeerId;
+        _p2pPreviousHost = {};
+        _p2pElectedHost = _p2pConfig.localPeerId;
+        _p2pLocalSeatId = 1;
+        _p2pNextSeatId = 2;
+        _sessionMembers.clear();
+        SessionMemberRecord local;
+        local.peerId = _p2pConfig.localPeerId;
+        local.seatId = _p2pLocalSeatId;
+        local.connected = true;
+        local.ready = _p2pLocalReady;
+        local.host = true;
+        _sessionMembers.emplace(local.peerId.value, std::move(local));
+        _p2pMigrationState = _p2pHostMigrationEnabled
+            ? P2PHostMigrationState::Stable
+            : P2PHostMigrationState::Disabled;
+    }
+
+    PeerId electMigrationHost() const {
+        const SessionMemberRecord* winner = nullptr;
+        for (const auto& [key, member] : _sessionMembers) {
+            (void)key;
+            if (!member.connected || member.host) continue;
+            if (!winner || member.seatId < winner->seatId ||
+                (member.seatId == winner->seatId &&
+                 member.peerId.value < winner->peerId.value)) {
+                winner = &member;
+            }
+        }
+        return winner ? winner->peerId : PeerId{};
+    }
+
+    void scheduleHostElection() {
+        if (!_p2pHostMigrationEnabled || _p2pSessionId == 0 ||
+            _p2pLocalSeatId == 0) {
+            _p2pMigrationState = _p2pHostMigrationEnabled
+                ? P2PHostMigrationState::Failed
+                : P2PHostMigrationState::Disabled;
+            return;
+        }
+        _p2pPreviousHost = _p2pSessionHost;
+        _p2pElectedHost = electMigrationHost();
+        if (!_p2pElectedHost.isValid()) {
+            _p2pMigrationState = P2PHostMigrationState::Failed;
+            return;
+        }
+        ++_p2pSessionEpoch;
+        if (_p2pSessionEpoch == 0) ++_p2pSessionEpoch;
+        _p2pMigrationState = P2PHostMigrationState::Electing;
+        _p2pMigrationActionAtMs = sessionNowMs() +
+            (_p2pElectedHost == _p2pConfig.localPeerId ? 0u : 400u);
+        _p2pMigrationAttempts = 0;
+        _p2pResumeRequested = true;
+        _p2pPreserveReadyOnConnect = true;
+        _p2pBarrier.open = false;
+    }
+
+    void beginHostRecovery(DisconnectReason reason) {
+        if (!_p2pHostMigrationEnabled || _p2pSessionId == 0) return;
+        if (_p2pMigrationState == P2PHostMigrationState::Electing ||
+            _p2pMigrationState == P2PHostMigrationState::Promoting) return;
+        if (_p2pMigrationState == P2PHostMigrationState::Reconnecting &&
+            _p2pElectedHost == _p2pPreviousHost) {
+            scheduleHostElection();
+            return;
+        }
+        if (_clientAdmission != P2PAdmissionState::Admitted) return;
+        if (reason == DisconnectReason::ConnectionLost) {
+            // A transient client-side path loss is more common than a dead
+            // Host. First consume the Host's reservation by reconnecting to
+            // the same PeerId; elect only if that attempt also fails.
+            _p2pPreviousHost = _p2pSessionHost;
+            _p2pElectedHost = _p2pSessionHost;
+            _p2pMigrationState = P2PHostMigrationState::Reconnecting;
+            _p2pMigrationActionAtMs = sessionNowMs() + 250u;
+            _p2pMigrationAttempts = 0;
+            _p2pResumeRequested = true;
+            _p2pPreserveReadyOnConnect = true;
+            _p2pBarrier.open = false;
+            return;
+        }
+        if (reason == DisconnectReason::HostShutdown) scheduleHostElection();
+    }
+
+    bool promoteToMigrationHost() {
+        if (_p2pElectedHost != _p2pConfig.localPeerId ||
+            _p2pSessionId == 0 || _p2pSessionEpoch == 0) return false;
+        _p2pMigrationState = P2PHostMigrationState::Promoting;
+        _clientConn.reset();
+        _clientNetConn.reset();
+        if (_p2pListening) {
+            GnsConnection::clearP2PAdoptFactory(_p2pConfig.virtualPort);
+        }
+        if (!GnsConnection::setP2PAdoptFactory(
+                _p2pConfig, _p2pSignaling,
+                [this](HSteamNetConnection incoming, const PeerId& remotePeer) {
+                    return adoptIncomingClient(
+                        incoming, &remotePeer, _p2pConfig.virtualPort);
+                })) {
+            _p2pMigrationState = P2PHostMigrationState::Failed;
+            return false;
+        }
+        _sessionMembers.erase(_p2pPreviousHost.value);
+        for (auto& [key, member] : _sessionMembers) {
+            (void)key;
+            member.host = false;
+            if (member.peerId != _p2pConfig.localPeerId) {
+                member.connected = false;
+                member.ready = false;
+                member.reservationExpiresAtMs =
+                    sessionNowMs() + _p2pReconnectGracePeriodMs;
+            }
+        }
+        SessionMemberRecord* local = findSessionMember(_p2pConfig.localPeerId);
+        if (!local) {
+            SessionMemberRecord member;
+            member.peerId = _p2pConfig.localPeerId;
+            member.seatId = _p2pLocalSeatId;
+            local = &_sessionMembers.emplace(member.peerId.value, std::move(member)).first->second;
+        }
+        local->host = true;
+        local->connected = true;
+        local->ready = _p2pLocalReady;
+        local->reservationExpiresAtMs = 0;
+        _p2pSessionHost = _p2pConfig.localPeerId;
+        _p2pNextSeatId = 1;
+        for (const auto& [key, member] : _sessionMembers) {
+            (void)key;
+            _p2pNextSeatId = std::max(_p2pNextSeatId, member.seatId + 1);
+        }
+        _p2pListening = true;
+        _mode = ConnectionMode::ListenServer;
+        _clientAdmission = P2PAdmissionState::NotRequired;
+        _p2pBarrier = {};
+        _p2pRosterRevision = 0;
+        _p2pMigrationState = P2PHostMigrationState::Stable;
+        refreshHostBarrier(true);
+        broadcastSessionRoster(true);
+        _replicationManager.forceReplicateAll();
+        return true;
+    }
+
+    void expireSessionReservations() {
+        if (!_p2pListening) return;
+        const uint64_t now = sessionNowMs();
+        bool changed = false;
+        for (auto it = _sessionMembers.begin(); it != _sessionMembers.end();) {
+            if (!it->second.host && !it->second.connected &&
+                (_p2pReconnectGracePeriodMs == 0 ||
+                 (it->second.reservationExpiresAtMs != 0 &&
+                  now >= it->second.reservationExpiresAtMs))) {
+                it = _sessionMembers.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+        if (changed) {
+            refreshHostBarrier(true);
+            broadcastSessionRoster(true);
+        }
+    }
+
+    void tickP2PSessionMaintenance() {
+        expireSessionReservations();
+        if (_p2pPlannedHostDepartureAtMs != 0 &&
+            sessionNowMs() >= _p2pPlannedHostDepartureAtMs) {
+            _p2pPlannedHostDepartureAtMs = 0;
+            GnsConnection::clearP2PAdoptFactory(_p2pConfig.virtualPort);
+            _p2pListening = false;
+            clearServerClients("host migration requested",
+                               DisconnectReason::HostShutdown);
+            _mode = ConnectionMode::Disconnected;
+            _p2pMigrationState = P2PHostMigrationState::Disabled;
+            return;
+        }
+        if ((_p2pMigrationState != P2PHostMigrationState::Electing &&
+             _p2pMigrationState != P2PHostMigrationState::Reconnecting) ||
+            _p2pMigrationActionAtMs == 0 ||
+            sessionNowMs() < _p2pMigrationActionAtMs) return;
+        _p2pMigrationActionAtMs = 0;
+        if (_p2pElectedHost == _p2pConfig.localPeerId) {
+            (void)promoteToMigrationHost();
+            return;
+        }
+        _p2pResumeRequested = true;
+        _p2pPreserveReadyOnConnect = true;
+        if (!connectP2PNow(_p2pElectedHost)) {
+            if (_p2pElectedHost == _p2pPreviousHost) scheduleHostElection();
+            else _p2pMigrationState = P2PHostMigrationState::Failed;
+        } else {
+            _p2pMigrationState = P2PHostMigrationState::Reconnecting;
+            ++_p2pMigrationAttempts;
+        }
+    }
+
     void refreshHostBarrier(bool incrementRevision) {
         if (!_p2pListening) return;
         if (incrementRevision || _p2pBarrier.revision == 0) {
             ++_p2pBarrier.revision;
             if (_p2pBarrier.revision == 0) ++_p2pBarrier.revision;
         }
-        size_t total = 1;
-        size_t ready = _p2pLocalReady ? 1 : 0;
-        for (const auto& record : _serverClients) {
-            if (!record.sessionAdmitted || !record.transport ||
-                !record.transport->isP2P() || !record.transport->isConnected()) continue;
+        if (SessionMemberRecord* local = findSessionMember(_p2pConfig.localPeerId)) {
+            local->connected = true;
+            local->ready = _p2pLocalReady;
+            local->host = true;
+        }
+        size_t total = 0;
+        size_t ready = 0;
+        for (const auto& [key, member] : _sessionMembers) {
+            (void)key;
             ++total;
-            if (record.sessionReady) ++ready;
+            if (member.connected && member.ready) ++ready;
         }
         _p2pBarrier.totalMemberCount = total;
         _p2pBarrier.readyMemberCount = ready;
@@ -372,9 +666,11 @@ public:
 
         std::vector<uint8_t> body;
         session::encodeBarrier(
-            _p2pBarrier.revision,
-            static_cast<uint16_t>(std::min<size_t>(ready, UINT16_MAX)),
-            static_cast<uint16_t>(std::min<size_t>(total, UINT16_MAX)),
+            _p2pSessionId, _p2pSessionEpoch, _p2pBarrier.revision,
+            static_cast<uint16_t>(std::min<size_t>(
+                ready, std::numeric_limits<uint16_t>::max())),
+            static_cast<uint16_t>(std::min<size_t>(
+                total, std::numeric_limits<uint16_t>::max())),
             _p2pBarrier.open, body);
         for (auto& record : _serverClients) {
             if (record.sessionAdmitted && record.transport &&
@@ -389,9 +685,17 @@ public:
         if (!_clientConn || !_clientConn->isP2P() || !_clientConn->isConnected()) return;
         _clientAdmission = P2PAdmissionState::Pending;
         _clientJoinRejection = P2PJoinRejectReason::None;
+        session::JoinRequest request;
+        request.ticket = _p2pJoinTicket;
+        request.resume = _p2pResumeRequested && _p2pSessionId != 0 &&
+                         _p2pSessionEpoch != 0 && _p2pLocalSeatId != 0;
+        if (request.resume) {
+            request.sessionId = _p2pSessionId;
+            request.epoch = _p2pSessionEpoch;
+            request.seatId = _p2pLocalSeatId;
+        }
         std::vector<uint8_t> body;
-        if (!session::encodeJoinRequest(
-                _p2pJoinTicket.data(), _p2pJoinTicket.size(), body) ||
+        if (!session::encodeJoinRequest(request, body) ||
             !sendSessionControl(_clientConn.get(), kMsgTypeSessionJoinRequest, body)) {
             _clientJoinRejection = P2PJoinRejectReason::MalformedRequest;
         }
@@ -436,6 +740,7 @@ public:
                     _connectionHandler(_clientNetConn.get(), false, reason);
                 }
                 _clientConnectionPublished = false;
+                if (observed->isP2P()) beginHostRecovery(reason);
             });
     }
 
@@ -445,14 +750,23 @@ public:
         case kMsgTypeSessionJoinRequest: {
             ServerClientRecord* record = findServerRecord(from);
             if (!record || !record->transport || !record->transport->isP2P()) return true;
-            std::vector<uint8_t> ticket;
+            session::JoinRequest request;
             P2PJoinDecision decision;
-            if (!session::decodeJoinRequest(body, size, ticket)) {
+            const PeerId remotePeer = record->transport->getRemotePeerId();
+            SessionMemberRecord* member = findSessionMember(remotePeer);
+            bool resumed = false;
+            if (!session::decodeJoinRequest(body, size, request)) {
                 decision = P2PJoinDecision::reject(
                     P2PJoinRejectReason::MalformedRequest);
+            } else if (request.resume) {
+                resumed = member && request.sessionId == _p2pSessionId &&
+                    request.epoch == _p2pSessionEpoch &&
+                    request.seatId == member->seatId && !member->host;
+                decision = resumed ? P2PJoinDecision::accept() :
+                    P2PJoinDecision::reject(P2PJoinRejectReason::InvalidTicket);
             } else if (_p2pJoinValidator) {
                 decision = _p2pJoinValidator(
-                    record->transport->getRemotePeerId(), ticket.data(), ticket.size());
+                    remotePeer, request.ticket.data(), request.ticket.size());
                 if (decision.accepted) decision.reason = P2PJoinRejectReason::None;
                 else if (decision.reason == P2PJoinRejectReason::None) {
                     decision.reason = P2PJoinRejectReason::InvalidTicket;
@@ -461,8 +775,33 @@ public:
                 decision = P2PJoinDecision::accept();
             }
 
+            if (decision.accepted && !member &&
+                _sessionMembers.size() >= std::min<size_t>(
+                    _limits.maxConnections + 1, kP2PMaxSessionMembers)) {
+                decision = P2PJoinDecision::reject(P2PJoinRejectReason::SessionFull);
+            }
+            if (decision.accepted && !member) {
+                SessionMemberRecord created;
+                created.peerId = remotePeer;
+                created.seatId = _p2pNextSeatId++;
+                if (_p2pNextSeatId == 0) ++_p2pNextSeatId;
+                member = &_sessionMembers.emplace(remotePeer.value, std::move(created)).first->second;
+            }
+
             std::vector<uint8_t> result;
-            session::encodeJoinResult(decision, result);
+            session::JoinResult joinResult;
+            joinResult.decision = decision;
+            joinResult.sessionId = decision.accepted ? _p2pSessionId : 0;
+            joinResult.epoch = decision.accepted ? _p2pSessionEpoch : 0;
+            joinResult.seatId = decision.accepted && member ? member->seatId : 0;
+            joinResult.resumed = decision.accepted && resumed;
+            if (!session::encodeJoinResult(joinResult, result)) {
+                joinResult = {};
+                joinResult.decision = P2PJoinDecision::reject(
+                    P2PJoinRejectReason::MalformedRequest);
+                (void)session::encodeJoinResult(joinResult, result);
+                decision = joinResult.decision;
+            }
             (void)sendSessionControl(record->transport.get(),
                                      kMsgTypeSessionJoinResult, result);
             if (!decision.accepted) {
@@ -473,10 +812,16 @@ public:
             if (!record->sessionAdmitted) {
                 record->sessionAdmitted = true;
                 record->sessionReady = false;
+                record->sessionSeatId = member->seatId;
+                member->connected = true;
+                member->ready = false;
+                member->reservationExpiresAtMs = 0;
                 publishServerConnection(*record);
                 refreshHostBarrier(true);
+                broadcastSessionRoster(true);
             } else {
                 refreshHostBarrier(false);
+                broadcastSessionRoster(false);
             }
             return true;
         }
@@ -484,21 +829,42 @@ public:
             if (from != _clientNetConn.get() || !_clientConn || !_clientConn->isP2P()) {
                 return true;
             }
-            P2PJoinDecision decision;
-            if (!session::decodeJoinResult(body, size, decision)) {
+            session::JoinResult result;
+            if (!session::decodeJoinResult(body, size, result)) {
                 _clientAdmission = P2PAdmissionState::Rejected;
                 _clientJoinRejection = P2PJoinRejectReason::MalformedRequest;
                 _clientConn->disconnect("malformed P2P join result",
                                         DisconnectReason::AdmissionRejected);
                 return true;
             }
-            if (!decision.accepted) {
+            if (!result.decision.accepted) {
                 _clientAdmission = P2PAdmissionState::Rejected;
-                _clientJoinRejection = decision.reason;
+                _clientJoinRejection = result.decision.reason;
                 return true;
             }
+            const bool requestedResume = _p2pResumeRequested;
+            const bool invalidResumeResult = requestedResume
+                ? (!result.resumed || result.sessionId != _p2pSessionId ||
+                   result.epoch != _p2pSessionEpoch ||
+                   result.seatId != _p2pLocalSeatId)
+                : result.resumed;
+            if (invalidResumeResult) {
+                _clientAdmission = P2PAdmissionState::Rejected;
+                _clientJoinRejection = P2PJoinRejectReason::MalformedRequest;
+                _clientConn->disconnect("inconsistent P2P resume result",
+                                        DisconnectReason::AdmissionRejected);
+                return true;
+            }
+            _p2pSessionId = result.sessionId;
+            _p2pSessionEpoch = result.epoch;
+            _p2pLocalSeatId = result.seatId;
+            _p2pSessionHost = _clientConn->getRemotePeerId();
+            _p2pResumeRequested = false;
             _clientAdmission = P2PAdmissionState::Admitted;
             _clientJoinRejection = P2PJoinRejectReason::None;
+            _p2pMigrationState = _p2pHostMigrationEnabled
+                ? P2PHostMigrationState::Stable
+                : P2PHostMigrationState::Disabled;
             if (!_clientConnectionPublished) {
                 _clientConnectionPublished = true;
                 if (_connectionHandler) {
@@ -519,7 +885,13 @@ public:
             if (!session::decodeReadyState(body, size, ready)) return true;
             if (record->sessionReady != ready) {
                 record->sessionReady = ready;
+                if (SessionMemberRecord* member = findSessionMember(
+                        record->transport->getRemotePeerId())) {
+                    member->ready = ready;
+                    member->connected = true;
+                }
                 refreshHostBarrier(true);
+                broadcastSessionRoster(true);
             } else {
                 refreshHostBarrier(false);
             }
@@ -528,17 +900,63 @@ public:
         case kMsgTypeSessionBarrier: {
             if (from != _clientNetConn.get() ||
                 _clientAdmission != P2PAdmissionState::Admitted) return true;
+            uint64_t sessionId = 0;
+            uint32_t epoch = 0;
             uint32_t revision = 0;
             uint16_t ready = 0;
             uint16_t total = 0;
             bool open = false;
-            if (!session::decodeBarrier(body, size, revision, ready, total, open) ||
+            if (!session::decodeBarrier(body, size, sessionId, epoch, revision,
+                                        ready, total, open) ||
+                sessionId != _p2pSessionId || epoch != _p2pSessionEpoch ||
                 revision < _p2pBarrier.revision) return true;
             _p2pBarrier.revision = revision;
             _p2pBarrier.readyMemberCount = ready;
             _p2pBarrier.totalMemberCount = total;
             _p2pBarrier.localReady = _p2pLocalReady;
             _p2pBarrier.open = open;
+            return true;
+        }
+        case kMsgTypeSessionRoster: {
+            if (from != _clientNetConn.get() ||
+                _clientAdmission != P2PAdmissionState::Admitted) return true;
+            session::Roster roster;
+            if (!session::decodeRoster(body, size, roster) ||
+                roster.sessionId != _p2pSessionId ||
+                roster.epoch != _p2pSessionEpoch ||
+                roster.revision < _p2pRosterRevision) return true;
+            _p2pRosterRevision = roster.revision;
+            _p2pSessionHost = roster.hostPeerId;
+            _sessionMembers.clear();
+            for (const session::RosterMember& incoming : roster.members) {
+                SessionMemberRecord member;
+                member.peerId = incoming.peerId;
+                member.seatId = incoming.seatId;
+                member.connected = incoming.connected;
+                member.ready = incoming.ready;
+                member.host = incoming.host;
+                _sessionMembers.emplace(member.peerId.value, std::move(member));
+            }
+            return true;
+        }
+        case kMsgTypeSessionMigration: {
+            if (from != _clientNetConn.get() ||
+                _clientAdmission != P2PAdmissionState::Admitted ||
+                !_p2pHostMigrationEnabled) return true;
+            session::MigrationPlan plan;
+            if (!session::decodeMigrationPlan(body, size, plan) ||
+                plan.sessionId != _p2pSessionId ||
+                plan.currentEpoch != _p2pSessionEpoch ||
+                plan.electedHostPeerId != electMigrationHost()) return true;
+            _p2pPreviousHost = _p2pSessionHost;
+            _p2pElectedHost = plan.electedHostPeerId;
+            _p2pSessionEpoch = plan.nextEpoch;
+            _p2pMigrationState = P2PHostMigrationState::Electing;
+            _p2pMigrationActionAtMs = sessionNowMs() +
+                (_p2pElectedHost == _p2pConfig.localPeerId ? 0u : 400u);
+            _p2pResumeRequested = true;
+            _p2pPreserveReadyOnConnect = true;
+            _p2pBarrier.open = false;
             return true;
         }
         default:
@@ -807,6 +1225,7 @@ public:
         if (result.budgetExhausted) ++_pumpBudgetExhaustions;
         reapDisconnectedClients();
         processDeferredControl();
+        tickP2PSessionMaintenance();
     }
 
     void reapDisconnectedClients() {
@@ -815,7 +1234,33 @@ public:
         while (it != _serverClients.end()) {
             if (!it->transport ||
                 it->transport->getState() == GnsConnectionState::Disconnected) {
-                p2pMembershipChanged = p2pMembershipChanged || it->sessionAdmitted;
+                if (it->sessionAdmitted && it->transport && it->transport->isP2P()) {
+                    const PeerId peer = it->transport->getRemotePeerId();
+                    bool replacementActive = false;
+                    for (const auto& other : _serverClients) {
+                        if (&other != &*it && other.sessionAdmitted && other.transport &&
+                            other.transport->isP2P() && other.transport->isConnected() &&
+                            other.transport->getRemotePeerId() == peer) {
+                            replacementActive = true;
+                            break;
+                        }
+                    }
+                    if (!replacementActive) {
+                        const DisconnectReason reason = it->transport->getLastDisconnectReason();
+                        if (SessionMemberRecord* member = findSessionMember(peer)) {
+                            if (reason == DisconnectReason::ConnectionLost &&
+                                _p2pReconnectGracePeriodMs != 0) {
+                                member->connected = false;
+                                member->ready = false;
+                                member->reservationExpiresAtMs =
+                                    sessionNowMs() + _p2pReconnectGracePeriodMs;
+                            } else {
+                                _sessionMembers.erase(peer.value);
+                            }
+                            p2pMembershipChanged = true;
+                        }
+                    }
+                }
                 if (_extension && it->facade &&
                     !it->extensionDisconnectNotified) {
                     _extension->onConnectionDisconnected(it->facade.get());
@@ -826,7 +1271,10 @@ public:
                 ++it;
             }
         }
-        if (p2pMembershipChanged) refreshHostBarrier(true);
+        if (p2pMembershipChanged) {
+            refreshHostBarrier(true);
+            broadcastSessionRoster(true);
+        }
     }
 
     void clearServerClients(const char* reason,
@@ -895,6 +1343,23 @@ public:
         _clientJoinRejection = P2PJoinRejectReason::None;
         _p2pBarrier = {};
         _p2pLocalReady = false;
+        _sessionMembers.clear();
+        _p2pSessionId = 0;
+        _p2pSessionEpoch = 0;
+        _p2pRosterRevision = 0;
+        _p2pLocalSeatId = 0;
+        _p2pNextSeatId = 1;
+        _p2pResumeRequested = false;
+        _p2pPreserveReadyOnConnect = false;
+        _p2pSessionHost = {};
+        _p2pPreviousHost = {};
+        _p2pElectedHost = {};
+        _p2pMigrationActionAtMs = 0;
+        _p2pPlannedHostDepartureAtMs = 0;
+        _p2pMigrationAttempts = 0;
+        _p2pMigrationState = _p2pHostMigrationEnabled
+            ? P2PHostMigrationState::Stable
+            : P2PHostMigrationState::Disabled;
         return true;
     }
 
@@ -924,7 +1389,9 @@ public:
         _p2pListening = true;
         _p2pLocalReady = false;
         _p2pBarrier = {};
+        initializeHostedSession();
         refreshHostBarrier(true);
+        broadcastSessionRoster(true);
         _mode = ConnectionMode::ListenServer;
         return true;
     }
@@ -952,7 +1419,17 @@ public:
             _clientConn.reset();
             _clientNetConn.reset();
         }
-        _p2pLocalReady = false;
+        const bool preserveReady = _p2pPreserveReadyOnConnect;
+        _p2pPreserveReadyOnConnect = false;
+        if (!preserveReady) _p2pLocalReady = false;
+        if (!_p2pResumeRequested) {
+            _p2pSessionId = 0;
+            _p2pSessionEpoch = 0;
+            _p2pRosterRevision = 0;
+            _p2pLocalSeatId = 0;
+            _p2pSessionHost = remotePeer;
+            _sessionMembers.clear();
+        }
         auto transport = std::make_unique<GnsConnection>();
         transport->setProtocolVersion(_protocolVersion);
         if (!transport->initP2PClient(remotePeer, _p2pConfig, _p2pSignaling)) return false;
@@ -1012,6 +1489,11 @@ public:
             peer.pingMs = connection.pingMs;
             peer.isSessionHost = remoteIsHost;
             peer.admitted = admitted;
+            if (const SessionMemberRecord* member =
+                    findSessionMember(connection.remotePeerId)) {
+                peer.seatId = member->seatId;
+                peer.reserved = !member->connected;
+            }
             switch (transport->getState()) {
             case GnsConnectionState::Ready:
                 peer.state = P2PPeerState::Ready;
@@ -1036,6 +1518,24 @@ public:
             append(record.transport.get(), record.facade.get(), false,
                    record.sessionAdmitted);
         }
+        for (const auto& [key, member] : _sessionMembers) {
+            (void)key;
+            if (member.peerId == _p2pConfig.localPeerId) continue;
+            const auto existing = std::find_if(
+                peers.begin(), peers.end(), [&](const P2PPeerInfo& peer) {
+                    return peer.peerId == member.peerId;
+                });
+            if (existing != peers.end()) continue;
+            P2PPeerInfo peer;
+            peer.peerId = member.peerId;
+            peer.seatId = member.seatId;
+            peer.state = member.connected
+                ? P2PPeerState::Ready : P2PPeerState::Reserved;
+            peer.isSessionHost = member.host;
+            peer.admitted = true;
+            peer.reserved = !member.connected;
+            peers.push_back(std::move(peer));
+        }
         std::sort(peers.begin(), peers.end(),
                   [](const P2PPeerInfo& lhs, const P2PPeerInfo& rhs) {
                       if (lhs.peerId.value != rhs.peerId.value) {
@@ -1053,6 +1553,16 @@ public:
         session.state = P2PSessionState::Idle;
         session.localPeerId = _p2pConfig.localPeerId;
         session.virtualPort = _p2pConfig.virtualPort;
+        session.sessionId = _p2pSessionId;
+        session.epoch = _p2pSessionEpoch;
+        session.localSeatId = _p2pLocalSeatId;
+        session.migration = _p2pMigrationState;
+        session.previousHostPeerId = _p2pPreviousHost;
+        session.electedHostPeerId = _p2pElectedHost;
+        for (const auto& [key, member] : _sessionMembers) {
+            (void)key;
+            if (!member.connected && !member.host) ++session.reservedPeerCount;
+        }
         if (_p2pListening) {
             session.role = P2PSessionRole::Host;
             session.hostPeerId = _p2pConfig.localPeerId;
@@ -1060,11 +1570,18 @@ public:
             session.admission = P2PAdmissionState::NotRequired;
         } else if (_clientConn && _clientConn->isP2P()) {
             session.role = P2PSessionRole::Client;
-            session.hostPeerId = _clientConn->getRemotePeerId();
+            session.hostPeerId = _p2pSessionHost.isValid()
+                ? _p2pSessionHost : _clientConn->getRemotePeerId();
             session.admission = _clientAdmission;
             session.rejectionReason = _clientJoinRejection;
             session.state = _clientConn->isConnected()
                 ? P2PSessionState::Joining : P2PSessionState::Connecting;
+        }
+
+        if (_p2pMigrationState == P2PHostMigrationState::Electing ||
+            _p2pMigrationState == P2PHostMigrationState::Promoting ||
+            _p2pMigrationState == P2PHostMigrationState::Reconnecting) {
+            session.state = P2PSessionState::Migrating;
         }
 
         for (const auto& peer : getP2PPeers()) {
@@ -1072,11 +1589,34 @@ public:
                 ++session.readyPeerCount;
             }
         }
-        if ((_p2pListening && session.readyPeerCount != 0) ||
-            (!_p2pListening && _clientAdmission == P2PAdmissionState::Admitted)) {
+        const bool migrating =
+            _p2pMigrationState == P2PHostMigrationState::Electing ||
+            _p2pMigrationState == P2PHostMigrationState::Promoting ||
+            _p2pMigrationState == P2PHostMigrationState::Reconnecting;
+        if (!migrating && ((_p2pListening && session.readyPeerCount != 0) ||
+            (!_p2pListening && _clientAdmission == P2PAdmissionState::Admitted))) {
             session.state = P2PSessionState::Active;
         }
         return session;
+    }
+
+    std::vector<P2PSessionMemberInfo> getP2PSessionMembers() const override {
+        std::vector<P2PSessionMemberInfo> members;
+        members.reserve(_sessionMembers.size());
+        for (const auto& [key, member] : _sessionMembers) {
+            (void)key;
+            members.push_back({
+                member.peerId, member.seatId, member.connected, member.ready,
+                member.host, !member.connected && !member.host,
+            });
+        }
+        std::sort(members.begin(), members.end(),
+                  [](const P2PSessionMemberInfo& lhs,
+                     const P2PSessionMemberInfo& rhs) {
+                      if (lhs.seatId != rhs.seatId) return lhs.seatId < rhs.seatId;
+                      return lhs.peerId.value < rhs.peerId.value;
+                  });
+        return members;
     }
 
     NetConnection* findP2PPeer(const PeerId& peer) const override {
@@ -1158,6 +1698,71 @@ public:
 
     P2PReadyBarrierInfo getP2PReadyBarrierInfo() const override {
         return _p2pBarrier;
+    }
+
+    bool setP2PReconnectGracePeriodMs(uint32_t graceMs) override {
+        constexpr uint32_t kMaxGraceMs = 10u * 60u * 1000u;
+        if (graceMs > kMaxGraceMs) return false;
+        _p2pReconnectGracePeriodMs = graceMs;
+        return true;
+    }
+
+    void setP2PHostMigrationEnabled(bool enabled) override {
+        _p2pHostMigrationEnabled = enabled;
+        if (enabled && _p2pReconnectGracePeriodMs == 0) {
+            _p2pReconnectGracePeriodMs = 30000;
+        }
+        if (!enabled) {
+            _p2pMigrationState = P2PHostMigrationState::Disabled;
+            _p2pMigrationActionAtMs = 0;
+        } else if (_p2pSessionId != 0 &&
+                   _p2pMigrationState == P2PHostMigrationState::Disabled) {
+            _p2pMigrationState = P2PHostMigrationState::Stable;
+        }
+    }
+
+    bool reconnectP2P() override {
+        if (!_clientConn || !_clientConn->isP2P() ||
+            _clientAdmission != P2PAdmissionState::Admitted ||
+            _p2pSessionId == 0 || _p2pSessionEpoch == 0 ||
+            _p2pLocalSeatId == 0) return false;
+        const PeerId host = _clientConn->getRemotePeerId();
+        _p2pResumeRequested = true;
+        _p2pPreserveReadyOnConnect = true;
+        _clientConn->disconnect("P2P reconnect requested",
+                                DisconnectReason::ConnectionLost);
+        _clientConn.reset();
+        _clientNetConn.reset();
+        return connectP2PNow(host);
+    }
+
+    bool requestP2PHostMigration() override {
+        if (!_p2pListening || !_p2pHostMigrationEnabled ||
+            _sessionMembers.size() < 2 || _p2pPlannedHostDepartureAtMs != 0) {
+            return false;
+        }
+        broadcastSessionRoster(true);
+        const PeerId elected = electMigrationHost();
+        if (!elected.isValid()) return false;
+        session::MigrationPlan plan;
+        plan.sessionId = _p2pSessionId;
+        plan.currentEpoch = _p2pSessionEpoch;
+        plan.nextEpoch = _p2pSessionEpoch + 1;
+        if (plan.nextEpoch == 0) return false;
+        plan.electedHostPeerId = elected;
+        std::vector<uint8_t> body;
+        if (!session::encodeMigrationPlan(plan, body)) return false;
+        for (auto& record : _serverClients) {
+            if (record.sessionAdmitted && record.transport &&
+                record.transport->isConnected()) {
+                (void)sendSessionControl(record.transport.get(),
+                                         kMsgTypeSessionMigration, body);
+            }
+        }
+        // Give the reliable plan one maintenance window before closing the
+        // old Host transports. Callers keep pumping normally.
+        _p2pPlannedHostDepartureAtMs = sessionNowMs() + 100u;
+        return true;
     }
 
     void connect(const char* address, uint16_t port) override {
@@ -1270,6 +1875,22 @@ public:
         _clientConnectionPublished = false;
         _p2pBarrier = {};
         _p2pLocalReady = false;
+        _sessionMembers.clear();
+        _p2pSessionId = 0;
+        _p2pSessionEpoch = 0;
+        _p2pRosterRevision = 0;
+        _p2pLocalSeatId = 0;
+        _p2pNextSeatId = 1;
+        _p2pResumeRequested = false;
+        _p2pPreserveReadyOnConnect = false;
+        _p2pSessionHost = {};
+        _p2pPreviousHost = {};
+        _p2pElectedHost = {};
+        _p2pMigrationActionAtMs = 0;
+        _p2pPlannedHostDepartureAtMs = 0;
+        _p2pMigrationState = _p2pHostMigrationEnabled
+            ? P2PHostMigrationState::Stable
+            : P2PHostMigrationState::Disabled;
         _mode = ConnectionMode::Disconnected;
     }
 
@@ -1836,6 +2457,23 @@ private:
     P2PReadyBarrierInfo _p2pBarrier{};
     bool _p2pLocalReady = false;
     bool _clientConnectionPublished = false;
+    std::map<std::string, SessionMemberRecord> _sessionMembers;
+    uint64_t _p2pSessionId = 0;
+    uint32_t _p2pSessionEpoch = 0;
+    uint32_t _p2pRosterRevision = 0;
+    uint32_t _p2pLocalSeatId = 0;
+    uint32_t _p2pNextSeatId = 1;
+    uint32_t _p2pReconnectGracePeriodMs = 30000;
+    bool _p2pHostMigrationEnabled = false;
+    bool _p2pResumeRequested = false;
+    bool _p2pPreserveReadyOnConnect = false;
+    P2PHostMigrationState _p2pMigrationState = P2PHostMigrationState::Disabled;
+    PeerId _p2pSessionHost;
+    PeerId _p2pPreviousHost;
+    PeerId _p2pElectedHost;
+    uint64_t _p2pMigrationActionAtMs = 0;
+    uint64_t _p2pPlannedHostDepartureAtMs = 0;
+    uint32_t _p2pMigrationAttempts = 0;
     uint32_t _nextNetId = 0;
     uint32_t _protocolVersion = kProtocolVersion;
     NetworkLimits _limits{};

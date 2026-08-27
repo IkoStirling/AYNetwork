@@ -96,6 +96,25 @@ RPC 或复制流量。未设置 validator 时保持开发兼容模式，自动�
 原因通过 GNS 应用码跨端传递，可区分 `AdmissionRejected`、`UserQuit`、`Kicked`、
 `HostShutdown` 与真实链路丢失。
 
+断线恢复默认保留 30 秒席位。Host 只在 `ConnectionLost` 时保留
+`PeerId + sessionId + epoch + seatId`；`UserQuit`、`Kicked` 等显式离开立即释放。
+Client 调用 `reconnectP2P()` 会携带该恢复元组，校验成功后恢复原席位和 Ready 状态，
+无需重新执行游戏票据校验。可用 `setP2PReconnectGracePeriodMs()` 在 0 到 10 分钟内
+调整窗口；保留成员仍计入 Ready barrier，但在恢复前不算 Ready，因此游戏不会在缺员
+时误开局。生产环境必须由鉴权信令或平台身份把 PeerId 绑定到账号，不能信任客户端
+自报的 PeerId。
+
+可选 Host Migration 保持 listen-host 权威模型：所有节点先调用
+`setP2PHostMigrationEnabled(true)`。优雅退出时旧 Host 调用
+`requestP2PHostMigration()`，以可靠控制帧发布下一 epoch 和候选 Host；异常断线时 Client
+先尝试恢复原 Host，失败后按最低稳定席位、再按 PeerId 确定性选举。新 Host 保留
+sessionId 和存活成员席位、递增 epoch，并强制向重连成员发送完整复制基线。
+`getP2PSessionMembers()` 与 `getP2PSessionInfo()` 可观察席位、保留状态、epoch 和迁移阶段。
+
+迁移只能继承每个候选节点已收到的复制状态；仅存在旧 Host 内存中的未复制状态、
+未持久化 RPC 副作用和连接局部状态会丢失。该机制也不是分区共识：无法互通的网络
+分区可能各自选主，游戏/匹配服务仍需 epoch 仲裁或会话终止策略。
+
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。
 
@@ -104,7 +123,7 @@ RPC 或复制流量。未设置 validator 时保持开发兼容模式，自动�
 通过 WebSocket/HTTPS 转发相同的 opaque GNS 信令。TURN 凭证应短期签发，不能
 把长期密钥写入客户端。
 
-当前 P2P 拓扑仍沿用 AYNetwork 的 authority/listen-host 模型；房间目录、主机迁移
-和真正的无主机一致性协议属于会话层，不由信令转发器承担。
+当前 P2P 拓扑仍沿用 AYNetwork 的 authority/listen-host 模型，并已支持席位恢复和
+Host Migration。房间目录、跨分区仲裁和真正的无主机一致性协议不由信令转发器承担。
 
 协议版本、Authority 模型和复制/RPC 阶段见 [design.md](design.md)。
