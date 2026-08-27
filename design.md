@@ -1765,6 +1765,10 @@ layers. It does not change their wire formats or authority rules.
 - Built-in self-hosted backend: a bounded UDP rendezvous protocol with PeerId
   validation, registration, heartbeat, endpoint rebinding, opaque forwarding,
   peer expiry, message/peer caps, and a standalone server target.
+- Secure signaling v2 adds per-peer room credentials, HMAC-SHA256, a
+  challenge/confirm endpoint proof, replay windows, expiry and rate limiting.
+  See `docs/secure-signaling-v2.md`. The legacy v1 UDP backend remains only for
+  local development and trusted networks.
 - Security boundary: the built-in server does not authenticate accounts. A
   production service replaces `ISignalingTransport` with an authenticated
   HTTPS/WebSocket/platform implementation and issues short-lived TURN
@@ -1772,6 +1776,15 @@ layers. It does not change their wire formats or authority rules.
 - Process model: standalone GNS owns one identity per process. P2P identity
   setup is rejected while another GNS connection/listener is active, and P2P
   tests run in a dedicated process for the same reason.
+- Direct-path hardening (2026-08-27): STUN host names are resolved before GNS
+  connection creation/listener route installation, avoiding DNS work while the
+  GNS global lock is held. Connection state is monotonic after protocol Ready,
+  and a reconnect with the same PeerId deterministically replaces its stale
+  host-side connection.
+- Release probe: `AYNetwork_P2PSmokePeer` uses the production subsystem and
+  requires handshake + Server RPC + replicated authority state to complete
+  before running the app RTT/loss/jitter probe. It supports repeated sessions
+  and multi-peer host gates through environment settings.
 - Topology: this milestone supports listen-host/client P2P with NAT traversal
   and TURN fallback. Matchmaking rooms, host election/migration, and hostless
   state consensus are separate session/authority concerns and do not belong in

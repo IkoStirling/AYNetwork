@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <thread>
 #include <vector>
@@ -355,6 +356,77 @@ TEST_CASE(ApplicationHandlerReceivesDecodedBodyExactlyOnce) {
     client->shutdown();
     delete server;
     delete client;
+}
+
+TEST_CASE(OnePeerCanReconnectWhileAnotherPeerRemainsUsable) {
+    ayt::test::setCurrentCase("OnePeerCanReconnectWhileAnotherPeerRemainsUsable");
+
+    std::unique_ptr<INetworkSubSystem> server(createNetworkSubSystemForTest());
+    std::unique_ptr<INetworkSubSystem> client1(createNetworkSubSystemForTest());
+    std::unique_ptr<INetworkSubSystem> client2(createNetworkSubSystemForTest());
+    CHECK(server && client1 && client2);
+    CHECK(server->initialize());
+    CHECK(client1->initialize());
+    CHECK(client2->initialize());
+
+    std::atomic<int> client1Connected{0};
+    std::atomic<int> client1Disconnected{0};
+    client1->onConnectionChange([&](NetConnection*, bool connected, DisconnectReason) {
+        if (connected) ++client1Connected;
+        else ++client1Disconnected;
+    });
+    std::atomic<int> client2Deliveries{0};
+    server->onMessage(CHANNEL_RELIABLE,
+        [&](NetConnection*, uint8_t, const void* data, size_t size) {
+            static constexpr char kKeepAlive[] = "peer-two-still-alive";
+            if (size == sizeof(kKeepAlive) - 1 &&
+                std::memcmp(data, kKeepAlive, size) == 0) {
+                ++client2Deliveries;
+            }
+        });
+
+    constexpr uint16_t kPort = 27557;
+    server->listen(kPort);
+    client1->connect("127.0.0.1", kPort);
+    client2->connect("127.0.0.1", kPort);
+    std::vector<INetworkSubSystem*> systems{server.get(), client1.get(), client2.get()};
+    CHECK(pumpUntil(std::chrono::seconds(8), [&]() {
+        pumpAll(systems);
+        return server->getConnections().size() == 2 &&
+               client1->isConnected() && client2->isConnected();
+    }));
+    CHECK_INT_EQ(client1Connected.load(), 1);
+    CHECK_INT_EQ(client1Disconnected.load(), 0);
+
+    client1->disconnect();
+    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
+        pumpAll(systems);
+        return server->getConnections().size() == 1 &&
+               !client1->isConnected() && client2->isConnected();
+    }));
+    CHECK_INT_EQ(client1Disconnected.load(), 1);
+
+    static constexpr char kKeepAlive[] = "peer-two-still-alive";
+    client2->send(CHANNEL_RELIABLE, kKeepAlive, sizeof(kKeepAlive) - 1);
+    CHECK(pumpUntil(std::chrono::seconds(5), [&]() {
+        pumpAll(systems);
+        return client2Deliveries.load() == 1;
+    }));
+
+    client1->connect("127.0.0.1", kPort);
+    CHECK(pumpUntil(std::chrono::seconds(8), [&]() {
+        pumpAll(systems);
+        return server->getConnections().size() == 2 && client1->isConnected();
+    }));
+    CHECK_INT_EQ(client1Connected.load(), 2);
+    CHECK_INT_EQ(client1Disconnected.load(), 1);
+
+    server->disconnect();
+    client1->disconnect();
+    client2->disconnect();
+    server->shutdown();
+    client1->shutdown();
+    client2->shutdown();
 }
 
 TEST_CASE(ProductionDefaultsAndAdmissionGate) {

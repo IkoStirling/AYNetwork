@@ -129,7 +129,12 @@ public:
     // exposes one interface/identity per process. A normal game process owns
     // one local PeerId and may listen on several virtual ports.
     static bool setLocalP2PIdentity(const PeerId& localPeer);
-    static void setP2PAdoptFactory(uint16_t virtualPort,
+    // Resolves STUN host names before entering GNS. GNS may otherwise perform
+    // DNS while holding its global lock, directly adding lookup latency to the
+    // networking service thread. The resolved config remains valid input for
+    // all backends because only host names are replaced with numeric IPv4.
+    static bool prepareP2PConfig(P2PConfig& config, std::string* error = nullptr);
+    static bool setP2PAdoptFactory(const P2PConfig& config,
                                    std::shared_ptr<ISignalingTransport> signaling,
                                    P2PAdoptFactory factory);
     static void clearP2PAdoptFactory(uint16_t virtualPort);

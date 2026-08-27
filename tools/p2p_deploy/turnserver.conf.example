@@ -1,0 +1,26 @@
+# coturn baseline for AYNetwork probes. Replace every deployment value.
+listening-port=3478
+tls-listening-port=5349
+fingerprint
+lt-cred-mech
+realm=turn.example.com
+
+# Prefer TURN REST short-lived credentials. Keep this secret server-side.
+use-auth-secret
+static-auth-secret=CHANGE_ME_WITH_AT_LEAST_32_RANDOM_BYTES
+
+# Keep the relay range deliberate and open the same range in the firewall.
+min-port=49160
+max-port=49200
+
+# Public hosts behind one-to-one NAT should configure external-ip explicitly.
+# external-ip=PUBLIC_IP/PRIVATE_IP
+
+no-cli
+no-multicast-peers
+no-loopback-peers
+stale-nonce=600
+
+# Configure real certificates before enabling TLS/TURNS.
+# cert=/etc/letsencrypt/live/turn.example.com/fullchain.pem
+# pkey=/etc/letsencrypt/live/turn.example.com/privkey.pem

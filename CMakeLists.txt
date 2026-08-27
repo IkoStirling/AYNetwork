@@ -11,6 +11,7 @@ set(SRC_FILES
     src/Transport/GnsConnection.cpp
     src/Transport/UdpSocket.cpp
     src/Signaling/UdpSignaling.cpp
+    src/Signaling/SecureUdpSignaling.cpp
     src/Protocol/PacketAssembler.cpp
     src/Protocol/PacketCodec.cpp
     src/Protocol/AckPipeline.cpp
@@ -51,6 +52,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
     AYStorage                              # R2: Lz4Decompressor (decode side)
     AYReflect                              # R3.0: ITypeInfo + FieldAttribute::NetReplicate walk
     AYReplay                               # R5.3 (2026-08-24): IReplayRecorder interface
+    AYCrypto                               # authenticated P2P signaling tokens/HMAC
     GameNetworkingSockets::GameNetworkingSockets   # R1: GNS shared variant
     lz4::lz4                               # R2: PacketCodec encode side
 )
@@ -80,6 +82,8 @@ option(AYNETWORK_BUILD_SIGNALING_SERVER "Build AYNetwork UDP signaling server" O
 if(AYNETWORK_BUILD_SIGNALING_SERVER)
     add_executable(AYNetwork_SignalingServer tools/signaling/main.cpp)
     target_link_libraries(AYNetwork_SignalingServer PRIVATE AYNetwork)
+    add_executable(AYNetwork_SecureSignalingServer tools/secure_signaling/main.cpp)
+    target_link_libraries(AYNetwork_SecureSignalingServer PRIVATE AYNetwork)
     add_executable(AYNetwork_P2PSmokePeer tools/p2p_smoke/main.cpp)
     target_link_libraries(AYNetwork_P2PSmokePeer PRIVATE AYNetwork)
 endif()

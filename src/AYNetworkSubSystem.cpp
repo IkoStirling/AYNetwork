@@ -199,6 +199,26 @@ public:
             ::fprintf(stderr, "[Network] incoming conn %u but server not listening\n", incoming);
             return nullptr;
         }
+        // A PeerId names one active engine session. A reconnect can arrive
+        // before GNS reports the old path closed (notably after NAT/interface
+        // changes), so replace the stale route deterministically instead of
+        // retaining two authoritative connections for the same peer.
+        if (remotePeer) {
+            for (auto it = _serverClients.begin(); it != _serverClients.end();) {
+                if (it->transport && it->transport->isP2P() &&
+                    it->transport->getRemotePeerId() == *remotePeer) {
+                    it->transport->disconnect("superseded P2P peer session");
+                    if (_extension && it->facade &&
+                        !it->extensionDisconnectNotified) {
+                        _extension->onConnectionDisconnected(it->facade.get());
+                        it->extensionDisconnectNotified = true;
+                    }
+                    it = _serverClients.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         if (_serverClients.size() >= _limits.maxConnections) {
             GnsConnection::s_gns->CloseConnection(
                 incoming, 0, "server connection limit reached", false);
@@ -248,6 +268,7 @@ public:
                 const bool connected = (newS == GnsConnectionState::Ready)
                     || (newS == GnsConnectionState::Connected
                         && rawChild->getProtocolVersion() == 0);
+                if (!connected && newS != GnsConnectionState::Disconnected) return;
                 const DisconnectReason reason = connected
                     ? DisconnectReason::Unknown
                     : rawChild->getLastDisconnectReason();
@@ -264,6 +285,7 @@ public:
                 const bool connected = (newS == GnsConnectionState::Ready)
                     || (newS == GnsConnectionState::Connected
                         && rawChild->getProtocolVersion() == 0);
+                if (!connected && newS != GnsConnectionState::Disconnected) return;
                 const DisconnectReason reason = connected
                     ? DisconnectReason::Unknown
                     : rawChild->getLastDisconnectReason();
@@ -637,11 +659,11 @@ public:
         if (_p2pListening) {
             GnsConnection::clearP2PAdoptFactory(_p2pConfig.virtualPort);
         }
-        GnsConnection::setP2PAdoptFactory(
-            _p2pConfig.virtualPort, _p2pSignaling,
+        if (!GnsConnection::setP2PAdoptFactory(
+            _p2pConfig, _p2pSignaling,
             [this](HSteamNetConnection incoming, const PeerId& remotePeer) {
                 return adoptIncomingClient(incoming, &remotePeer, _p2pConfig.virtualPort);
-            });
+            })) return false;
         _p2pListening = true;
         _mode = ConnectionMode::ListenServer;
         return true;
@@ -686,6 +708,7 @@ public:
                 const bool connected = (newState == GnsConnectionState::Ready) ||
                     (newState == GnsConnectionState::Connected &&
                      _clientConn->getProtocolVersion() == 0);
+                if (!connected && newState != GnsConnectionState::Disconnected) return;
                 const DisconnectReason reason = connected
                     ? DisconnectReason::Unknown : _clientConn->getLastDisconnectReason();
                 _connectionHandler(_clientNetConn.get(), connected, reason);
@@ -750,6 +773,7 @@ public:
                 bool connected = (newS == GnsConnectionState::Ready) ||
                                  (newS == GnsConnectionState::Connected &&
                                   _clientConn->getProtocolVersion() == 0);
+                if (!connected && newS != GnsConnectionState::Disconnected) return;
                 DisconnectReason reason = connected
                     ? DisconnectReason::Unknown
                     : _clientConn->getLastDisconnectReason();
@@ -945,6 +969,7 @@ public:
                     bool connected = (newS == GnsConnectionState::Ready) ||
                                      (newS == GnsConnectionState::Connected &&
                                       _clientConn->getProtocolVersion() == 0);
+                    if (!connected && newS != GnsConnectionState::Disconnected) return;
                     DisconnectReason reason = connected
                         ? DisconnectReason::Unknown
                         : _clientConn->getLastDisconnectReason();

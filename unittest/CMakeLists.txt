@@ -66,6 +66,7 @@ set(P2P_TEST_NAME AYNetwork_P2P_Test)
 add_executable(${P2P_TEST_NAME}
     main.cpp
     AYTest_P2P.cpp
+    AYTest_SecureSignaling.cpp
 )
 target_compile_definitions(${P2P_TEST_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
 target_link_libraries(${P2P_TEST_NAME} PRIVATE AYNetwork AYTest AYCore)

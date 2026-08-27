@@ -15,6 +15,7 @@
 //   5. gns::shutdown() — call from NetworkSubSystem::shutdown().
 
 #include <AYNetwork/Transport/GnsConnection.h>
+#include <AYNetwork/Transport/UdpSocket.h>
 #include <AYNetwork/INetwork.h>                  // R1 done: HandshakeMsgType / DisconnectReason / kProtocolVersion
 #include <AYNetwork/Protocol/PacketCodec.h>                  // R2: framing layer
 #include <AYNetwork/Profiler/ProfilerMsgType.h> // R5.5 (2026-08-25): handshake extras-key helper
@@ -30,9 +31,11 @@
 
 #include <atomic>
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -70,6 +73,7 @@ static std::unordered_map<HSteamListenSocket, GnsConnection*>& listenerOwners() 
 }
 
 struct P2PListenerRoute {
+    P2PConfig config;
     std::shared_ptr<ISignalingTransport> signaling;
     GnsConnection::P2PAdoptFactory factory;
 };
@@ -270,6 +274,142 @@ void GnsConnection::clearAdoptFactory(HSteamListenSocket listener) {
 namespace
 {
 
+std::string joinCommaSeparated(const std::vector<std::string>& values) {
+    std::string result;
+    for (const auto& value : values) {
+        if (value.empty()) continue;
+        if (!result.empty()) result.push_back(',');
+        result += value;
+    }
+    return result;
+}
+
+bool splitIceEndpoint(const std::string& endpoint,
+                      std::string& prefix,
+                      std::string& host,
+                      std::string& portSuffix) {
+    prefix.clear();
+    host.clear();
+    portSuffix.clear();
+    if (endpoint.empty()) return false;
+
+    std::string_view value{endpoint};
+    const size_t scheme = value.find("://");
+    if (scheme != std::string_view::npos) {
+        prefix.assign(value.substr(0, scheme + 3));
+        value.remove_prefix(scheme + 3);
+    } else if (value.starts_with("stun:")) {
+        prefix = "stun:";
+        value.remove_prefix(5);
+    }
+    if (value.empty()) return false;
+    // Numeric IPv6 endpoints are already resolved. Preserve their brackets
+    // and optional port exactly as supplied.
+    if (value.front() == '[') {
+        const size_t close = value.find(']');
+        if (close == std::string_view::npos) return false;
+        host.assign(value);
+        return true;
+    }
+
+    const size_t colon = value.rfind(':');
+    if (colon != std::string_view::npos) {
+        if (value.find(':') != colon) {
+            // Unbracketed IPv6 is left unchanged; GNS accepts numeric IPv6.
+            host.assign(value);
+            return true;
+        }
+        const std::string_view port = value.substr(colon + 1);
+        unsigned parsedPort = 0;
+        const auto parsed = std::from_chars(
+            port.data(), port.data() + port.size(), parsedPort);
+        if (port.empty() || parsed.ec != std::errc{} ||
+            parsed.ptr != port.data() + port.size() ||
+            parsedPort == 0 || parsedPort > 65535) {
+            return false;
+        }
+        host.assign(value.substr(0, colon));
+        portSuffix.assign(value.substr(colon));
+    } else {
+        host.assign(value);
+    }
+    return !host.empty();
+}
+
+bool resolveStunServers(P2PConfig& config, std::string* error) {
+    UdpSocket resolverSocket;
+    if (!resolverSocket.create()) {
+        if (error) *error = "unable to initialize UDP resolver";
+        return false;
+    }
+    for (std::string& endpoint : config.stunServers) {
+        std::string prefix;
+        std::string host;
+        std::string portSuffix;
+        if (!splitIceEndpoint(endpoint, prefix, host, portSuffix)) {
+            if (error) *error = "invalid STUN endpoint: " + endpoint;
+            return false;
+        }
+        if (!host.empty() && (host.front() == '[' || host.find(':') != std::string::npos)) {
+            continue;
+        }
+        std::string resolved;
+        if (!UdpSocket::resolveIPv4(host.c_str(), resolved)) {
+            if (error) *error = "failed to resolve STUN host: " + host;
+            return false;
+        }
+        endpoint = prefix + resolved + portSuffix;
+    }
+    return true;
+}
+
+int iceCandidateMask(const P2PConfig& config) {
+    int mask = 0;
+    if (config.icePolicy != P2PIcePolicy::RelayOnly) {
+        if (config.allowPrivateCandidates) {
+            mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Private;
+        }
+        if (!config.stunServers.empty()) {
+            mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Public;
+        }
+    }
+    if (config.icePolicy != P2PIcePolicy::DirectOnly && !config.turnServers.empty()) {
+        mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Relay;
+    }
+    return mask;
+}
+
+bool applyIncomingP2PConfig(HSteamNetConnection connection,
+                            const P2PConfig& config) {
+    if (!gns::g_utils || connection == k_HSteamNetConnection_Invalid ||
+        !config.isValid()) return false;
+
+    const int iceMask = iceCandidateMask(config);
+    const std::string stun = joinCommaSeparated(config.stunServers);
+    const std::string turn = joinCommaSeparated(config.turnServers);
+    const std::string turnUsers = joinCommaSeparated(config.turnUsers);
+    const std::string turnPasswords = joinCommaSeparated(config.turnPasswords);
+
+    // Custom-signaling incoming connections do not inherit the initiating
+    // peer's options. Apply the listener policy before AcceptConnection(),
+    // which is the point where GNS transitions into route discovery.
+    return gns::g_utils->SetConnectionConfigValueInt32(
+               connection, k_ESteamNetworkingConfig_P2P_Transport_ICE_Enable,
+               iceMask) &&
+           gns::g_utils->SetConnectionConfigValueString(
+               connection, k_ESteamNetworkingConfig_P2P_STUN_ServerList,
+               stun.c_str()) &&
+           gns::g_utils->SetConnectionConfigValueString(
+               connection, k_ESteamNetworkingConfig_P2P_TURN_ServerList,
+               turn.c_str()) &&
+           gns::g_utils->SetConnectionConfigValueString(
+               connection, k_ESteamNetworkingConfig_P2P_TURN_UserList,
+               turnUsers.c_str()) &&
+           gns::g_utils->SetConnectionConfigValueString(
+               connection, k_ESteamNetworkingConfig_P2P_TURN_PassList,
+               turnPasswords.c_str());
+}
+
 class GnsCustomConnectionSignaling final : public ISteamNetworkingConnectionSignaling {
 public:
     GnsCustomConnectionSignaling(std::shared_ptr<ISignalingTransport> signaling,
@@ -317,6 +457,12 @@ public:
         // account. Missing or mismatching identity inside the GNS signal is
         // always suspicious and is rejected here.
         if (!remote.isValid() || remote != _sender) return nullptr;
+        if (!applyIncomingP2PConfig(connection, route.config)) {
+            ::fprintf(stderr,
+                      "[GnsConnection] failed to apply incoming P2P config on vport %d\n",
+                      localVirtualPort);
+            return nullptr;
+        }
         if (!route.factory || !route.factory(connection, remote)) return nullptr;
         return new GnsCustomConnectionSignaling(
             route.signaling ? route.signaling : _signaling, std::move(remote));
@@ -334,32 +480,6 @@ private:
     PeerId _sender;
     std::shared_ptr<ISignalingTransport> _signaling;
 };
-
-std::string joinCommaSeparated(const std::vector<std::string>& values) {
-    std::string result;
-    for (const auto& value : values) {
-        if (value.empty()) continue;
-        if (!result.empty()) result.push_back(',');
-        result += value;
-    }
-    return result;
-}
-
-int iceCandidateMask(const P2PConfig& config) {
-    int mask = 0;
-    if (config.icePolicy != P2PIcePolicy::RelayOnly) {
-        if (config.allowPrivateCandidates) {
-            mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Private;
-        }
-        if (!config.stunServers.empty()) {
-            mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Public;
-        }
-    }
-    if (config.icePolicy != P2PIcePolicy::DirectOnly && !config.turnServers.empty()) {
-        mask |= k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Relay;
-    }
-    return mask;
-}
 
 } // namespace
 
@@ -394,16 +514,35 @@ bool GnsConnection::setLocalP2PIdentity(const PeerId& localPeer) {
     return true;
 }
 
-void GnsConnection::setP2PAdoptFactory(
-    uint16_t virtualPort,
+bool GnsConnection::prepareP2PConfig(P2PConfig& config, std::string* error) {
+    if (error) error->clear();
+    if (!config.isValid()) {
+        if (error) *error = "invalid P2P configuration";
+        return false;
+    }
+    return resolveStunServers(config, error) && config.isValid();
+}
+
+bool GnsConnection::setP2PAdoptFactory(
+    const P2PConfig& config,
     std::shared_ptr<ISignalingTransport> signaling,
     P2PAdoptFactory factory) {
-    std::lock_guard<std::recursive_mutex> lock(registryMutex);
-    if (signaling && factory) {
-        p2pListenerRoutes()[virtualPort] = {std::move(signaling), std::move(factory)};
-    } else {
-        p2pListenerRoutes().erase(virtualPort);
+    P2PConfig prepared = config;
+    std::string prepareError;
+    if (!signaling || !factory ||
+        !prepareP2PConfig(prepared, &prepareError)) {
+        std::lock_guard<std::recursive_mutex> lock(registryMutex);
+        p2pListenerRoutes().erase(config.virtualPort);
+        if (!prepareError.empty()) {
+            ::fprintf(stderr, "[GnsConnection] P2P listener config rejected: %s\n",
+                      prepareError.c_str());
+        }
+        return false;
     }
+    std::lock_guard<std::recursive_mutex> lock(registryMutex);
+    p2pListenerRoutes()[prepared.virtualPort] = {
+        std::move(prepared), std::move(signaling), std::move(factory)};
+    return true;
 }
 
 void GnsConnection::clearP2PAdoptFactory(uint16_t virtualPort) {
@@ -481,17 +620,24 @@ bool GnsConnection::initP2PClient(
         !signaling || !signaling->isRunning()) {
         return false;
     }
-    const int iceMask = iceCandidateMask(config);
+    P2PConfig prepared = config;
+    std::string prepareError;
+    if (!prepareP2PConfig(prepared, &prepareError)) {
+        ::fprintf(stderr, "[GnsConnection] P2P client config rejected: %s\n",
+                  prepareError.c_str());
+        return false;
+    }
+    const int iceMask = iceCandidateMask(prepared);
     if (iceMask == 0) return false;
 
     SteamNetworkingIdentity remoteIdentity;
     remoteIdentity.Clear();
     if (!remoteIdentity.SetGenericString(remotePeer.value.c_str())) return false;
 
-    const std::string stun = joinCommaSeparated(config.stunServers);
-    const std::string turn = joinCommaSeparated(config.turnServers);
-    const std::string turnUsers = joinCommaSeparated(config.turnUsers);
-    const std::string turnPasswords = joinCommaSeparated(config.turnPasswords);
+    const std::string stun = joinCommaSeparated(prepared.stunServers);
+    const std::string turn = joinCommaSeparated(prepared.turnServers);
+    const std::string turnUsers = joinCommaSeparated(prepared.turnUsers);
+    const std::string turnPasswords = joinCommaSeparated(prepared.turnPasswords);
     std::vector<SteamNetworkingConfigValue_t> options;
     options.reserve(5);
     SteamNetworkingConfigValue_t option;
@@ -1017,7 +1163,11 @@ void GnsConnection::disconnect(const char* reason) {
         if (_lastDisconnectReason == DisconnectReason::Unknown) {
             _lastDisconnectReason = DisconnectReason::UserQuit;
         }
-        // linger=false: drop immediately. R2 will switch to graceful close.
+        // Ask GNS to push queued reliable frames before closing. Keeping the
+        // connection in GNS linger state is unsafe here because this wrapper
+        // intentionally releases its handle synchronously; the close itself
+        // still carries the reason to a reachable peer.
+        (void)s_gns->FlushMessagesOnConnection(_conn);
         s_gns->CloseConnection(_conn, 0, reason, false);
         _conn = k_HSteamNetConnection_Invalid;
     }
@@ -1118,6 +1268,12 @@ void GnsConnection::setState(GnsConnectionState newState) {
 void GnsConnection::handleStatusChange(int /*oldGnsState*/, int newGnsState) {
     switch (newGnsState) {
         case k_ESteamNetworkingConnectionState_Connected: {
+            // Custom-signaling P2P can deliver and complete the protocol
+            // handshake from ReceivedP2PCustomSignal before GNS dispatches a
+            // queued Connected status callback. Connection state is monotonic:
+            // a late transport callback must never downgrade Ready and cause
+            // all subsequent application packets to be rejected.
+            if (_state == GnsConnectionState::Ready) break;
             // R1 done: branch on protocol version. Legacy (version=0) goes
             // straight to Connected (which == Ready under isConnected()).
             // With handshake enabled, transition to Handshaking and the
@@ -1331,6 +1487,12 @@ void GnsConnection::_handleHandshake(const uint8_t* data, size_t len) {
         if (s_gns && _conn != k_HSteamNetConnection_Invalid) {
             s_gns->CloseConnection(_conn, 0, "rejected by peer", false);
         }
+        {
+            std::lock_guard<std::recursive_mutex> lock(registryMutex);
+            connMap().erase(_conn);
+        }
+        _conn = k_HSteamNetConnection_Invalid;
+        setState(GnsConnectionState::Disconnected);
         return;
     }
 

@@ -2,6 +2,7 @@
 
 #include <AYNetwork.h>
 #include <AYNetwork/Signaling/UdpSignaling.h>
+#include <AYNetwork/Transport/GnsConnection.h>
 #include <AYNetwork/Transport/UdpSocket.h>
 #include <AYTest.h>
 
@@ -70,6 +71,25 @@ TEST_CASE(PeerIdentityAndConfigValidation) {
     config.turnServers = {"turn:a.test:3478"};
     config.turnUsers = {""};
     CHECK(!config.isValid());
+}
+
+TEST_CASE(StunHostnamesArePreparedBeforeEnteringGns) {
+    ayt::test::setCurrentCase("StunHostnamesArePreparedBeforeEnteringGns");
+    P2PConfig config;
+    config.localPeerId = PeerId{"resolver-test"};
+    config.icePolicy = P2PIcePolicy::DirectOnly;
+    config.allowPrivateCandidates = false;
+    config.stunServers = {"localhost:3478", "127.0.0.1:3479", "stun:localhost:3480"};
+    std::string error;
+    CHECK(GnsConnection::prepareP2PConfig(config, &error));
+    CHECK(error.empty());
+    CHECK(config.stunServers[0] == "127.0.0.1:3478");
+    CHECK(config.stunServers[1] == "127.0.0.1:3479");
+    CHECK(config.stunServers[2] == "stun:127.0.0.1:3480");
+
+    config.stunServers = {"host:invalid-port"};
+    CHECK(!GnsConnection::prepareP2PConfig(config, &error));
+    CHECK(!error.empty());
 }
 
 TEST_CASE(UdpClientRejectsPacketFromUnexpectedEndpoint) {
