@@ -164,6 +164,12 @@ claim、重启恢复和 XChaCha20-Poly1305 凭证静态加密。`HttpOnlineServi
 后端中立 HMAC 玩家 token、持久 SQLite state 与独立 fleet token。完整边界见
 [docs/online-services.md](docs/online-services.md)。
 
+游戏侧可由 `OnlineSessionCoordinator` 非阻塞编排 Lobby 和匹配票据，并把 P2P assignment
+中的现成 grant 直接交给 `P2PSessionCoordinator`，避免重复 join；Dedicated assignment
+则通过可替换的 `IDedicatedSessionConnector` 安装 reservation token、连接并回报状态。
+统一状态覆盖 `Idle / InLobby / Queueing / Assigned / Connecting / InSession / Failed`，
+取消竞争会以 canonical ticket 结果为准，不会静默丢弃已经提交的 assignment。
+
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。
 

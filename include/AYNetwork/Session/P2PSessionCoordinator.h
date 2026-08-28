@@ -77,6 +77,12 @@ public:
     // createSession uses config.p2p.virtualPort and config.capacity.
     bool createSession();
     bool joinSession(uint64_t sessionId);
+
+    // Starts from a backend grant already issued by Lobby or Matchmaking.
+    // This does not call createSession()/joinSession() again. The grant must
+    // belong to config.p2p.localPeerId; the backend Host identity determines
+    // whether AYNetwork listens or connects.
+    bool startAssignedSession(P2PSessionGrant grant);
     bool leaveSession();
     bool requestHostMigration();
     void update();

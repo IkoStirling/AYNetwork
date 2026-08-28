@@ -2046,12 +2046,36 @@ The online-service boundary and first-version behavior are documented in
   process E2E requires SQLite plus signed player authentication and executes all
   Online Services route families through `SessionServer`.
 
+### 15.23 Game-facing Online Session coordinator (2026-08-28)
+
+- `OnlineSessionCoordinator` turns Lobby discovery/lifecycle and Matchmaking
+  enqueue/poll/cancel into one non-blocking game-loop state machine. At most one
+  backend request is in flight; `update()` consumes results and advances the
+  local transport on the owner thread.
+- P2P Lobby and Match assignments carry an already-issued per-player grant.
+  `P2PSessionCoordinator::startAssignedSession()` now installs that grant
+  directly and derives listen/connect from the canonical backend Host, avoiding
+  a duplicate join, extra seat, or replacement ticket.
+- Dedicated assignment crosses the engine boundary through
+  `IDedicatedSessionConnector`. The application receives the complete
+  reservation before connecting and owns its game-specific admission handshake;
+  the coordinator observes only non-blocking Connecting/Active/Failed state.
+- Match cancellation is intent-preserving across in-flight enqueue/poll calls.
+  A cancellation/assignment Conflict is reconciled by reading the canonical
+  ticket, so a committed assignment is consumed rather than leaked. Bounded
+  transient poll retries preserve a live ticket for explicit cleanup.
+- Tests cover Lobby create/update/launch/leave, discovery/join/refresh, direct
+  P2P assignment bootstrap without a second backend member, cancellation retry
+  and committed-assignment reconciliation, Dedicated reservation handoff/lifecycle,
+  and malformed-assignment fail-closed.
+
 ---
 
 ## 16. Changelog
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-28 | **Online Session Coordinator**：新增非阻塞 Lobby/Matchmaking 游戏侧状态机；assignment grant 直接接入 `P2PSessionCoordinator`，避免重复 join；Dedicated reservation 通过可替换 connector 交付；取消竞争按 canonical ticket 对账，并覆盖 P2P/Dedicated/失败回滚测试。 |
 | 2026-08-28 | **Durable Online Services backend**：新增规范化 SQLite Lobby/Match/Dedicated store、WAL/事务容量预留、跨进程过期 claim、assignment 与 server/allocation token 静态加密、schema/key 启动门禁；新增后端中立 HMAC 玩家 bearer、生产 SessionServer 接入、重启/并发/保密测试与 production E2E。 |
 | 2026-08-28 | **Authenticated Online Services HTTP**：新增 `HttpOnlineServices` 客户端和共享 SessionServer 路由；bearer 派生 PeerId、party 独立授权、fleet/server/reservation 三域凭证；在线路由复用限流/审计；新增 `AYNetwork_OnlineProbe` 多进程 E2E 与生产临时状态拒绝门禁。 |
 | 2026-08-28 | **Durable backend + Online Services v1**：SQLite WAL/事务 epoch CAS、token 静态加密、持久 Ed25519 key、HTTP 准入/限流/审计与生产启动门禁；补分区故障矩阵；新增 Lobby、party Matchmaking、Dedicated lease/drain/allocation 契约和线程安全参考实现，并接入现有 P2P session backend。 |

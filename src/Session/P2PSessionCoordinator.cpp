@@ -157,7 +157,13 @@ bool P2PSessionCoordinatorConfig::isValid() const {
 }
 
 struct P2PSessionCoordinator::Impl {
-    enum class OperationKind : uint8_t { None, Create, Join, Leave };
+    enum class OperationKind : uint8_t {
+        None,
+        Create,
+        Join,
+        Assigned,
+        Leave,
+    };
     struct OperationResult {
         OperationKind kind = OperationKind::None;
         SessionServiceError error = SessionServiceError::None;
@@ -382,7 +388,11 @@ struct P2PSessionCoordinator::Impl {
         lease = std::make_unique<P2PSessionLeaseKeeper>(
             service, grant.member, config.lease);
 
-        const bool hosting = result.kind == OperationKind::Create;
+        // Lobby and Matchmaking hand out a complete grant, so operation kind
+        // cannot be used to infer the local role. The canonical backend Host
+        // identity is also correct for direct create/join operations.
+        const bool hosting =
+            grant.session.hostPeerId == grant.member.peerId;
         const bool started = hosting
             ? network.listenP2P()
             : network.connectP2P(grant.session.hostPeerId);
@@ -571,6 +581,26 @@ bool P2PSessionCoordinator::joinSession(uint64_t sessionId) {
         return false;
     }
     return _impl->startOperation(Impl::OperationKind::Join, sessionId);
+}
+
+bool P2PSessionCoordinator::startAssignedSession(P2PSessionGrant grant) {
+    if (_impl->status.state != P2PSessionCoordinatorState::Idle ||
+        _impl->busy()) {
+        _impl->status.error = P2PSessionCoordinatorError::Busy;
+        _impl->status.message = "session coordinator is busy";
+        return false;
+    }
+    if (!grant.isValid() ||
+        grant.member.peerId != _impl->config.p2p.localPeerId) {
+        _impl->fail(P2PSessionCoordinatorError::InvalidConfiguration,
+                    SessionServiceError::ProtocolError,
+                    "assigned session grant is invalid or belongs to another peer");
+        return false;
+    }
+    Impl::OperationResult result;
+    result.kind = Impl::OperationKind::Assigned;
+    result.grant = std::move(grant);
+    return _impl->bootstrap(std::move(result));
 }
 
 bool P2PSessionCoordinator::leaveSession() {

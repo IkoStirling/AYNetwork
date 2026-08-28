@@ -52,6 +52,51 @@ draining server 不再接新局，仍有 allocation 时注销会进入排空并�
 参考选择器优先选择占用比例最低的 server，再以 server ID 打破平局，结果可复现且不会
 超卖声明容量。
 
+## 游戏侧 OnlineSessionCoordinator
+
+`OnlineSessionCoordinator` 把上述后端接口收束成游戏循环可驱动的状态机。Lobby 的创建、
+发现、加入、刷新、CAS 更新、离开和启动，以及 Matchmaking 的入队、轮询、取消与 assignment
+接续均不会在调用线程执行 HTTP；游戏每帧调用一次 `update()` 消费完成结果即可。
+
+```cpp
+#include <AYNetwork/Session/OnlineSessionCoordinator.h>
+
+P2PSessionCoordinator p2p(network, sessionService, p2pConfig);
+OnlineSessionCoordinatorConfig onlineConfig;
+onlineConfig.localPeerId = localPeer;
+OnlineSessionCoordinator online(
+    lobbyService, matchmakingService, p2p,
+    std::move(onlineConfig), dedicatedConnector);
+
+MatchmakingRequest request;
+request.queue = "default";
+request.region = "asia";
+request.buildId = buildId;
+request.topology = MatchTopology::Any;
+request.targetPlayers = 2;
+request.virtualPort = 7350;
+online.startMatchmaking(std::move(request)); // 空 party 自动成为 solo ticket
+
+// regular application/network loop
+online.update();
+const auto status = online.getStatus();
+```
+
+匹配完成后，P2P assignment 中属于本地 `PeerId` 的现成 grant 会直接交给
+`P2PSessionCoordinator::startAssignedSession()`，不会再次调用后端 join、重复占用席位或重新
+签票。初始 Host 由 grant 的后端 Host 身份决定，而不是由客户端猜测。
+
+Dedicated assignment 通过 `IDedicatedSessionConnector` 交给应用。connector 必须先安装完整
+`DedicatedAllocation`（包括短期 reservation token），再启动 IP 连接和专用服准入握手；
+AYNetwork 不把某一种游戏服认证协议硬编码进通用 `connect()`。connector 的 `update()` 和
+`getStatus()` 必须非阻塞。reservation token 属于秘密，不应写入普通日志或遥测。
+
+协调器保留“取消意图”：即使 enqueue/poll 正在进行，也会在 ticket id 到达后继续取消。
+若取消与 assignment 提交竞争并返回 Conflict，协调器会重新读取 canonical ticket；已经提交
+的 assignment 不会被静默丢弃。连续临时轮询错误按配置重试，终止后仍可调用
+`cancelMatchmaking()` 清理活 ticket。`leaveSession()` 会先离开 P2P 或断开 Dedicated，
+Lobby 启动的会话随后再撤销 Lobby membership。
+
 ## HTTP 接入
 
 `HttpOnlineServices` 实现三个客户端接口；同一组路由可选挂载到

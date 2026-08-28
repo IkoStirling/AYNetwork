@@ -70,6 +70,7 @@ add_executable(${P2P_TEST_NAME}
     AYTest_SecureSignaling.cpp
     AYTest_SessionService.cpp
     AYTest_SessionCoordinator.cpp
+    AYTest_OnlineSessionCoordinator.cpp
     AYTest_DurableSessionService.cpp
     AYTest_OnlineServices.cpp
     AYTest_DurableOnlineServices.cpp
