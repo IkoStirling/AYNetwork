@@ -75,7 +75,7 @@ draining server 不再接新局，仍有 allocation 时注销会进入排空并�
 | POST | `/v1/dedicated/allocations` | Fleet control token |
 | POST | `/v1/dedicated/allocations/{id}/release` | Reservation Bearer |
 
-参考 `AYNetwork_SessionServer` 可通过以下环境变量启用该 API：
+参考 `AYNetwork_SessionServer` 可通过以下环境变量启用开发模式 API：
 
 ```powershell
 $env:AY_ONLINE_ENABLE = "1"
@@ -84,19 +84,61 @@ $env:AY_ONLINE_SERVER_TOKEN = "<至少 32 字符的 fleet/orchestrator token>"
 ```
 
 凭证文件每行是 `<PeerId> <token>`，PeerId 与 token 都不可重复，token 至少 32 字符。
-该文件仅是可执行 E2E 和受控联调使用的认证适配器；正式账号服务应直接设置
-`playerAuthenticator` / `partyAuthorizer`。`AY_ONLINE_SERVER_TOKEN` 只用于受信 fleet
-操作，Dedicated 实例注册后会获得自己的 server bearer。
+该文件仅供 E2E 和受控联调使用。生产模式使用后端中立的 HMAC 玩家凭证：账号服务调用
+`issuePlayerAccessToken()` 签发短期 bearer，SessionServer 通过 `AY_ONLINE_AUTH_KEY` 验证并
+取得可信 `PeerId`。它不依赖 Steam 或其他平台账号；平台登录、封禁和 refresh token 仍由
+应用账号服务负责。`AY_ONLINE_SERVER_TOKEN` 只用于受信 fleet 操作，Dedicated 实例注册
+后会获得自己的 server bearer。HTTP party ticket 还需要应用安装 `partyAuthorizer`；参考
+SessionServer 的安全默认值只允许单人 ticket，避免客户端伪造队友。
 
-## 当前实现与持久化边界
+## SQLite 持久化实现
 
 `InMemoryOnlineServices` 是线程安全、有限容量的第一版参考业务实现，并真实接入现有 P2P
 session backend。默认最多 64 人 Lobby/Match、4096 容量 Dedicated Server，防止单请求
 产生无界 grant 响应。它适合引擎集成测试、单进程服务和规则原型。
 
+`SqliteOnlineServices` 是可部署的同机持久实现：
+
+- Lobby、成员、匹配 ticket/party、Dedicated server 和 allocation 使用规范化表；写操作
+  运行在 `BEGIN IMMEDIATE` 事务中，容量预留不会超卖。
+- WAL、`synchronous=FULL` 和 schema version 门禁保证重启恢复并拒绝未知格式；数据库必须
+  位于本地磁盘，不能放 SMB/NFS 共享目录。
+- Lobby launch 与 matchmaking 使用带过期时间的持久 claim，多进程 worker 只会有一个
+  提交外部 P2P/Dedicated 副作用；进程崩溃后 claim 会回到可执行状态。
+- server token、allocation token 和包含 Join Ticket/信令 token 的匹配 assignment 使用
+  XChaCha20-Poly1305 静态加密；错误的 storage key 会在启动时被拒绝。
+- server lease、allocation 和已完成 ticket 都有回收期限。默认已完成 ticket 保留 24 小时，
+  使客户端可在服务重启后继续轮询结果。
+
+外部 P2P 会话创建与 SQLite 提交不是分布式原子事务。若进程恰好在 P2P 创建成功后、结果
+提交前崩溃，claim 会恢复，但旧 P2P 会话可能存活到自身 lease 过期；它没有可取回的 assignment，
+不能授权新玩家。跨主机部署或需要严格 outbox/补偿审计时，应在三个服务接口后接应用事务
+数据库和任务队列。
+
+生产参考配置如下；`AY_ONLINE_DB` 未设置时会复用 `AY_SESSION_DB`：
+
+```powershell
+$env:AY_SESSION_PRODUCTION = "1"
+$env:AY_SESSION_DB = "D:\AYNetwork\state.sqlite3"
+$env:AY_SESSION_STATE_KEY = "<64 个 hex 字符；同时加密 session/online state>"
+$env:AY_SESSION_TICKET_KEY_FILE = "D:\AYNetwork\ticket-signing.key"
+$env:AY_SESSION_ADMISSION_TOKEN = "<至少 32 字符>"
+$env:AY_SESSION_AUDIT_FILE = "D:\AYNetwork\audit.jsonl"
+$env:AY_SESSION_HTTP_BIND = "127.0.0.1"
+
+$env:AY_ONLINE_ENABLE = "1"
+$env:AY_ONLINE_AUTH_KEY = "<账号服务与 SessionServer 共享的 64 hex HMAC key>"
+$env:AY_ONLINE_SERVER_TOKEN = "<至少 32 字符的 fleet/orchestrator token>"
+```
+
+生产 HTTP 必须监听回环并由反向代理终止 TLS。当前 token verifier 接受单一 signing key；
+轮换时应先滚动部署支持旧/新 key 的应用认证适配器，或在短 token 生命周期后切换。不要把
+`AY_ONLINE_AUTH_KEY` 或 fleet token 分发给游戏客户端。
+
+## 扩展边界
+
 HTTP server 只依赖 `ILobbyService`、`IMatchmakingService`、
-`IDedicatedServerService`，没有依赖内存实现，这就是持久化替换边界。参考 SessionServer
-在生产模式下默认拒绝启用临时 online state；`AY_ONLINE_ALLOW_EPHEMERAL=1` 只允许 staging
-明确放行。正式部署应注入数据库实现，并保持 ticket/allocation 状态、revision CAS 和
-容量预留事务化。尚未内置玩家技能评分、跨区延迟测量、party 邀请/隐私、Dedicated
-进程拉起或云厂商 API。
+`IDedicatedServerService`，没有依赖 SQLite，这就是应用后端替换边界。参考 SessionServer
+在生产模式下默认要求持久 online state 和签名玩家凭证；
+`AY_ONLINE_ALLOW_EPHEMERAL=1`、`AY_ONLINE_ALLOW_STATIC_CREDENTIALS=1` 仅用于 staging。
+尚未内置玩家技能评分、跨区延迟测量、party 邀请/隐私、Dedicated 进程拉起或云厂商 API。

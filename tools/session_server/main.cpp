@@ -3,6 +3,8 @@
 #include <AYNetwork/Session/HttpSessionService.h>
 #include <AYNetwork/Session/InMemorySessionService.h>
 #include <AYNetwork/Session/InMemoryOnlineServices.h>
+#include <AYNetwork/Session/PlayerAccessToken.h>
+#include <AYNetwork/Session/SqliteOnlineServices.h>
 #include <AYNetwork/Session/SqliteSessionService.h>
 #include <AYNetwork/Signaling/SecureUdpSignaling.h>
 
@@ -185,6 +187,9 @@ int main(int argc, char** argv) {
     const bool onlineEnabled = enabled("AY_ONLINE_ENABLE");
     const std::string onlineCredentials =
         environment("AY_ONLINE_CREDENTIALS_FILE");
+    std::string onlineDatabase = environment("AY_ONLINE_DB");
+    const std::string onlineAuthKeyText =
+        environment("AY_ONLINE_AUTH_KEY");
     const std::string onlineServerToken =
         environment("AY_ONLINE_SERVER_TOKEN");
     std::string httpBind = environment("AY_SESSION_HTTP_BIND");
@@ -206,19 +211,30 @@ int main(int argc, char** argv) {
             "set AY_SESSION_HTTP_BIND=127.0.0.1\n");
         return 2;
     }
+    if (onlineDatabase.empty() && !databasePath.empty()) {
+        onlineDatabase = databasePath;
+    }
     if (onlineEnabled &&
-        (onlineCredentials.empty() || onlineServerToken.size() < 32)) {
+        ((onlineCredentials.empty() && onlineAuthKeyText.empty()) ||
+         onlineServerToken.size() < 32)) {
         std::fprintf(stderr,
-            "online services require AY_ONLINE_CREDENTIALS_FILE and "
+            "online services require AY_ONLINE_CREDENTIALS_FILE or "
+            "AY_ONLINE_AUTH_KEY, plus "
             "AY_ONLINE_SERVER_TOKEN (32+ chars)\n");
         return 2;
     }
-    if (production && onlineEnabled &&
+    if (production && onlineEnabled && onlineDatabase.empty() &&
         !enabled("AY_ONLINE_ALLOW_EPHEMERAL")) {
         std::fprintf(stderr,
-            "reference online state is in-memory; production must inject durable "
-            "ILobbyService/IMatchmakingService/IDedicatedServerService adapters "
-            "or explicitly set AY_ONLINE_ALLOW_EPHEMERAL=1 for staging\n");
+            "production online services require AY_ONLINE_DB (or AY_SESSION_DB); "
+            "AY_ONLINE_ALLOW_EPHEMERAL=1 is staging-only\n");
+        return 2;
+    }
+    if (production && onlineEnabled && onlineAuthKeyText.empty() &&
+        !enabled("AY_ONLINE_ALLOW_STATIC_CREDENTIALS")) {
+        std::fprintf(stderr,
+            "production online authentication requires AY_ONLINE_AUTH_KEY; "
+            "static credential files are staging-only\n");
         return 2;
     }
 
@@ -281,16 +297,63 @@ int main(int argc, char** argv) {
         core = std::move(memory);
     }
 
-    std::shared_ptr<ayt::net::InMemoryOnlineServices> online;
+    std::shared_ptr<ayt::net::ILobbyService> lobbies;
+    std::shared_ptr<ayt::net::IMatchmakingService> matchmaking;
+    std::shared_ptr<ayt::net::IDedicatedServerService> dedicated;
     std::shared_ptr<PlayerCredentialDirectory> playerCredentials;
+    std::shared_ptr<ayt::net::PlayerAccessTokenVerifier> playerTokenVerifier;
+    const char* onlineStore = "disabled";
     if (onlineEnabled) {
-        playerCredentials = std::make_shared<PlayerCredentialDirectory>();
-        if (!playerCredentials->load(onlineCredentials)) {
-            std::fprintf(stderr, "failed to load AY_ONLINE_CREDENTIALS_FILE\n");
-            return 1;
+        if (!onlineCredentials.empty()) {
+            playerCredentials = std::make_shared<PlayerCredentialDirectory>();
+            if (!playerCredentials->load(onlineCredentials)) {
+                std::fprintf(stderr, "failed to load AY_ONLINE_CREDENTIALS_FILE\n");
+                return 1;
+            }
         }
-        online = std::make_shared<ayt::net::InMemoryOnlineServices>(
-            ayt::net::InMemoryOnlineServicesConfig{}, core);
+        if (!onlineAuthKeyText.empty()) {
+            ayt::net::PlayerAccessTokenVerifierConfig authConfig;
+            if (!parseStorageKey(onlineAuthKeyText, authConfig.signingKey)) {
+                std::fprintf(stderr,
+                    "AY_ONLINE_AUTH_KEY must contain exactly 64 hex characters\n");
+                return 2;
+            }
+            playerTokenVerifier =
+                std::make_shared<ayt::net::PlayerAccessTokenVerifier>(
+                    std::move(authConfig));
+            if (!playerTokenVerifier->isReady()) {
+                std::fprintf(stderr, "failed to initialize online token verifier\n");
+                return 1;
+            }
+        }
+        if (!onlineDatabase.empty()) {
+            ayt::net::SqliteOnlineServicesConfig onlineConfig;
+            onlineConfig.databasePath = onlineDatabase;
+            if (!parseStorageKey(storageKeyText, onlineConfig.storageKey)) {
+                std::fprintf(stderr,
+                    "durable online services require AY_SESSION_STATE_KEY "
+                    "with exactly 64 hex characters\n");
+                return 2;
+            }
+            auto service = std::make_shared<ayt::net::SqliteOnlineServices>(
+                std::move(onlineConfig), core);
+            if (!service->isReady()) {
+                std::fprintf(stderr, "failed to open online database: %s\n",
+                             service->getLastError().c_str());
+                return 1;
+            }
+            lobbies = service;
+            matchmaking = service;
+            dedicated = service;
+            onlineStore = "sqlite";
+        } else {
+            auto service = std::make_shared<ayt::net::InMemoryOnlineServices>(
+                ayt::net::InMemoryOnlineServicesConfig{}, core);
+            lobbies = service;
+            matchmaking = service;
+            dedicated = service;
+            onlineStore = "memory";
+        }
     }
 
     ayt::net::SecureUdpSignalingServerConfig signalingConfig;
@@ -347,10 +410,15 @@ int main(int argc, char** argv) {
             audit->write(event);
         };
     }
-    if (online) {
+    if (lobbies) {
         httpConfig.playerAuthenticator =
-            [playerCredentials](std::string_view token, ayt::net::PeerId& peer) {
-                return playerCredentials->authenticate(token, peer);
+            [playerCredentials, playerTokenVerifier](
+                std::string_view token, ayt::net::PeerId& peer) {
+                if (playerTokenVerifier &&
+                    playerTokenVerifier->verify(token, peer) ==
+                        ayt::net::PlayerAccessTokenError::None) return true;
+                return playerCredentials &&
+                       playerCredentials->authenticate(token, peer);
             };
         httpConfig.dedicatedControlAuthenticator =
             [onlineServerToken](std::string_view supplied) {
@@ -358,7 +426,7 @@ int main(int argc, char** argv) {
             };
     }
     ayt::net::HttpP2PSessionServer http(
-        std::move(httpConfig), core, online, online, online);
+        std::move(httpConfig), core, lobbies, matchmaking, dedicated);
     if (!http.start()) {
         signaling.stop();
         std::fprintf(stderr, "failed to bind SessionServer HTTP socket\n");
@@ -367,16 +435,17 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
-    std::printf("AY_SESSION_SERVER state=ready mode=%s store=%s online=%s http=%s:%u signaling=%s:%u\n",
+    std::printf("AY_SESSION_SERVER state=ready mode=%s store=%s online=%s "
+                "online_store=%s http=%s:%u signaling=%s:%u\n",
                 production ? "production" : "development",
                 databasePath.empty() ? "memory" : "sqlite",
-                online ? "enabled" : "disabled",
+                lobbies ? "enabled" : "disabled", onlineStore,
                 httpBind.c_str(), http.getBoundPort(), argv[3],
                 signaling.getBoundPort());
     std::fflush(stdout);
 
     while (g_running.load() && http.isRunning()) {
-        if (online) (void)online->runMatchmaking(8);
+        if (matchmaking) (void)matchmaking->runMatchmaking(8);
         if (signaling.pump() == 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }

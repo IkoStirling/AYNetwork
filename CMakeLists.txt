@@ -18,6 +18,8 @@ set(SRC_FILES
     src/Session/SqliteSessionService.cpp
     src/Session/HttpSessionService.cpp
     src/Session/HttpOnlineServices.cpp
+    src/Session/SqliteOnlineServices.cpp
+    src/Session/PlayerAccessToken.cpp
     src/Session/P2PSessionBackend.cpp
     src/Session/P2PSessionLeaseKeeper.cpp
     src/Session/P2PSessionCoordinator.cpp
@@ -138,6 +140,15 @@ if(AYNETWORK_BUILD_SESSION_SERVER)
                 -SessionServer $<TARGET_FILE:AYNetwork_SessionServer>
                 -OnlineProbe $<TARGET_FILE:AYNetwork_OnlineProbe>)
         set_tests_properties(AYNetwork_OnlineServices_E2E
+            PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+        add_test(
+            NAME AYNetwork_OnlineServices_Production_E2E
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File ${CMAKE_CURRENT_SOURCE_DIR}/unittest/RunOnlineServicesE2E.ps1
+                -SessionServer $<TARGET_FILE:AYNetwork_SessionServer>
+                -OnlineProbe $<TARGET_FILE:AYNetwork_OnlineProbe>
+                -Production)
+        set_tests_properties(AYNetwork_OnlineServices_Production_E2E
             PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
     endif()
 endif()

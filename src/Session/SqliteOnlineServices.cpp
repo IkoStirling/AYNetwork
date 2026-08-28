@@ -1,0 +1,2187 @@
+#include <AYNetwork/Session/SqliteOnlineServices.h>
+
+#include <sodium.h>
+#include <sqlite3.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <limits>
+#include <cstring>
+#include <mutex>
+#include <string_view>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace ayt::net
+{
+namespace
+{
+
+using json = nlohmann::json;
+constexpr size_t kMaxNameBytes = 128;
+constexpr size_t kMaxKeyBytes = 64;
+constexpr size_t kMaxAddressBytes = 255;
+constexpr size_t kMaxAssignmentBytes = 2u * 1024u * 1024u;
+constexpr uint8_t kSchemaVersion = 1;
+constexpr char kHex[] = "0123456789abcdef";
+constexpr std::array<uint8_t, 32> kStorageCheck = {
+    'A','Y','N','e','t','w','o','r','k','-','O','n','l','i','n','e',
+    '-','S','t','o','r','a','g','e','-','K','e','y','-','V','1','!'
+};
+
+uint64_t systemNow() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+bool hasNonZero(const std::array<uint8_t, 32>& value) {
+    return std::any_of(value.begin(), value.end(),
+                       [](uint8_t byte) { return byte != 0; });
+}
+
+bool validKey(const std::string& value) {
+    return !value.empty() && value.size() <= kMaxKeyBytes;
+}
+
+bool containsPeer(const std::vector<PeerId>& peers, const PeerId& peer) {
+    return std::find(peers.begin(), peers.end(), peer) != peers.end();
+}
+
+bool validParty(const std::vector<PeerId>& party, uint16_t target) {
+    if (party.empty() || party.size() > target) return false;
+    std::unordered_set<std::string> unique;
+    for (const PeerId& peer : party) {
+        if (!peer.isValid() || !unique.insert(peer.value).second) return false;
+    }
+    return true;
+}
+
+bool matchCompatible(const MatchmakingRequest& left,
+                     const MatchmakingRequest& right) {
+    return left.queue == right.queue && left.region == right.region &&
+           left.buildId == right.buildId && left.topology == right.topology &&
+           left.targetPlayers == right.targetPlayers &&
+           left.virtualPort == right.virtualPort;
+}
+
+OnlineServiceError mapSessionError(SessionServiceError error) {
+    switch (error) {
+    case SessionServiceError::InvalidRequest: return OnlineServiceError::InvalidRequest;
+    case SessionServiceError::Unauthorized: return OnlineServiceError::Unauthorized;
+    case SessionServiceError::SessionFull: return OnlineServiceError::Full;
+    case SessionServiceError::SessionClosed: return OnlineServiceError::Closed;
+    case SessionServiceError::TransportError:
+    case SessionServiceError::RateLimited: return OnlineServiceError::BackendUnavailable;
+    case SessionServiceError::None: return OnlineServiceError::None;
+    case SessionServiceError::SessionNotFound:
+    case SessionServiceError::EpochConflict:
+    case SessionServiceError::HostLeaseExpired:
+    case SessionServiceError::ProtocolError:
+    case SessionServiceError::InternalError: return OnlineServiceError::InternalError;
+    }
+    return OnlineServiceError::InternalError;
+}
+
+std::string randomToken() {
+    std::array<uint8_t, 32> bytes{};
+    randombytes_buf(bytes.data(), bytes.size());
+    std::string token(bytes.size() * 2, '0');
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        token[i * 2] = kHex[bytes[i] >> 4];
+        token[i * 2 + 1] = kHex[bytes[i] & 0x0f];
+    }
+    sodium_memzero(bytes.data(), bytes.size());
+    return token;
+}
+
+bool tokenEqual(std::string_view left, std::string_view right) {
+    return left.size() == 64 && right.size() == 64 &&
+           sodium_memcmp(left.data(), right.data(), left.size()) == 0;
+}
+
+class Statement {
+public:
+    Statement(sqlite3* database, const char* sql) {
+        if (database && sqlite3_prepare_v2(database, sql, -1, &_value, nullptr) !=
+                            SQLITE_OK) {
+            _value = nullptr;
+        }
+    }
+    ~Statement() { if (_value) sqlite3_finalize(_value); }
+    Statement(const Statement&) = delete;
+    Statement& operator=(const Statement&) = delete;
+
+    explicit operator bool() const { return _value != nullptr; }
+    sqlite3_stmt* get() const { return _value; }
+
+private:
+    sqlite3_stmt* _value = nullptr;
+};
+
+bool bindU64(sqlite3_stmt* statement, int index, uint64_t value) {
+    if (value > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
+        return false;
+    }
+    return sqlite3_bind_int64(statement, index,
+                              static_cast<sqlite3_int64>(value)) == SQLITE_OK;
+}
+
+// Session IDs are supplied by an external IP2PSessionService and use the full
+// uint64_t domain. SQLite INTEGER is signed, so preserve the two's-complement
+// bit pattern instead of rejecting IDs whose high bit is set. Values allocated
+// by this store continue to use bindU64() and remain positive SQL integers.
+bool bindOpaqueU64(sqlite3_stmt* statement, int index, uint64_t value) {
+    static_assert(sizeof(sqlite3_int64) == sizeof(value));
+    sqlite3_int64 stored = 0;
+    std::memcpy(&stored, &value, sizeof(stored));
+    return sqlite3_bind_int64(statement, index, stored) == SQLITE_OK;
+}
+
+bool bindText(sqlite3_stmt* statement, int index, std::string_view value) {
+    // sqlite3_bind_text treats a null pointer as SQL NULL even when the byte
+    // count is zero. A default-constructed empty string_view has a null data()
+    // pointer, while several schema fields intentionally persist empty TEXT.
+    const char* bytes = value.empty() ? "" : value.data();
+    return sqlite3_bind_text(statement, index, bytes,
+                             static_cast<int>(value.size()), SQLITE_TRANSIENT) ==
+           SQLITE_OK;
+}
+
+bool bindBlob(sqlite3_stmt* statement, int index,
+              const std::vector<uint8_t>& value) {
+    return sqlite3_bind_blob(statement, index, value.data(),
+                             static_cast<int>(value.size()), SQLITE_TRANSIENT) ==
+           SQLITE_OK;
+}
+
+std::string columnText(sqlite3_stmt* statement, int column) {
+    const auto* bytes = sqlite3_column_text(statement, column);
+    const int size = sqlite3_column_bytes(statement, column);
+    if (!bytes || size <= 0) return {};
+    return std::string(reinterpret_cast<const char*>(bytes),
+                       static_cast<size_t>(size));
+}
+
+std::vector<uint8_t> columnBlob(sqlite3_stmt* statement, int column) {
+    const auto* bytes = static_cast<const uint8_t*>(
+        sqlite3_column_blob(statement, column));
+    const int size = sqlite3_column_bytes(statement, column);
+    if (!bytes || size <= 0) return {};
+    return std::vector<uint8_t>(bytes, bytes + size);
+}
+
+bool sealSecret(const std::array<uint8_t, 32>& key, std::string_view context,
+                const uint8_t* plain, size_t plainSize,
+                std::vector<uint8_t>& sealed) {
+    if ((!plain && plainSize != 0) || context.empty()) return false;
+    const size_t nonceSize = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    const size_t tagSize = crypto_aead_xchacha20poly1305_ietf_ABYTES;
+    if (plainSize > (std::numeric_limits<size_t>::max)() - nonceSize - tagSize) {
+        return false;
+    }
+    sealed.assign(nonceSize + plainSize + tagSize, 0);
+    randombytes_buf(sealed.data(), nonceSize);
+    unsigned long long cipherSize = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+            sealed.data() + nonceSize, &cipherSize, plain, plainSize,
+            reinterpret_cast<const uint8_t*>(context.data()), context.size(),
+            nullptr, sealed.data(), key.data()) != 0 ||
+        cipherSize != plainSize + tagSize) {
+        sealed.clear();
+        return false;
+    }
+    return true;
+}
+
+bool openSecret(const std::array<uint8_t, 32>& key, std::string_view context,
+                const std::vector<uint8_t>& sealed,
+                std::vector<uint8_t>& plain) {
+    const size_t nonceSize = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    const size_t tagSize = crypto_aead_xchacha20poly1305_ietf_ABYTES;
+    plain.clear();
+    if (context.empty() || sealed.size() < nonceSize + tagSize) return false;
+    plain.assign(sealed.size() - nonceSize - tagSize, 0);
+    unsigned long long plainSize = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            plain.data(), &plainSize, nullptr, sealed.data() + nonceSize,
+            sealed.size() - nonceSize,
+            reinterpret_cast<const uint8_t*>(context.data()), context.size(),
+            sealed.data(), key.data()) != 0 || plainSize != plain.size()) {
+        if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+        plain.clear();
+        return false;
+    }
+    return true;
+}
+
+std::string secretContext(const char* type, uint64_t id) {
+    return std::string{"AYNetwork:Online:"} + type + ':' + std::to_string(id) +
+           ":v1";
+}
+
+json sessionToJson(const P2PBackendSessionInfo& value) {
+    return {{"id", value.sessionId}, {"epoch", value.epoch},
+            {"host", value.hostPeerId.value}, {"port", value.virtualPort},
+            {"capacity", value.capacity}, {"members", value.memberCount},
+            {"open", value.open}, {"lease", value.hostLeaseExpiresAtUnixSeconds},
+            {"signal_address", value.signalingAddress},
+            {"signal_port", value.signalingPort},
+            {"signal_room", value.signalingRoom}};
+}
+
+bool sessionFromJson(const json& value, P2PBackendSessionInfo& out) {
+    try {
+        P2PBackendSessionInfo parsed;
+        parsed.sessionId = value.at("id").get<uint64_t>();
+        parsed.epoch = value.at("epoch").get<uint32_t>();
+        parsed.hostPeerId = PeerId{value.at("host").get<std::string>()};
+        parsed.virtualPort = value.at("port").get<uint16_t>();
+        parsed.capacity = value.at("capacity").get<uint16_t>();
+        parsed.memberCount = value.at("members").get<uint16_t>();
+        parsed.open = value.at("open").get<bool>();
+        parsed.hostLeaseExpiresAtUnixSeconds = value.at("lease").get<uint64_t>();
+        parsed.signalingAddress = value.at("signal_address").get<std::string>();
+        parsed.signalingPort = value.at("signal_port").get<uint16_t>();
+        parsed.signalingRoom = value.at("signal_room").get<std::string>();
+        if (!parsed.isValid()) return false;
+        out = std::move(parsed);
+        return true;
+    } catch (...) { return false; }
+}
+
+json grantToJson(const P2PSessionGrant& value) {
+    return {{"session", sessionToJson(value.session)},
+            {"peer", value.member.peerId.value},
+            {"member_token", value.member.token},
+            {"signaling_token", value.signalingToken},
+            {"ticket", json::binary(value.joinTicket)},
+            {"public_key", json::binary(std::vector<uint8_t>(
+                value.ticketPublicKey.begin(), value.ticketPublicKey.end()))}};
+}
+
+bool grantFromJson(const json& value, P2PSessionGrant& out) {
+    try {
+        P2PSessionGrant parsed;
+        if (!sessionFromJson(value.at("session"), parsed.session)) return false;
+        parsed.member.sessionId = parsed.session.sessionId;
+        parsed.member.peerId = PeerId{value.at("peer").get<std::string>()};
+        parsed.member.token = value.at("member_token").get<std::string>();
+        parsed.signalingToken = value.at("signaling_token").get<std::string>();
+        const auto& ticket = value.at("ticket").get_binary();
+        const auto& key = value.at("public_key").get_binary();
+        parsed.joinTicket.assign(ticket.begin(), ticket.end());
+        if (key.size() != parsed.ticketPublicKey.size()) return false;
+        std::copy(key.begin(), key.end(), parsed.ticketPublicKey.begin());
+        if (!parsed.isValid()) return false;
+        out = std::move(parsed);
+        return true;
+    } catch (...) { return false; }
+}
+
+json allocationToJson(const DedicatedAllocation& value) {
+    return {{"id", value.allocationId}, {"server", value.serverId},
+            {"address", value.address}, {"port", value.port},
+            {"players", value.playerCount},
+            {"token", value.reservationToken},
+            {"expires", value.expiresAtUnixSeconds}};
+}
+
+bool allocationFromJson(const json& value, DedicatedAllocation& out) {
+    try {
+        DedicatedAllocation parsed;
+        parsed.allocationId = value.at("id").get<uint64_t>();
+        parsed.serverId = value.at("server").get<uint64_t>();
+        parsed.address = value.at("address").get<std::string>();
+        parsed.port = value.at("port").get<uint16_t>();
+        parsed.playerCount = value.at("players").get<uint16_t>();
+        parsed.reservationToken = value.at("token").get<std::string>();
+        parsed.expiresAtUnixSeconds = value.at("expires").get<uint64_t>();
+        if (!parsed.isValid()) return false;
+        out = std::move(parsed);
+        return true;
+    } catch (...) { return false; }
+}
+
+bool serializeAssignment(const MatchAssignment& assignment,
+                         std::vector<uint8_t>& bytes) {
+    try {
+        json grants = json::array();
+        for (const auto& grant : assignment.p2pGrants) {
+            if (!grant.isValid()) return false;
+            grants.push_back(grantToJson(grant));
+        }
+        json value{{"topology", static_cast<uint8_t>(assignment.topology)},
+                   {"grants", std::move(grants)},
+                   {"dedicated", assignment.dedicated.isValid()
+                        ? allocationToJson(assignment.dedicated) : json(nullptr)}};
+        bytes = json::to_cbor(value);
+        return !bytes.empty() && bytes.size() <= kMaxAssignmentBytes;
+    } catch (...) { bytes.clear(); return false; }
+}
+
+bool deserializeAssignment(const std::vector<uint8_t>& bytes,
+                           MatchAssignment& out) {
+    if (bytes.empty() || bytes.size() > kMaxAssignmentBytes) return false;
+    try {
+        const json value = json::from_cbor(bytes, true, false);
+        if (value.is_discarded()) return false;
+        const uint8_t topology = value.at("topology").get<uint8_t>();
+        if (topology > static_cast<uint8_t>(MatchTopology::Any)) return false;
+        MatchAssignment parsed;
+        parsed.topology = static_cast<MatchTopology>(topology);
+        for (const auto& item : value.at("grants")) {
+            P2PSessionGrant grant;
+            if (!grantFromJson(item, grant)) return false;
+            parsed.p2pGrants.push_back(std::move(grant));
+        }
+        if (!value.at("dedicated").is_null() &&
+            !allocationFromJson(value.at("dedicated"), parsed.dedicated)) {
+            return false;
+        }
+        const bool validP2P = parsed.topology == MatchTopology::P2P &&
+                              !parsed.p2pGrants.empty() &&
+                              !parsed.dedicated.isValid();
+        const bool validDedicated = parsed.topology == MatchTopology::Dedicated &&
+                                    parsed.p2pGrants.empty() &&
+                                    parsed.dedicated.isValid();
+        if (!validP2P && !validDedicated) return false;
+        out = std::move(parsed);
+        return true;
+    } catch (...) { return false; }
+}
+
+} // namespace
+
+bool SqliteOnlineServicesConfig::isValid() const {
+    return !databasePath.empty() && hasNonZero(storageKey) &&
+           busyTimeoutMs != 0 && operationClaimSeconds != 0 &&
+           matchTicketRetentionSeconds != 0 &&
+           maxLobbies != 0 && maxMatchTickets != 0 &&
+           maxDedicatedServers != 0 && maxLobbyCapacity != 0 &&
+           maxMatchPlayers >= 2 && maxDedicatedServerCapacity != 0 &&
+           dedicatedLeaseSeconds != 0 && allocationLifetimeSeconds != 0;
+}
+
+struct SqliteOnlineServices::Impl {
+    struct ServerRecord {
+        DedicatedServerInfo info;
+        std::string token;
+    };
+
+    enum class ClaimResult { None, Claimed, Error };
+
+    explicit Impl(SqliteOnlineServicesConfig input,
+                  std::shared_ptr<IP2PSessionService> sessions)
+        : config(std::move(input)), p2pSessions(std::move(sessions)) {
+        if (!config.nowUnixSeconds) config.nowUnixSeconds = systemNow;
+        if (!config.isValid() || sodium_init() < 0) {
+            lastError = "invalid durable online-services configuration";
+            return;
+        }
+        if (sqlite3_open_v2(config.databasePath.c_str(), &database,
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                SQLITE_OPEN_FULLMUTEX,
+                            nullptr) != SQLITE_OK) {
+            setDatabaseError("failed to open online-services database");
+            close();
+            return;
+        }
+        sqlite3_busy_timeout(database, static_cast<int>(config.busyTimeoutMs));
+        if (!exec("PRAGMA foreign_keys=ON") ||
+            !exec("PRAGMA journal_mode=WAL") ||
+            !exec("PRAGMA synchronous=FULL") || !createSchema() ||
+            !validateSchemaVersion() || !validateStorageKey() ||
+            !recoverExpiredWork()) {
+            if (lastError.empty()) {
+                setDatabaseError("failed to initialize online-services database");
+            }
+            close();
+            return;
+        }
+        ready = true;
+    }
+
+    ~Impl() { close(); }
+
+    uint64_t now() const { return config.nowUnixSeconds(); }
+
+    void close() {
+        ready = false;
+        if (database) sqlite3_close(database);
+        database = nullptr;
+    }
+
+    void setDatabaseError(const char* prefix) {
+        lastError = prefix;
+        if (database && sqlite3_errcode(database) != SQLITE_OK) {
+            lastError += ": ";
+            lastError += sqlite3_errmsg(database);
+        }
+    }
+
+    bool exec(const char* sql) {
+        char* error = nullptr;
+        const int result = sqlite3_exec(database, sql, nullptr, nullptr, &error);
+        if (result == SQLITE_OK) return true;
+        lastError = error ? error : "SQLite operation failed";
+        sqlite3_free(error);
+        return false;
+    }
+
+    bool begin() { return exec("BEGIN IMMEDIATE"); }
+    bool commit() { return exec("COMMIT"); }
+    void rollback() { (void)exec("ROLLBACK"); }
+
+    bool createSchema() {
+        return exec(
+            "CREATE TABLE IF NOT EXISTS ay_online_meta("
+            "name TEXT PRIMARY KEY,value BLOB NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS ay_online_lobbies("
+            "lobby_id INTEGER PRIMARY KEY,revision INTEGER NOT NULL,"
+            "owner_peer TEXT NOT NULL,name TEXT NOT NULL,region TEXT NOT NULL,"
+            "build_id TEXT NOT NULL,capacity INTEGER NOT NULL,state INTEGER NOT NULL,"
+            "session_id INTEGER NOT NULL DEFAULT 0,launch_claim TEXT NOT NULL DEFAULT '',"
+            "launch_expires INTEGER NOT NULL DEFAULT 0);"
+            "CREATE INDEX IF NOT EXISTS ay_online_lobby_filter ON "
+            "ay_online_lobbies(state,region,build_id,lobby_id);"
+            "CREATE TABLE IF NOT EXISTS ay_online_lobby_members("
+            "lobby_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,peer_id TEXT NOT NULL,"
+            "PRIMARY KEY(lobby_id,peer_id),UNIQUE(lobby_id,ordinal),"
+            "FOREIGN KEY(lobby_id) REFERENCES ay_online_lobbies(lobby_id) ON DELETE CASCADE);"
+            "CREATE TABLE IF NOT EXISTS ay_online_servers("
+            "server_id INTEGER PRIMARY KEY,instance_name TEXT NOT NULL UNIQUE,"
+            "region TEXT NOT NULL,build_id TEXT NOT NULL,address TEXT NOT NULL,"
+            "port INTEGER NOT NULL,capacity INTEGER NOT NULL,reserved_players INTEGER NOT NULL,"
+            "draining INTEGER NOT NULL,lease_expires INTEGER NOT NULL,token BLOB NOT NULL);"
+            "CREATE INDEX IF NOT EXISTS ay_online_server_filter ON "
+            "ay_online_servers(region,build_id,draining,server_id);"
+            "CREATE TABLE IF NOT EXISTS ay_online_allocations("
+            "allocation_id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL,address TEXT NOT NULL,"
+            "port INTEGER NOT NULL,player_count INTEGER NOT NULL,expires INTEGER NOT NULL,"
+            "token BLOB NOT NULL,FOREIGN KEY(server_id) REFERENCES "
+            "ay_online_servers(server_id) ON DELETE CASCADE);"
+            "CREATE INDEX IF NOT EXISTS ay_online_allocation_expiry ON "
+            "ay_online_allocations(expires,server_id);"
+            "CREATE TABLE IF NOT EXISTS ay_online_tickets("
+            "queue_seq INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL UNIQUE,"
+            "state INTEGER NOT NULL,queue_name TEXT NOT NULL,region TEXT NOT NULL,"
+            "build_id TEXT NOT NULL,topology INTEGER NOT NULL,target_players INTEGER NOT NULL,"
+            "virtual_port INTEGER NOT NULL,failure TEXT NOT NULL DEFAULT '',"
+            "assignment BLOB,match_claim TEXT NOT NULL DEFAULT '',"
+            "claim_expires INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,"
+            "completed_at INTEGER NOT NULL DEFAULT 0);"
+            "CREATE INDEX IF NOT EXISTS ay_online_ticket_queue ON "
+            "ay_online_tickets(state,queue_seq);"
+            "CREATE TABLE IF NOT EXISTS ay_online_ticket_members("
+            "ticket_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,peer_id TEXT NOT NULL,"
+            "PRIMARY KEY(ticket_id,peer_id),UNIQUE(ticket_id,ordinal),"
+            "FOREIGN KEY(ticket_id) REFERENCES ay_online_tickets(ticket_id) ON DELETE CASCADE);"
+            "CREATE INDEX IF NOT EXISTS ay_online_ticket_peer ON "
+            "ay_online_ticket_members(peer_id,ticket_id);");
+    }
+
+    bool validateSchemaVersion() {
+        Statement select(database,
+            "SELECT value FROM ay_online_meta WHERE name='schema-version'");
+        if (!select) return false;
+        const int result = sqlite3_step(select.get());
+        if (result == SQLITE_ROW) {
+            const auto stored = columnBlob(select.get(), 0);
+            const bool valid = stored.size() == 1 &&
+                               stored.front() == kSchemaVersion;
+            if (!valid) lastError = "unsupported online-services schema version";
+            return valid;
+        }
+        if (result != SQLITE_DONE) return false;
+        const std::vector<uint8_t> version{kSchemaVersion};
+        Statement insert(database,
+            "INSERT INTO ay_online_meta(name,value) VALUES('schema-version',?1)");
+        return insert && bindBlob(insert.get(), 1, version) &&
+               sqlite3_step(insert.get()) == SQLITE_DONE;
+    }
+
+    bool validateStorageKey() {
+        Statement select(database,
+            "SELECT value FROM ay_online_meta WHERE name='storage-check'");
+        if (!select) return false;
+        const int result = sqlite3_step(select.get());
+        const std::string context = "AYNetwork:Online:storage-check:v1";
+        if (result == SQLITE_ROW) {
+            std::vector<uint8_t> plain;
+            const auto sealed = columnBlob(select.get(), 0);
+            const bool valid = openSecret(config.storageKey, context, sealed, plain) &&
+                plain.size() == kStorageCheck.size() &&
+                sodium_memcmp(plain.data(), kStorageCheck.data(), plain.size()) == 0;
+            if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+            if (!valid) lastError = "online-services storage key mismatch";
+            return valid;
+        }
+        if (result != SQLITE_DONE) return false;
+        std::vector<uint8_t> sealed;
+        if (!sealSecret(config.storageKey, context, kStorageCheck.data(),
+                        kStorageCheck.size(), sealed)) return false;
+        Statement insert(database,
+            "INSERT INTO ay_online_meta(name,value) VALUES('storage-check',?1)");
+        return insert && bindBlob(insert.get(), 1, sealed) &&
+               sqlite3_step(insert.get()) == SQLITE_DONE;
+    }
+
+    bool recoverExpiredWork() {
+        const uint64_t current = now();
+        Statement lobbies(database,
+            "UPDATE ay_online_lobbies SET state=?1,revision=revision+1,"
+            "launch_claim='',launch_expires=0 WHERE state=?2 AND launch_expires<=?3");
+        Statement tickets(database,
+            "UPDATE ay_online_tickets SET state=?1,match_claim='',claim_expires=0 "
+            "WHERE state=?2 AND claim_expires<=?3");
+        Statement cleanup(database,
+            "DELETE FROM ay_online_tickets WHERE completed_at!=0 AND "
+            "completed_at<=?1");
+        const uint64_t retentionCutoff = current > config.matchTicketRetentionSeconds
+            ? current - config.matchTicketRetentionSeconds : 0;
+        return lobbies && tickets && cleanup &&
+            sqlite3_bind_int(lobbies.get(), 1,
+                static_cast<int>(LobbyState::Open)) == SQLITE_OK &&
+            sqlite3_bind_int(lobbies.get(), 2,
+                static_cast<int>(LobbyState::Launching)) == SQLITE_OK &&
+            bindU64(lobbies.get(), 3, current) &&
+            sqlite3_step(lobbies.get()) == SQLITE_DONE &&
+            sqlite3_bind_int(tickets.get(), 1,
+                static_cast<int>(MatchTicketState::Queued)) == SQLITE_OK &&
+            sqlite3_bind_int(tickets.get(), 2,
+                static_cast<int>(MatchTicketState::Matching)) == SQLITE_OK &&
+            bindU64(tickets.get(), 3, current) &&
+            sqlite3_step(tickets.get()) == SQLITE_DONE &&
+            bindU64(cleanup.get(), 1, retentionCutoff) &&
+            sqlite3_step(cleanup.get()) == SQLITE_DONE;
+    }
+
+    uint64_t allocateId(const char* table, const char* column) {
+        const std::string sql = std::string{"SELECT 1 FROM "} + table +
+                                " WHERE " + column + "=?1";
+        for (unsigned attempt = 0; attempt < 32; ++attempt) {
+            uint64_t id = 0;
+            randombytes_buf(&id, sizeof(id));
+            id &= static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
+            if (id == 0) continue;
+            Statement exists(database, sql.c_str());
+            if (!exists || !bindU64(exists.get(), 1, id)) return 0;
+            if (sqlite3_step(exists.get()) == SQLITE_DONE) return id;
+        }
+        return 0;
+    }
+
+    bool loadLobby(LobbyId lobbyId, LobbyInfo& info) {
+        Statement lobby(database,
+            "SELECT revision,owner_peer,name,region,build_id,capacity,state,session_id "
+            "FROM ay_online_lobbies WHERE lobby_id=?1");
+        if (!lobby || !bindU64(lobby.get(), 1, lobbyId) ||
+            sqlite3_step(lobby.get()) != SQLITE_ROW) return false;
+        LobbyInfo parsed;
+        parsed.lobbyId = lobbyId;
+        parsed.revision = static_cast<uint64_t>(sqlite3_column_int64(lobby.get(), 0));
+        parsed.ownerPeerId = PeerId{columnText(lobby.get(), 1)};
+        parsed.name = columnText(lobby.get(), 2);
+        parsed.region = columnText(lobby.get(), 3);
+        parsed.buildId = columnText(lobby.get(), 4);
+        parsed.capacity = static_cast<uint16_t>(sqlite3_column_int(lobby.get(), 5));
+        const int state = sqlite3_column_int(lobby.get(), 6);
+        if (state < 0 || state > static_cast<int>(LobbyState::Closed)) return false;
+        parsed.state = static_cast<LobbyState>(state);
+        parsed.sessionId = static_cast<uint64_t>(sqlite3_column_int64(lobby.get(), 7));
+        Statement members(database,
+            "SELECT peer_id FROM ay_online_lobby_members WHERE lobby_id=?1 "
+            "ORDER BY ordinal");
+        if (!members || !bindU64(members.get(), 1, lobbyId)) return false;
+        while (sqlite3_step(members.get()) == SQLITE_ROW) {
+            parsed.members.emplace_back(columnText(members.get(), 0));
+        }
+        if (!parsed.isValid()) return false;
+        info = std::move(parsed);
+        return true;
+    }
+
+    bool loadServer(DedicatedServerId serverId, ServerRecord& record) {
+        Statement statement(database,
+            "SELECT instance_name,region,build_id,address,port,capacity,"
+            "reserved_players,draining,lease_expires,token FROM ay_online_servers "
+            "WHERE server_id=?1");
+        if (!statement || !bindU64(statement.get(), 1, serverId) ||
+            sqlite3_step(statement.get()) != SQLITE_ROW) return false;
+        ServerRecord parsed;
+        parsed.info.serverId = serverId;
+        parsed.info.instanceName = columnText(statement.get(), 0);
+        parsed.info.region = columnText(statement.get(), 1);
+        parsed.info.buildId = columnText(statement.get(), 2);
+        parsed.info.address = columnText(statement.get(), 3);
+        parsed.info.port = static_cast<uint16_t>(sqlite3_column_int(statement.get(), 4));
+        parsed.info.capacity = static_cast<uint16_t>(sqlite3_column_int(statement.get(), 5));
+        parsed.info.reservedPlayers = static_cast<uint16_t>(
+            sqlite3_column_int(statement.get(), 6));
+        parsed.info.draining = sqlite3_column_int(statement.get(), 7) != 0;
+        parsed.info.leaseExpiresAtUnixSeconds = static_cast<uint64_t>(
+            sqlite3_column_int64(statement.get(), 8));
+        std::vector<uint8_t> plain;
+        const auto sealed = columnBlob(statement.get(), 9);
+        if (!openSecret(config.storageKey, secretContext("server", serverId),
+                        sealed, plain)) return false;
+        parsed.token.assign(reinterpret_cast<const char*>(plain.data()), plain.size());
+        if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+        if (parsed.info.instanceName.empty() || !validKey(parsed.info.region) ||
+            !validKey(parsed.info.buildId) || parsed.info.address.empty() ||
+            parsed.info.port == 0 || parsed.info.capacity == 0 ||
+            parsed.info.reservedPlayers > parsed.info.capacity ||
+            parsed.info.leaseExpiresAtUnixSeconds == 0 || parsed.token.size() != 64) {
+            return false;
+        }
+        record = std::move(parsed);
+        return true;
+    }
+
+    bool loadTicket(MatchTicketId ticketId, MatchTicketInfo& info) {
+        Statement statement(database,
+            "SELECT state,queue_name,region,build_id,topology,target_players,"
+            "virtual_port,failure,assignment FROM ay_online_tickets WHERE ticket_id=?1");
+        if (!statement || !bindU64(statement.get(), 1, ticketId) ||
+            sqlite3_step(statement.get()) != SQLITE_ROW) return false;
+        MatchTicketInfo parsed;
+        parsed.ticketId = ticketId;
+        const int state = sqlite3_column_int(statement.get(), 0);
+        const int topology = sqlite3_column_int(statement.get(), 4);
+        if (state < 0 || state > static_cast<int>(MatchTicketState::Failed) ||
+            topology < 0 || topology > static_cast<int>(MatchTopology::Any)) return false;
+        parsed.state = static_cast<MatchTicketState>(state);
+        parsed.request.queue = columnText(statement.get(), 1);
+        parsed.request.region = columnText(statement.get(), 2);
+        parsed.request.buildId = columnText(statement.get(), 3);
+        parsed.request.topology = static_cast<MatchTopology>(topology);
+        parsed.request.targetPlayers = static_cast<uint16_t>(
+            sqlite3_column_int(statement.get(), 5));
+        parsed.request.virtualPort = static_cast<uint16_t>(
+            sqlite3_column_int(statement.get(), 6));
+        parsed.failure = columnText(statement.get(), 7);
+        Statement members(database,
+            "SELECT peer_id FROM ay_online_ticket_members WHERE ticket_id=?1 "
+            "ORDER BY ordinal");
+        if (!members || !bindU64(members.get(), 1, ticketId)) return false;
+        while (sqlite3_step(members.get()) == SQLITE_ROW) {
+            parsed.request.partyMembers.emplace_back(columnText(members.get(), 0));
+        }
+        if (!validParty(parsed.request.partyMembers, parsed.request.targetPlayers) ||
+            !validKey(parsed.request.queue) || !validKey(parsed.request.region) ||
+            !validKey(parsed.request.buildId) || parsed.request.virtualPort == 0) {
+            return false;
+        }
+        if (parsed.state == MatchTicketState::Matched) {
+            const auto sealed = columnBlob(statement.get(), 8);
+            std::vector<uint8_t> plain;
+            if (!openSecret(config.storageKey, secretContext("ticket", ticketId),
+                            sealed, plain) ||
+                !deserializeAssignment(plain, parsed.assignment)) {
+                if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+                return false;
+            }
+            if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+        }
+        info = std::move(parsed);
+        return true;
+    }
+
+    bool isTicketMember(MatchTicketId ticketId, const PeerId& peer) {
+        Statement statement(database,
+            "SELECT 1 FROM ay_online_ticket_members WHERE ticket_id=?1 AND peer_id=?2");
+        return statement && bindU64(statement.get(), 1, ticketId) &&
+               bindText(statement.get(), 2, peer.value) &&
+               sqlite3_step(statement.get()) == SQLITE_ROW;
+    }
+
+    bool expireDedicated() {
+        const uint64_t current = now();
+        Statement update(database,
+            "UPDATE ay_online_servers SET reserved_players=MAX(0,reserved_players-"
+            "COALESCE((SELECT SUM(player_count) FROM ay_online_allocations a "
+            "WHERE a.server_id=ay_online_servers.server_id AND a.expires<=?1),0)) "
+            "WHERE server_id IN (SELECT server_id FROM ay_online_allocations "
+            "WHERE expires<=?1)");
+        Statement removeAllocations(database,
+            "DELETE FROM ay_online_allocations WHERE expires<=?1");
+        Statement removeServers(database,
+            "DELETE FROM ay_online_servers WHERE lease_expires<=?1");
+        return update && removeAllocations && removeServers &&
+               bindU64(update.get(), 1, current) &&
+               sqlite3_step(update.get()) == SQLITE_DONE &&
+               bindU64(removeAllocations.get(), 1, current) &&
+               sqlite3_step(removeAllocations.get()) == SQLITE_DONE &&
+               bindU64(removeServers.get(), 1, current) &&
+               sqlite3_step(removeServers.get()) == SQLITE_DONE;
+    }
+
+    int rowExists(const char* table, const char* column, uint64_t id) {
+        const std::string sql = std::string{"SELECT 1 FROM "} + table +
+                                " WHERE " + column + "=?1";
+        Statement statement(database, sql.c_str());
+        if (!statement || !bindU64(statement.get(), 1, id)) return -1;
+        const int result = sqlite3_step(statement.get());
+        if (result == SQLITE_ROW) return 1;
+        return result == SQLITE_DONE ? 0 : -1;
+    }
+
+    ClaimResult claimMatchBatch(std::vector<MatchTicketId>& batch,
+                                MatchmakingRequest& request,
+                                std::vector<PeerId>& peers,
+                                std::string& claim) {
+        batch.clear();
+        peers.clear();
+        claim.clear();
+        if (!recoverExpiredWork() || !begin()) return ClaimResult::Error;
+        Statement queued(database,
+            "SELECT ticket_id FROM ay_online_tickets WHERE state=?1 "
+            "ORDER BY queue_seq");
+        if (!queued || sqlite3_bind_int(queued.get(), 1,
+                static_cast<int>(MatchTicketState::Queued)) != SQLITE_OK) {
+            rollback();
+            return ClaimResult::Error;
+        }
+        std::vector<std::pair<MatchTicketId, MatchTicketInfo>> candidates;
+        int step = SQLITE_ROW;
+        while ((step = sqlite3_step(queued.get())) == SQLITE_ROW) {
+            const MatchTicketId id = static_cast<uint64_t>(
+                sqlite3_column_int64(queued.get(), 0));
+            MatchTicketInfo info;
+            if (!loadTicket(id, info)) {
+                rollback();
+                return ClaimResult::Error;
+            }
+            candidates.emplace_back(id, std::move(info));
+        }
+        if (step != SQLITE_DONE) {
+            rollback();
+            return ClaimResult::Error;
+        }
+        for (size_t seedIndex = 0; seedIndex < candidates.size(); ++seedIndex) {
+            const auto& seed = candidates[seedIndex];
+            size_t players = seed.second.request.partyMembers.size();
+            std::vector<MatchTicketId> selected{seed.first};
+            for (size_t candidateIndex = 0;
+                 candidateIndex < candidates.size(); ++candidateIndex) {
+                if (candidateIndex == seedIndex) continue;
+                const auto& candidate = candidates[candidateIndex];
+                if (!matchCompatible(seed.second.request,
+                                     candidate.second.request)) continue;
+                const size_t party = candidate.second.request.partyMembers.size();
+                if (players + party > seed.second.request.targetPlayers) continue;
+                selected.push_back(candidate.first);
+                players += party;
+                if (players == seed.second.request.targetPlayers) break;
+            }
+            if (players == seed.second.request.targetPlayers) {
+                batch = std::move(selected);
+                request = seed.second.request;
+                break;
+            }
+        }
+        if (batch.empty()) {
+            if (!commit()) {
+                rollback();
+                return ClaimResult::Error;
+            }
+            return ClaimResult::None;
+        }
+        claim = randomToken();
+        const uint64_t expiry = now() + config.operationClaimSeconds;
+        for (MatchTicketId id : batch) {
+            Statement update(database,
+                "UPDATE ay_online_tickets SET state=?1,match_claim=?2,"
+                "claim_expires=?3 WHERE ticket_id=?4 AND state=?5");
+            if (claim.empty() || !update ||
+                sqlite3_bind_int(update.get(), 1,
+                    static_cast<int>(MatchTicketState::Matching)) != SQLITE_OK ||
+                !bindText(update.get(), 2, claim) || !bindU64(update.get(), 3, expiry) ||
+                !bindU64(update.get(), 4, id) ||
+                sqlite3_bind_int(update.get(), 5,
+                    static_cast<int>(MatchTicketState::Queued)) != SQLITE_OK ||
+                sqlite3_step(update.get()) != SQLITE_DONE ||
+                sqlite3_changes(database) != 1) {
+                rollback();
+                batch.clear();
+                return ClaimResult::Error;
+            }
+        }
+        for (MatchTicketId id : batch) {
+            const auto candidate = std::find_if(
+                candidates.begin(), candidates.end(), [id](const auto& value) {
+                    return value.first == id;
+                });
+            if (candidate == candidates.end()) {
+                rollback();
+                batch.clear();
+                return ClaimResult::Error;
+            }
+            peers.insert(peers.end(), candidate->second.request.partyMembers.begin(),
+                         candidate->second.request.partyMembers.end());
+        }
+        if (!commit()) {
+            rollback();
+            batch.clear();
+            return ClaimResult::Error;
+        }
+        return ClaimResult::Claimed;
+    }
+
+    bool resetMatchBatch(const std::vector<MatchTicketId>& batch,
+                         const std::string& claim) {
+        if (!begin()) return false;
+        for (MatchTicketId id : batch) {
+            Statement update(database,
+                "UPDATE ay_online_tickets SET state=?1,match_claim='',"
+                "claim_expires=0 WHERE ticket_id=?2 AND state=?3 AND match_claim=?4");
+            if (!update || sqlite3_bind_int(update.get(), 1,
+                    static_cast<int>(MatchTicketState::Queued)) != SQLITE_OK ||
+                !bindU64(update.get(), 2, id) ||
+                sqlite3_bind_int(update.get(), 3,
+                    static_cast<int>(MatchTicketState::Matching)) != SQLITE_OK ||
+                !bindText(update.get(), 4, claim) ||
+                sqlite3_step(update.get()) != SQLITE_DONE ||
+                sqlite3_changes(database) != 1) {
+                rollback();
+                return false;
+            }
+        }
+        if (!commit()) {
+            rollback();
+            return false;
+        }
+        return true;
+    }
+
+    bool finalizeMatchBatch(const std::vector<MatchTicketId>& batch,
+                            const std::string& claim,
+                            const MatchAssignment& assignment,
+                            OnlineServiceError failure,
+                            const std::string& failureMessage) {
+        if (!begin()) return false;
+        for (MatchTicketId id : batch) {
+            MatchTicketInfo ticket;
+            if (!loadTicket(id, ticket)) {
+                rollback();
+                return false;
+            }
+            std::vector<uint8_t> sealed;
+            if (failure == OnlineServiceError::None) {
+                MatchAssignment perTicket;
+                perTicket.topology = assignment.topology;
+                if (assignment.topology == MatchTopology::Dedicated) {
+                    perTicket.dedicated = assignment.dedicated;
+                } else {
+                    for (const auto& grant : assignment.p2pGrants) {
+                        if (containsPeer(ticket.request.partyMembers,
+                                         grant.member.peerId)) {
+                            perTicket.p2pGrants.push_back(grant);
+                        }
+                    }
+                }
+                std::vector<uint8_t> plain;
+                if (!serializeAssignment(perTicket, plain) ||
+                    !sealSecret(config.storageKey, secretContext("ticket", id),
+                                plain.data(), plain.size(), sealed)) {
+                    if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+                    rollback();
+                    return false;
+                }
+                if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+            }
+            Statement update(database,
+                "UPDATE ay_online_tickets SET state=?1,failure=?2,assignment=?3,"
+                "match_claim='',claim_expires=0,completed_at=?4 WHERE ticket_id=?5 "
+                "AND state=?6 AND match_claim=?7");
+            if (!update) {
+                rollback();
+                return false;
+            }
+            const std::string detail = failureMessage.size() <= 512
+                ? failureMessage : failureMessage.substr(0, 512);
+            const bool boundAssignment = failure == OnlineServiceError::None
+                ? bindBlob(update.get(), 3, sealed)
+                : sqlite3_bind_null(update.get(), 3) == SQLITE_OK;
+            if (sqlite3_bind_int(update.get(), 1,
+                    failure == OnlineServiceError::None
+                        ? static_cast<int>(MatchTicketState::Matched)
+                        : static_cast<int>(MatchTicketState::Failed)) != SQLITE_OK ||
+                !bindText(update.get(), 2, failure == OnlineServiceError::None
+                    ? std::string_view{} : std::string_view{detail}) ||
+                !boundAssignment || !bindU64(update.get(), 4, now()) ||
+                !bindU64(update.get(), 5, id) ||
+                sqlite3_bind_int(update.get(), 6,
+                    static_cast<int>(MatchTicketState::Matching)) != SQLITE_OK ||
+                !bindText(update.get(), 7, claim) ||
+                sqlite3_step(update.get()) != SQLITE_DONE ||
+                sqlite3_changes(database) != 1) {
+                rollback();
+                return false;
+            }
+        }
+        if (!commit()) {
+            rollback();
+            return false;
+        }
+        return true;
+    }
+
+    template <typename T>
+    OnlineServiceResult<T> databaseFailure(const char* message) {
+        setDatabaseError(message);
+        return OnlineServiceResult<T>::failure(
+            OnlineServiceError::BackendUnavailable, lastError);
+    }
+
+    SqliteOnlineServicesConfig config;
+    std::shared_ptr<IP2PSessionService> p2pSessions;
+    sqlite3* database = nullptr;
+    mutable std::recursive_mutex mutex;
+    bool ready = false;
+    std::string lastError;
+};
+
+SqliteOnlineServices::SqliteOnlineServices(
+    SqliteOnlineServicesConfig config,
+    std::shared_ptr<IP2PSessionService> p2pSessions)
+    : _impl(std::make_unique<Impl>(std::move(config), std::move(p2pSessions))) {}
+
+SqliteOnlineServices::~SqliteOnlineServices() = default;
+
+bool SqliteOnlineServices::isReady() const {
+    std::lock_guard lock(_impl->mutex);
+    return _impl->ready;
+}
+
+std::string SqliteOnlineServices::getLastError() const {
+    std::lock_guard lock(_impl->mutex);
+    return _impl->lastError;
+}
+
+OnlineServiceResult<LobbyInfo> SqliteOnlineServices::createLobby(
+    const CreateLobbyRequest& request) {
+    if (!request.ownerPeerId.isValid() || request.name.empty() ||
+        request.name.size() > kMaxNameBytes || !validKey(request.region) ||
+        !validKey(request.buildId) || request.capacity == 0 ||
+        request.capacity > _impl->config.maxLobbyCapacity) {
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::InvalidRequest, "invalid durable lobby request");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin()) {
+        return _impl->databaseFailure<LobbyInfo>("failed to begin lobby create");
+    }
+    Statement count(_impl->database, "SELECT COUNT(*) FROM ay_online_lobbies");
+    if (!count || sqlite3_step(count.get()) != SQLITE_ROW) {
+        _impl->rollback();
+        return _impl->databaseFailure<LobbyInfo>("failed to count lobbies");
+    }
+    if (static_cast<uint64_t>(sqlite3_column_int64(count.get(), 0)) >=
+        _impl->config.maxLobbies) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Full, "durable lobby directory is full");
+    }
+    const LobbyId id = _impl->allocateId(
+        "ay_online_lobbies", "lobby_id");
+    Statement insertLobby(_impl->database,
+        "INSERT INTO ay_online_lobbies(lobby_id,revision,owner_peer,name,region,"
+        "build_id,capacity,state,session_id) VALUES(?1,1,?2,?3,?4,?5,?6,?7,0)");
+    Statement insertMember(_impl->database,
+        "INSERT INTO ay_online_lobby_members(lobby_id,ordinal,peer_id) "
+        "VALUES(?1,0,?2)");
+    const bool inserted = id != 0 && insertLobby && insertMember &&
+        bindU64(insertLobby.get(), 1, id) &&
+        bindText(insertLobby.get(), 2, request.ownerPeerId.value) &&
+        bindText(insertLobby.get(), 3, request.name) &&
+        bindText(insertLobby.get(), 4, request.region) &&
+        bindText(insertLobby.get(), 5, request.buildId) &&
+        sqlite3_bind_int(insertLobby.get(), 6, request.capacity) == SQLITE_OK &&
+        sqlite3_bind_int(insertLobby.get(), 7,
+            static_cast<int>(LobbyState::Open)) == SQLITE_OK &&
+        sqlite3_step(insertLobby.get()) == SQLITE_DONE &&
+        bindU64(insertMember.get(), 1, id) &&
+        bindText(insertMember.get(), 2, request.ownerPeerId.value) &&
+        sqlite3_step(insertMember.get()) == SQLITE_DONE;
+    LobbyInfo info;
+    if (!inserted || !_impl->loadLobby(id, info) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<LobbyInfo>("failed to persist lobby");
+    }
+    return OnlineServiceResult<LobbyInfo>::success(std::move(info));
+}
+
+OnlineServiceResult<std::vector<LobbyInfo>>
+SqliteOnlineServices::listLobbies(const ListLobbiesRequest& request) {
+    if (request.limit == 0 || request.limit > 1000 ||
+        request.region.size() > kMaxKeyBytes ||
+        request.buildId.size() > kMaxKeyBytes) {
+        return OnlineServiceResult<std::vector<LobbyInfo>>::failure(
+            OnlineServiceError::InvalidRequest, "invalid durable lobby filter");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork() || !_impl->begin()) {
+        return _impl->databaseFailure<std::vector<LobbyInfo>>(
+            "failed to query durable lobbies");
+    }
+    Statement statement(_impl->database,
+        "SELECT lobby_id FROM ay_online_lobbies l WHERE state=?1 "
+        "AND (?2='' OR region=?2) AND (?3='' OR build_id=?3) "
+        "AND capacity-(SELECT COUNT(*) FROM ay_online_lobby_members m "
+        "WHERE m.lobby_id=l.lobby_id)>=?4 ORDER BY lobby_id LIMIT ?5");
+    if (!statement ||
+        sqlite3_bind_int(statement.get(), 1,
+            static_cast<int>(LobbyState::Open)) != SQLITE_OK ||
+        !bindText(statement.get(), 2, request.region) ||
+        !bindText(statement.get(), 3, request.buildId) ||
+        sqlite3_bind_int64(statement.get(), 4,
+            static_cast<sqlite3_int64>(request.minimumOpenSlots)) != SQLITE_OK ||
+        sqlite3_bind_int64(statement.get(), 5,
+            static_cast<sqlite3_int64>(request.limit)) != SQLITE_OK) {
+        _impl->rollback();
+        return _impl->databaseFailure<std::vector<LobbyInfo>>(
+            "failed to prepare lobby query");
+    }
+    std::vector<LobbyInfo> result;
+    int step = SQLITE_ROW;
+    while ((step = sqlite3_step(statement.get())) == SQLITE_ROW) {
+        LobbyInfo info;
+        const LobbyId id = static_cast<LobbyId>(
+            sqlite3_column_int64(statement.get(), 0));
+        if (!_impl->loadLobby(id, info)) {
+            _impl->rollback();
+            return _impl->databaseFailure<std::vector<LobbyInfo>>(
+                "invalid durable lobby record");
+        }
+        result.push_back(std::move(info));
+    }
+    if (step != SQLITE_DONE || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<std::vector<LobbyInfo>>(
+            "failed to read durable lobbies");
+    }
+    return OnlineServiceResult<std::vector<LobbyInfo>>::success(std::move(result));
+}
+
+OnlineServiceResult<LobbyInfo> SqliteOnlineServices::joinLobby(
+    LobbyId lobbyId, const PeerId& authenticatedPeer) {
+    if (lobbyId == 0 || !authenticatedPeer.isValid()) {
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::InvalidRequest, "invalid durable lobby join");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork() || !_impl->begin()) {
+        return _impl->databaseFailure<LobbyInfo>("failed to begin lobby join");
+    }
+    LobbyInfo info;
+    if (!_impl->loadLobby(lobbyId, info)) {
+        const int exists = _impl->rowExists(
+            "ay_online_lobbies", "lobby_id", lobbyId);
+        _impl->rollback();
+        if (exists == 0) return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::NotFound, "lobby not found");
+        return _impl->databaseFailure<LobbyInfo>("failed to load lobby");
+    }
+    if (containsPeer(info.members, authenticatedPeer)) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<LobbyInfo>("failed to finish lobby join");
+        }
+        return OnlineServiceResult<LobbyInfo>::success(std::move(info));
+    }
+    if (info.state != LobbyState::Open) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Closed, "lobby is not joinable");
+    }
+    if (info.members.size() >= info.capacity) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Full, "lobby is full");
+    }
+    Statement insert(_impl->database,
+        "INSERT INTO ay_online_lobby_members(lobby_id,ordinal,peer_id) "
+        "VALUES(?1,(SELECT COALESCE(MAX(ordinal),-1)+1 FROM "
+        "ay_online_lobby_members WHERE lobby_id=?1),?2)");
+    Statement update(_impl->database,
+        "UPDATE ay_online_lobbies SET revision=revision+1 WHERE lobby_id=?1");
+    if (!insert || !update || !bindU64(insert.get(), 1, lobbyId) ||
+        !bindText(insert.get(), 2, authenticatedPeer.value) ||
+        sqlite3_step(insert.get()) != SQLITE_DONE ||
+        !bindU64(update.get(), 1, lobbyId) ||
+        sqlite3_step(update.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1 ||
+        !_impl->loadLobby(lobbyId, info) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<LobbyInfo>("failed to persist lobby join");
+    }
+    return OnlineServiceResult<LobbyInfo>::success(std::move(info));
+}
+
+OnlineServiceResult<LobbyInfo> SqliteOnlineServices::leaveLobby(
+    LobbyId lobbyId, const PeerId& authenticatedPeer) {
+    if (lobbyId == 0 || !authenticatedPeer.isValid()) {
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::InvalidRequest, "invalid durable lobby leave");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork() || !_impl->begin()) {
+        return _impl->databaseFailure<LobbyInfo>("failed to begin lobby leave");
+    }
+    LobbyInfo info;
+    if (!_impl->loadLobby(lobbyId, info)) {
+        const int exists = _impl->rowExists(
+            "ay_online_lobbies", "lobby_id", lobbyId);
+        _impl->rollback();
+        if (exists == 0) return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::NotFound, "lobby not found");
+        return _impl->databaseFailure<LobbyInfo>("failed to load lobby");
+    }
+    if (info.state == LobbyState::Launching) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Conflict, "lobby launch is in progress");
+    }
+    const auto member = std::find(
+        info.members.begin(), info.members.end(), authenticatedPeer);
+    if (member == info.members.end()) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Unauthorized, "peer is not a lobby member");
+    }
+    if (info.members.size() == 1) {
+        LobbyInfo closed = info;
+        closed.state = LobbyState::Closed;
+        closed.sessionId = 0;
+        ++closed.revision;
+        Statement remove(_impl->database,
+            "DELETE FROM ay_online_lobbies WHERE lobby_id=?1");
+        if (!remove || !bindU64(remove.get(), 1, lobbyId) ||
+            sqlite3_step(remove.get()) != SQLITE_DONE ||
+            sqlite3_changes(_impl->database) != 1 || !_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<LobbyInfo>("failed to remove lobby");
+        }
+        return OnlineServiceResult<LobbyInfo>::success(std::move(closed));
+    }
+    Statement remove(_impl->database,
+        "DELETE FROM ay_online_lobby_members WHERE lobby_id=?1 AND peer_id=?2");
+    if (!remove || !bindU64(remove.get(), 1, lobbyId) ||
+        !bindText(remove.get(), 2, authenticatedPeer.value) ||
+        sqlite3_step(remove.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1) {
+        _impl->rollback();
+        return _impl->databaseFailure<LobbyInfo>("failed to remove lobby member");
+    }
+    std::string newOwner = info.ownerPeerId.value;
+    if (info.ownerPeerId == authenticatedPeer) {
+        Statement owner(_impl->database,
+            "SELECT peer_id FROM ay_online_lobby_members WHERE lobby_id=?1 "
+            "ORDER BY ordinal LIMIT 1");
+        if (!owner || !bindU64(owner.get(), 1, lobbyId) ||
+            sqlite3_step(owner.get()) != SQLITE_ROW) {
+            _impl->rollback();
+            return _impl->databaseFailure<LobbyInfo>("failed to transfer lobby owner");
+        }
+        newOwner = columnText(owner.get(), 0);
+    }
+    Statement update(_impl->database,
+        "UPDATE ay_online_lobbies SET owner_peer=?1,revision=revision+1 "
+        "WHERE lobby_id=?2");
+    if (!update || !bindText(update.get(), 1, newOwner) ||
+        !bindU64(update.get(), 2, lobbyId) ||
+        sqlite3_step(update.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1 ||
+        !_impl->loadLobby(lobbyId, info) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<LobbyInfo>("failed to persist lobby leave");
+    }
+    return OnlineServiceResult<LobbyInfo>::success(std::move(info));
+}
+
+OnlineServiceResult<LobbyInfo> SqliteOnlineServices::updateLobby(
+    const UpdateLobbyRequest& request) {
+    if (request.lobbyId == 0 || !request.actorPeerId.isValid() ||
+        request.expectedRevision == 0 || request.name.empty() ||
+        request.name.size() > kMaxNameBytes) {
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::InvalidRequest, "invalid durable lobby update");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork() || !_impl->begin()) {
+        return _impl->databaseFailure<LobbyInfo>("failed to begin lobby update");
+    }
+    LobbyInfo info;
+    if (!_impl->loadLobby(request.lobbyId, info)) {
+        const int exists = _impl->rowExists(
+            "ay_online_lobbies", "lobby_id", request.lobbyId);
+        _impl->rollback();
+        if (exists == 0) return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::NotFound, "lobby not found");
+        return _impl->databaseFailure<LobbyInfo>("failed to load lobby");
+    }
+    if (info.ownerPeerId != request.actorPeerId) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Unauthorized, "only the lobby owner may update it");
+    }
+    if (info.revision != request.expectedRevision) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Conflict, "lobby revision changed");
+    }
+    if (info.state != LobbyState::Open) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Closed, "lobby is not open");
+    }
+    Statement update(_impl->database,
+        "UPDATE ay_online_lobbies SET name=?1,revision=revision+1 "
+        "WHERE lobby_id=?2 AND revision=?3 AND state=?4");
+    if (!update || !bindText(update.get(), 1, request.name) ||
+        !bindU64(update.get(), 2, request.lobbyId) ||
+        !bindU64(update.get(), 3, request.expectedRevision) ||
+        sqlite3_bind_int(update.get(), 4,
+            static_cast<int>(LobbyState::Open)) != SQLITE_OK ||
+        sqlite3_step(update.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1 ||
+        !_impl->loadLobby(request.lobbyId, info) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<LobbyInfo>("failed to persist lobby update");
+    }
+    return OnlineServiceResult<LobbyInfo>::success(std::move(info));
+}
+
+OnlineServiceResult<LobbyInfo> SqliteOnlineServices::getLobby(LobbyId lobbyId) {
+    if (lobbyId == 0) return OnlineServiceResult<LobbyInfo>::failure(
+        OnlineServiceError::InvalidRequest, "invalid durable lobby id");
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork()) {
+        return _impl->databaseFailure<LobbyInfo>("failed to query lobby");
+    }
+    LobbyInfo info;
+    if (!_impl->loadLobby(lobbyId, info)) {
+        const int exists = _impl->rowExists(
+            "ay_online_lobbies", "lobby_id", lobbyId);
+        if (exists == 0) return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::NotFound, "lobby not found");
+        return _impl->databaseFailure<LobbyInfo>("failed to load lobby");
+    }
+    return OnlineServiceResult<LobbyInfo>::success(std::move(info));
+}
+
+OnlineServiceResult<LobbyLaunchResult> SqliteOnlineServices::launchLobbyP2P(
+    const LaunchLobbyRequest& request) {
+    if (request.lobbyId == 0 || !request.actorPeerId.isValid() ||
+        request.expectedRevision == 0 || request.virtualPort == 0) {
+        return OnlineServiceResult<LobbyLaunchResult>::failure(
+            OnlineServiceError::InvalidRequest, "invalid durable lobby launch");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork() || !_impl->begin()) {
+        return _impl->databaseFailure<LobbyLaunchResult>(
+            "failed to begin durable lobby launch");
+    }
+    LobbyInfo snapshot;
+    if (!_impl->loadLobby(request.lobbyId, snapshot)) {
+        const int exists = _impl->rowExists(
+            "ay_online_lobbies", "lobby_id", request.lobbyId);
+        _impl->rollback();
+        if (exists == 0) return OnlineServiceResult<LobbyLaunchResult>::failure(
+            OnlineServiceError::NotFound, "lobby not found");
+        return _impl->databaseFailure<LobbyLaunchResult>("failed to load lobby");
+    }
+    if (snapshot.ownerPeerId != request.actorPeerId) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyLaunchResult>::failure(
+            OnlineServiceError::Unauthorized, "only the lobby owner may launch");
+    }
+    if (snapshot.revision != request.expectedRevision ||
+        snapshot.state != LobbyState::Open) {
+        _impl->rollback();
+        return OnlineServiceResult<LobbyLaunchResult>::failure(
+            OnlineServiceError::Conflict, "lobby revision or state changed");
+    }
+    const std::string claim = randomToken();
+    const uint64_t claimExpiry = _impl->now() +
+                                  _impl->config.operationClaimSeconds;
+    Statement claimLobby(_impl->database,
+        "UPDATE ay_online_lobbies SET state=?1,revision=revision+1,"
+        "launch_claim=?2,launch_expires=?3 WHERE lobby_id=?4 AND revision=?5 "
+        "AND state=?6");
+    if (claim.empty() || !claimLobby ||
+        sqlite3_bind_int(claimLobby.get(), 1,
+            static_cast<int>(LobbyState::Launching)) != SQLITE_OK ||
+        !bindText(claimLobby.get(), 2, claim) ||
+        !bindU64(claimLobby.get(), 3, claimExpiry) ||
+        !bindU64(claimLobby.get(), 4, request.lobbyId) ||
+        !bindU64(claimLobby.get(), 5, request.expectedRevision) ||
+        sqlite3_bind_int(claimLobby.get(), 6,
+            static_cast<int>(LobbyState::Open)) != SQLITE_OK ||
+        sqlite3_step(claimLobby.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1 || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<LobbyLaunchResult>(
+            "failed to claim durable lobby launch");
+    }
+    const uint64_t launchRevision = request.expectedRevision + 1;
+    auto reopen = [&] {
+        if (!_impl->begin()) return false;
+        Statement update(_impl->database,
+            "UPDATE ay_online_lobbies SET state=?1,revision=revision+1,"
+            "launch_claim='',launch_expires=0 WHERE lobby_id=?2 AND state=?3 "
+            "AND revision=?4 AND launch_claim=?5");
+        const bool changed = update &&
+            sqlite3_bind_int(update.get(), 1,
+                static_cast<int>(LobbyState::Open)) == SQLITE_OK &&
+            bindU64(update.get(), 2, request.lobbyId) &&
+            sqlite3_bind_int(update.get(), 3,
+                static_cast<int>(LobbyState::Launching)) == SQLITE_OK &&
+            bindU64(update.get(), 4, launchRevision) &&
+            bindText(update.get(), 5, claim) &&
+            sqlite3_step(update.get()) == SQLITE_DONE &&
+            sqlite3_changes(_impl->database) == 1;
+        if (!changed || !_impl->commit()) {
+            _impl->rollback();
+            return false;
+        }
+        return true;
+    };
+    if (!_impl->p2pSessions) {
+        (void)reopen();
+        return OnlineServiceResult<LobbyLaunchResult>::failure(
+            OnlineServiceError::BackendUnavailable,
+            "P2P session backend is not configured");
+    }
+    auto host = _impl->p2pSessions->createSession(
+        {snapshot.ownerPeerId, request.virtualPort, snapshot.capacity});
+    if (!host) {
+        (void)reopen();
+        return OnlineServiceResult<LobbyLaunchResult>::failure(
+            mapSessionError(host.error), host.message);
+    }
+    std::vector<P2PSessionGrant> grants{host.value};
+    for (const PeerId& peer : snapshot.members) {
+        if (peer == snapshot.ownerPeerId) continue;
+        auto joined = _impl->p2pSessions->joinSession(
+            {host.value.session.sessionId, peer});
+        if (!joined) {
+            (void)_impl->p2pSessions->leaveSession({host.value.member});
+            (void)reopen();
+            return OnlineServiceResult<LobbyLaunchResult>::failure(
+                mapSessionError(joined.error), joined.message);
+        }
+        grants.push_back(std::move(joined.value));
+    }
+    if (!_impl->begin()) {
+        (void)_impl->p2pSessions->leaveSession({host.value.member});
+        (void)reopen();
+        return _impl->databaseFailure<LobbyLaunchResult>(
+            "failed to finalize lobby launch");
+    }
+    Statement finish(_impl->database,
+        "UPDATE ay_online_lobbies SET state=?1,session_id=?2,revision=revision+1,"
+        "launch_claim='',launch_expires=0 WHERE lobby_id=?3 AND state=?4 "
+        "AND revision=?5 AND launch_claim=?6");
+    const bool changed = finish &&
+        sqlite3_bind_int(finish.get(), 1,
+            static_cast<int>(LobbyState::InSession)) == SQLITE_OK &&
+        bindOpaqueU64(finish.get(), 2, host.value.session.sessionId) &&
+        bindU64(finish.get(), 3, request.lobbyId) &&
+        sqlite3_bind_int(finish.get(), 4,
+            static_cast<int>(LobbyState::Launching)) == SQLITE_OK &&
+        bindU64(finish.get(), 5, launchRevision) &&
+        bindText(finish.get(), 6, claim) &&
+        sqlite3_step(finish.get()) == SQLITE_DONE &&
+        sqlite3_changes(_impl->database) == 1;
+    LobbyInfo launched;
+    if (!changed || !_impl->loadLobby(request.lobbyId, launched) ||
+        !_impl->commit()) {
+        _impl->rollback();
+        (void)_impl->p2pSessions->leaveSession({host.value.member});
+        (void)reopen();
+        return _impl->databaseFailure<LobbyLaunchResult>(
+            "failed to persist lobby launch result");
+    }
+    LobbyLaunchResult result;
+    result.lobby = std::move(launched);
+    result.memberGrants = std::move(grants);
+    return OnlineServiceResult<LobbyLaunchResult>::success(std::move(result));
+}
+
+OnlineServiceResult<DedicatedServerGrant> SqliteOnlineServices::registerServer(
+    const DedicatedServerRegistration& request) {
+    if (request.instanceName.empty() ||
+        request.instanceName.size() > kMaxNameBytes ||
+        !validKey(request.region) || !validKey(request.buildId) ||
+        request.address.empty() || request.address.size() > kMaxAddressBytes ||
+        request.port == 0 || request.capacity == 0 ||
+        request.capacity > _impl->config.maxDedicatedServerCapacity) {
+        return OnlineServiceResult<DedicatedServerGrant>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable server registration");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedServerGrant>(
+            "failed to begin server registration");
+    }
+    Statement duplicate(_impl->database,
+        "SELECT 1 FROM ay_online_servers WHERE instance_name=?1");
+    if (!duplicate || !bindText(duplicate.get(), 1, request.instanceName)) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedServerGrant>(
+            "failed to check server registration");
+    }
+    const int duplicateResult = sqlite3_step(duplicate.get());
+    if (duplicateResult == SQLITE_ROW) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<DedicatedServerGrant>(
+                "failed to finish server registration");
+        }
+        return OnlineServiceResult<DedicatedServerGrant>::failure(
+            OnlineServiceError::Conflict,
+            "server instance is already registered");
+    }
+    Statement count(_impl->database, "SELECT COUNT(*) FROM ay_online_servers");
+    if (duplicateResult != SQLITE_DONE || !count ||
+        sqlite3_step(count.get()) != SQLITE_ROW) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedServerGrant>(
+            "failed to count dedicated servers");
+    }
+    if (static_cast<uint64_t>(sqlite3_column_int64(count.get(), 0)) >=
+        _impl->config.maxDedicatedServers) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<DedicatedServerGrant>(
+                "failed to finish server registration");
+        }
+        return OnlineServiceResult<DedicatedServerGrant>::failure(
+            OnlineServiceError::Full,
+            "durable server directory is full");
+    }
+    const DedicatedServerId id = _impl->allocateId(
+        "ay_online_servers", "server_id");
+    const std::string token = randomToken();
+    std::vector<uint8_t> sealed;
+    if (id == 0 || token.empty() ||
+        !sealSecret(_impl->config.storageKey, secretContext("server", id),
+                    reinterpret_cast<const uint8_t*>(token.data()), token.size(),
+                    sealed)) {
+        _impl->rollback();
+        return OnlineServiceResult<DedicatedServerGrant>::failure(
+            OnlineServiceError::InternalError,
+            "failed to create durable server credential");
+    }
+    const uint64_t expiry = _impl->now() +
+                            _impl->config.dedicatedLeaseSeconds;
+    Statement insert(_impl->database,
+        "INSERT INTO ay_online_servers(server_id,instance_name,region,build_id,"
+        "address,port,capacity,reserved_players,draining,lease_expires,token) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,0,0,?8,?9)");
+    const bool inserted = insert && bindU64(insert.get(), 1, id) &&
+        bindText(insert.get(), 2, request.instanceName) &&
+        bindText(insert.get(), 3, request.region) &&
+        bindText(insert.get(), 4, request.buildId) &&
+        bindText(insert.get(), 5, request.address) &&
+        sqlite3_bind_int(insert.get(), 6, request.port) == SQLITE_OK &&
+        sqlite3_bind_int(insert.get(), 7, request.capacity) == SQLITE_OK &&
+        bindU64(insert.get(), 8, expiry) && bindBlob(insert.get(), 9, sealed) &&
+        sqlite3_step(insert.get()) == SQLITE_DONE;
+    Impl::ServerRecord record;
+    if (!inserted || !_impl->loadServer(id, record) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedServerGrant>(
+            "failed to persist dedicated server");
+    }
+    DedicatedServerGrant grant;
+    grant.server = std::move(record.info);
+    grant.credential.serverId = id;
+    grant.credential.token = token;
+    return OnlineServiceResult<DedicatedServerGrant>::success(std::move(grant));
+}
+
+OnlineServiceResult<DedicatedServerInfo> SqliteOnlineServices::heartbeatServer(
+    const DedicatedServerCredential& credential) {
+    if (!credential.isValid()) {
+        return OnlineServiceResult<DedicatedServerInfo>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable server credential");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedServerInfo>(
+            "failed to begin server heartbeat");
+    }
+    Impl::ServerRecord record;
+    if (!_impl->loadServer(credential.serverId, record)) {
+        const int exists = _impl->rowExists(
+            "ay_online_servers", "server_id", credential.serverId);
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<DedicatedServerInfo>(
+                "failed to expire dedicated leases");
+        }
+        if (exists == 0) return OnlineServiceResult<DedicatedServerInfo>::failure(
+            OnlineServiceError::NotFound, "server lease not found");
+        return _impl->databaseFailure<DedicatedServerInfo>(
+            "failed to load server credential");
+    }
+    if (!tokenEqual(record.token, credential.token)) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<DedicatedServerInfo>(
+                "failed to finish server heartbeat");
+        }
+        return OnlineServiceResult<DedicatedServerInfo>::failure(
+            OnlineServiceError::Unauthorized,
+            "invalid server credential");
+    }
+    const uint64_t expiry = _impl->now() +
+                            _impl->config.dedicatedLeaseSeconds;
+    Statement update(_impl->database,
+        "UPDATE ay_online_servers SET lease_expires=?1 WHERE server_id=?2");
+    if (!update || !bindU64(update.get(), 1, expiry) ||
+        !bindU64(update.get(), 2, credential.serverId) ||
+        sqlite3_step(update.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1 ||
+        !_impl->loadServer(credential.serverId, record) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedServerInfo>(
+            "failed to persist server heartbeat");
+    }
+    return OnlineServiceResult<DedicatedServerInfo>::success(
+        std::move(record.info));
+}
+
+OnlineServiceResult<DedicatedServerInfo>
+SqliteOnlineServices::setServerDraining(
+    const DedicatedServerCredential& credential, bool draining) {
+    if (!credential.isValid()) {
+        return OnlineServiceResult<DedicatedServerInfo>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable server credential");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedServerInfo>(
+            "failed to begin server drain update");
+    }
+    Impl::ServerRecord record;
+    if (!_impl->loadServer(credential.serverId, record)) {
+        const int exists = _impl->rowExists(
+            "ay_online_servers", "server_id", credential.serverId);
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<DedicatedServerInfo>(
+                "failed to expire dedicated leases");
+        }
+        if (exists == 0) return OnlineServiceResult<DedicatedServerInfo>::failure(
+            OnlineServiceError::NotFound, "server not found");
+        return _impl->databaseFailure<DedicatedServerInfo>(
+            "failed to load server credential");
+    }
+    if (!tokenEqual(record.token, credential.token)) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<DedicatedServerInfo>(
+                "failed to finish server drain update");
+        }
+        return OnlineServiceResult<DedicatedServerInfo>::failure(
+            OnlineServiceError::Unauthorized,
+            "invalid server credential");
+    }
+    Statement update(_impl->database,
+        "UPDATE ay_online_servers SET draining=?1 WHERE server_id=?2");
+    if (!update || sqlite3_bind_int(update.get(), 1, draining ? 1 : 0) != SQLITE_OK ||
+        !bindU64(update.get(), 2, credential.serverId) ||
+        sqlite3_step(update.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1 ||
+        !_impl->loadServer(credential.serverId, record) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedServerInfo>(
+            "failed to persist server drain state");
+    }
+    return OnlineServiceResult<DedicatedServerInfo>::success(
+        std::move(record.info));
+}
+
+OnlineServiceResult<SessionServiceEmpty>
+SqliteOnlineServices::unregisterServer(
+    const DedicatedServerCredential& credential) {
+    if (!credential.isValid()) {
+        return OnlineServiceResult<SessionServiceEmpty>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable server credential");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
+        _impl->rollback();
+        return _impl->databaseFailure<SessionServiceEmpty>(
+            "failed to begin server unregister");
+    }
+    Impl::ServerRecord record;
+    if (!_impl->loadServer(credential.serverId, record)) {
+        const int exists = _impl->rowExists(
+            "ay_online_servers", "server_id", credential.serverId);
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<SessionServiceEmpty>(
+                "failed to expire dedicated leases");
+        }
+        if (exists == 0) return OnlineServiceResult<SessionServiceEmpty>::failure(
+            OnlineServiceError::NotFound, "server not found");
+        return _impl->databaseFailure<SessionServiceEmpty>(
+            "failed to load server credential");
+    }
+    if (!tokenEqual(record.token, credential.token)) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<SessionServiceEmpty>(
+                "failed to finish server unregister");
+        }
+        return OnlineServiceResult<SessionServiceEmpty>::failure(
+            OnlineServiceError::Unauthorized,
+            "invalid server credential");
+    }
+    if (record.info.reservedPlayers != 0) {
+        Statement drain(_impl->database,
+            "UPDATE ay_online_servers SET draining=1 WHERE server_id=?1");
+        if (!drain || !bindU64(drain.get(), 1, credential.serverId) ||
+            sqlite3_step(drain.get()) != SQLITE_DONE || !_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<SessionServiceEmpty>(
+                "failed to persist draining server");
+        }
+        return OnlineServiceResult<SessionServiceEmpty>::failure(
+            OnlineServiceError::Conflict,
+            "server is draining until allocations are released");
+    }
+    Statement remove(_impl->database,
+        "DELETE FROM ay_online_servers WHERE server_id=?1");
+    if (!remove || !bindU64(remove.get(), 1, credential.serverId) ||
+        sqlite3_step(remove.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1 || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<SessionServiceEmpty>(
+            "failed to unregister dedicated server");
+    }
+    return OnlineServiceResult<SessionServiceEmpty>::success({});
+}
+
+OnlineServiceResult<DedicatedAllocation>
+SqliteOnlineServices::allocateServer(
+    const DedicatedAllocationRequest& request) {
+    if (!validKey(request.region) || !validKey(request.buildId) ||
+        request.playerCount == 0 ||
+        request.playerCount > _impl->config.maxMatchPlayers) {
+        return OnlineServiceResult<DedicatedAllocation>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable allocation request");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedAllocation>(
+            "failed to begin dedicated allocation");
+    }
+    Statement select(_impl->database,
+        "SELECT server_id,address,port FROM ay_online_servers WHERE draining=0 "
+        "AND region=?1 AND build_id=?2 AND reserved_players+?3<=capacity "
+        "ORDER BY (1.0*reserved_players)/capacity,server_id LIMIT 1");
+    if (!select || !bindText(select.get(), 1, request.region) ||
+        !bindText(select.get(), 2, request.buildId) ||
+        sqlite3_bind_int(select.get(), 3, request.playerCount) != SQLITE_OK) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedAllocation>(
+            "failed to select dedicated capacity");
+    }
+    const int selected = sqlite3_step(select.get());
+    if (selected == SQLITE_DONE) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<DedicatedAllocation>(
+                "failed to finish dedicated allocation");
+        }
+        return OnlineServiceResult<DedicatedAllocation>::failure(
+            OnlineServiceError::NoCapacity,
+            "no eligible durable dedicated server");
+    }
+    if (selected != SQLITE_ROW) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedAllocation>(
+            "failed to read dedicated capacity");
+    }
+    DedicatedAllocation allocation;
+    allocation.serverId = static_cast<uint64_t>(
+        sqlite3_column_int64(select.get(), 0));
+    allocation.address = columnText(select.get(), 1);
+    allocation.port = static_cast<uint16_t>(sqlite3_column_int(select.get(), 2));
+    allocation.allocationId = _impl->allocateId(
+        "ay_online_allocations", "allocation_id");
+    allocation.playerCount = request.playerCount;
+    allocation.reservationToken = randomToken();
+    allocation.expiresAtUnixSeconds = _impl->now() +
+        _impl->config.allocationLifetimeSeconds;
+    std::vector<uint8_t> sealed;
+    if (!allocation.isValid() ||
+        !sealSecret(_impl->config.storageKey,
+                    secretContext("allocation", allocation.allocationId),
+                    reinterpret_cast<const uint8_t*>(
+                        allocation.reservationToken.data()),
+                    allocation.reservationToken.size(), sealed)) {
+        _impl->rollback();
+        return OnlineServiceResult<DedicatedAllocation>::failure(
+            OnlineServiceError::InternalError,
+            "failed to create durable allocation credential");
+    }
+    Statement insert(_impl->database,
+        "INSERT INTO ay_online_allocations(allocation_id,server_id,address,port,"
+        "player_count,expires,token) VALUES(?1,?2,?3,?4,?5,?6,?7)");
+    Statement reserve(_impl->database,
+        "UPDATE ay_online_servers SET reserved_players=reserved_players+?1 "
+        "WHERE server_id=?2 AND draining=0 AND reserved_players+?1<=capacity");
+    const bool persisted = insert && reserve &&
+        bindU64(insert.get(), 1, allocation.allocationId) &&
+        bindU64(insert.get(), 2, allocation.serverId) &&
+        bindText(insert.get(), 3, allocation.address) &&
+        sqlite3_bind_int(insert.get(), 4, allocation.port) == SQLITE_OK &&
+        sqlite3_bind_int(insert.get(), 5, allocation.playerCount) == SQLITE_OK &&
+        bindU64(insert.get(), 6, allocation.expiresAtUnixSeconds) &&
+        bindBlob(insert.get(), 7, sealed) &&
+        sqlite3_step(insert.get()) == SQLITE_DONE &&
+        sqlite3_bind_int(reserve.get(), 1, allocation.playerCount) == SQLITE_OK &&
+        bindU64(reserve.get(), 2, allocation.serverId) &&
+        sqlite3_step(reserve.get()) == SQLITE_DONE &&
+        sqlite3_changes(_impl->database) == 1;
+    if (!persisted || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<DedicatedAllocation>(
+            "failed to persist dedicated allocation");
+    }
+    return OnlineServiceResult<DedicatedAllocation>::success(
+        std::move(allocation));
+}
+
+OnlineServiceResult<SessionServiceEmpty>
+SqliteOnlineServices::releaseAllocation(
+    DedicatedAllocationId allocationId,
+    const std::string& reservationToken) {
+    if (allocationId == 0 || reservationToken.size() != 64) {
+        return OnlineServiceResult<SessionServiceEmpty>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable allocation credential");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
+        _impl->rollback();
+        return _impl->databaseFailure<SessionServiceEmpty>(
+            "failed to begin allocation release");
+    }
+    Statement select(_impl->database,
+        "SELECT server_id,player_count,token FROM ay_online_allocations "
+        "WHERE allocation_id=?1");
+    if (!select || !bindU64(select.get(), 1, allocationId)) {
+        _impl->rollback();
+        return _impl->databaseFailure<SessionServiceEmpty>(
+            "failed to query allocation");
+    }
+    const int selected = sqlite3_step(select.get());
+    if (selected == SQLITE_DONE) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<SessionServiceEmpty>(
+                "failed to finish allocation release");
+        }
+        return OnlineServiceResult<SessionServiceEmpty>::failure(
+            OnlineServiceError::NotFound, "allocation not found");
+    }
+    if (selected != SQLITE_ROW) {
+        _impl->rollback();
+        return _impl->databaseFailure<SessionServiceEmpty>(
+            "failed to read allocation");
+    }
+    const DedicatedServerId serverId = static_cast<uint64_t>(
+        sqlite3_column_int64(select.get(), 0));
+    const uint16_t players = static_cast<uint16_t>(
+        sqlite3_column_int(select.get(), 1));
+    std::vector<uint8_t> plain;
+    const auto sealed = columnBlob(select.get(), 2);
+    if (!openSecret(_impl->config.storageKey,
+                    secretContext("allocation", allocationId), sealed, plain)) {
+        _impl->rollback();
+        return _impl->databaseFailure<SessionServiceEmpty>(
+            "failed to decrypt allocation credential");
+    }
+    const std::string stored(reinterpret_cast<const char*>(plain.data()), plain.size());
+    if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+    if (!tokenEqual(stored, reservationToken)) {
+        if (!_impl->commit()) {
+            _impl->rollback();
+            return _impl->databaseFailure<SessionServiceEmpty>(
+                "failed to finish allocation release");
+        }
+        return OnlineServiceResult<SessionServiceEmpty>::failure(
+            OnlineServiceError::Unauthorized,
+            "invalid allocation credential");
+    }
+    Statement remove(_impl->database,
+        "DELETE FROM ay_online_allocations WHERE allocation_id=?1");
+    Statement release(_impl->database,
+        "UPDATE ay_online_servers SET reserved_players=MAX(0,reserved_players-?1) "
+        "WHERE server_id=?2");
+    const bool removed = remove && release &&
+        bindU64(remove.get(), 1, allocationId) &&
+        sqlite3_step(remove.get()) == SQLITE_DONE &&
+        sqlite3_changes(_impl->database) == 1 &&
+        sqlite3_bind_int(release.get(), 1, players) == SQLITE_OK &&
+        bindU64(release.get(), 2, serverId) &&
+        sqlite3_step(release.get()) == SQLITE_DONE;
+    if (!removed || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<SessionServiceEmpty>(
+            "failed to persist allocation release");
+    }
+    return OnlineServiceResult<SessionServiceEmpty>::success({});
+}
+
+OnlineServiceResult<std::vector<DedicatedServerInfo>>
+SqliteOnlineServices::listServers() {
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
+        _impl->rollback();
+        return _impl->databaseFailure<std::vector<DedicatedServerInfo>>(
+            "failed to query dedicated servers");
+    }
+    Statement statement(_impl->database,
+        "SELECT server_id FROM ay_online_servers ORDER BY server_id");
+    if (!statement) {
+        _impl->rollback();
+        return _impl->databaseFailure<std::vector<DedicatedServerInfo>>(
+            "failed to prepare server query");
+    }
+    std::vector<DedicatedServerInfo> result;
+    int step = SQLITE_ROW;
+    while ((step = sqlite3_step(statement.get())) == SQLITE_ROW) {
+        Impl::ServerRecord record;
+        const DedicatedServerId id = static_cast<uint64_t>(
+            sqlite3_column_int64(statement.get(), 0));
+        if (!_impl->loadServer(id, record)) {
+            _impl->rollback();
+            return _impl->databaseFailure<std::vector<DedicatedServerInfo>>(
+                "invalid durable server record");
+        }
+        result.push_back(std::move(record.info));
+    }
+    if (step != SQLITE_DONE || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<std::vector<DedicatedServerInfo>>(
+            "failed to read dedicated servers");
+    }
+    return OnlineServiceResult<std::vector<DedicatedServerInfo>>::success(
+        std::move(result));
+}
+
+OnlineServiceResult<MatchTicketInfo> SqliteOnlineServices::enqueueMatch(
+    const MatchmakingRequest& request) {
+    if (!validParty(request.partyMembers, request.targetPlayers) ||
+        !validKey(request.queue) || !validKey(request.region) ||
+        !validKey(request.buildId) || request.targetPlayers < 2 ||
+        request.targetPlayers > _impl->config.maxMatchPlayers ||
+        request.virtualPort == 0 ||
+        static_cast<uint8_t>(request.topology) >
+            static_cast<uint8_t>(MatchTopology::Any)) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable matchmaking request");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork() || !_impl->begin()) {
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to begin match enqueue");
+    }
+    Statement count(_impl->database, "SELECT COUNT(*) FROM ay_online_tickets");
+    if (!count || sqlite3_step(count.get()) != SQLITE_ROW) {
+        _impl->rollback();
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to count match tickets");
+    }
+    if (static_cast<uint64_t>(sqlite3_column_int64(count.get(), 0)) >=
+        _impl->config.maxMatchTickets) {
+        _impl->rollback();
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::Full,
+            "durable matchmaking queue is full");
+    }
+    for (const PeerId& peer : request.partyMembers) {
+        Statement active(_impl->database,
+            "SELECT 1 FROM ay_online_ticket_members m JOIN ay_online_tickets t "
+            "ON t.ticket_id=m.ticket_id WHERE m.peer_id=?1 AND t.state IN (?2,?3) "
+            "LIMIT 1");
+        if (!active || !bindText(active.get(), 1, peer.value) ||
+            sqlite3_bind_int(active.get(), 2,
+                static_cast<int>(MatchTicketState::Queued)) != SQLITE_OK ||
+            sqlite3_bind_int(active.get(), 3,
+                static_cast<int>(MatchTicketState::Matching)) != SQLITE_OK) {
+            _impl->rollback();
+            return _impl->databaseFailure<MatchTicketInfo>(
+                "failed to check active match tickets");
+        }
+        const int activeResult = sqlite3_step(active.get());
+        if (activeResult == SQLITE_ROW) {
+            _impl->rollback();
+            return OnlineServiceResult<MatchTicketInfo>::failure(
+                OnlineServiceError::Conflict,
+                "a party member already has an active match ticket");
+        }
+        if (activeResult != SQLITE_DONE) {
+            _impl->rollback();
+            return _impl->databaseFailure<MatchTicketInfo>(
+                "failed to read active match tickets");
+        }
+    }
+    const MatchTicketId id = _impl->allocateId(
+        "ay_online_tickets", "ticket_id");
+    Statement insert(_impl->database,
+        "INSERT INTO ay_online_tickets(ticket_id,state,queue_name,region,build_id,"
+        "topology,target_players,virtual_port,created_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)");
+    const bool inserted = id != 0 && insert && bindU64(insert.get(), 1, id) &&
+        sqlite3_bind_int(insert.get(), 2,
+            static_cast<int>(MatchTicketState::Queued)) == SQLITE_OK &&
+        bindText(insert.get(), 3, request.queue) &&
+        bindText(insert.get(), 4, request.region) &&
+        bindText(insert.get(), 5, request.buildId) &&
+        sqlite3_bind_int(insert.get(), 6,
+            static_cast<int>(request.topology)) == SQLITE_OK &&
+        sqlite3_bind_int(insert.get(), 7, request.targetPlayers) == SQLITE_OK &&
+        sqlite3_bind_int(insert.get(), 8, request.virtualPort) == SQLITE_OK &&
+        bindU64(insert.get(), 9, _impl->now()) &&
+        sqlite3_step(insert.get()) == SQLITE_DONE;
+    if (!inserted) {
+        _impl->rollback();
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to persist match ticket");
+    }
+    for (size_t index = 0; index < request.partyMembers.size(); ++index) {
+        Statement member(_impl->database,
+            "INSERT INTO ay_online_ticket_members(ticket_id,ordinal,peer_id) "
+            "VALUES(?1,?2,?3)");
+        if (!member || !bindU64(member.get(), 1, id) ||
+            sqlite3_bind_int64(member.get(), 2,
+                static_cast<sqlite3_int64>(index)) != SQLITE_OK ||
+            !bindText(member.get(), 3, request.partyMembers[index].value) ||
+            sqlite3_step(member.get()) != SQLITE_DONE) {
+            _impl->rollback();
+            return _impl->databaseFailure<MatchTicketInfo>(
+                "failed to persist match party");
+        }
+    }
+    MatchTicketInfo info;
+    if (!_impl->loadTicket(id, info) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to finish match enqueue");
+    }
+    return OnlineServiceResult<MatchTicketInfo>::success(std::move(info));
+}
+
+OnlineServiceResult<MatchTicketInfo> SqliteOnlineServices::getMatch(
+    MatchTicketId ticketId, const PeerId& authenticatedPeer) {
+    if (ticketId == 0 || !authenticatedPeer.isValid()) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable match query");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork()) {
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to query durable match");
+    }
+    if (!_impl->isTicketMember(ticketId, authenticatedPeer)) {
+        const int exists = _impl->rowExists(
+            "ay_online_tickets", "ticket_id", ticketId);
+        if (exists == 0) return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::NotFound, "match ticket not found");
+        if (exists == 1) return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::Unauthorized, "peer does not own this ticket");
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to authorize match query");
+    }
+    MatchTicketInfo info;
+    if (!_impl->loadTicket(ticketId, info)) {
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to load durable match ticket");
+    }
+    return OnlineServiceResult<MatchTicketInfo>::success(std::move(info));
+}
+
+OnlineServiceResult<MatchTicketInfo> SqliteOnlineServices::cancelMatch(
+    MatchTicketId ticketId, const PeerId& authenticatedPeer) {
+    if (ticketId == 0 || !authenticatedPeer.isValid()) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::InvalidRequest,
+            "invalid durable match cancellation");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->recoverExpiredWork() || !_impl->begin()) {
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to begin match cancellation");
+    }
+    const int exists = _impl->rowExists(
+        "ay_online_tickets", "ticket_id", ticketId);
+    if (exists == 0) {
+        _impl->rollback();
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::NotFound, "match ticket not found");
+    }
+    if (exists < 0) {
+        _impl->rollback();
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to query match ticket");
+    }
+    if (!_impl->isTicketMember(ticketId, authenticatedPeer)) {
+        _impl->rollback();
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::Unauthorized, "peer does not own this ticket");
+    }
+    MatchTicketInfo current;
+    if (!_impl->loadTicket(ticketId, current)) {
+        _impl->rollback();
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to load match ticket");
+    }
+    if (current.state != MatchTicketState::Queued) {
+        _impl->rollback();
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::Conflict,
+            "match ticket is no longer queued");
+    }
+    Statement update(_impl->database,
+        "UPDATE ay_online_tickets SET state=?1,completed_at=?2 WHERE ticket_id=?3 "
+        "AND state=?4");
+    if (!update || sqlite3_bind_int(update.get(), 1,
+            static_cast<int>(MatchTicketState::Cancelled)) != SQLITE_OK ||
+        !bindU64(update.get(), 2, _impl->now()) ||
+        !bindU64(update.get(), 3, ticketId) ||
+        sqlite3_bind_int(update.get(), 4,
+            static_cast<int>(MatchTicketState::Queued)) != SQLITE_OK ||
+        sqlite3_step(update.get()) != SQLITE_DONE ||
+        sqlite3_changes(_impl->database) != 1 ||
+        !_impl->loadTicket(ticketId, current) || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<MatchTicketInfo>(
+            "failed to persist match cancellation");
+    }
+    return OnlineServiceResult<MatchTicketInfo>::success(std::move(current));
+}
+
+size_t SqliteOnlineServices::runMatchmaking(size_t maxMatches) {
+    if (maxMatches == 0 || maxMatches > 1000) return 0;
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready) return 0;
+    size_t processed = 0;
+    while (processed < maxMatches) {
+        std::vector<MatchTicketId> batch;
+        std::vector<PeerId> peers;
+        MatchmakingRequest request;
+        std::string claim;
+        const auto claimed = _impl->claimMatchBatch(
+            batch, request, peers, claim);
+        if (claimed == Impl::ClaimResult::None) break;
+        if (claimed == Impl::ClaimResult::Error) {
+            _impl->setDatabaseError("failed to claim durable match batch");
+            break;
+        }
+
+        MatchAssignment assignment;
+        OnlineServiceError failure = OnlineServiceError::None;
+        std::string failureMessage;
+        if (request.topology == MatchTopology::Dedicated ||
+            request.topology == MatchTopology::Any) {
+            auto allocated = allocateServer({
+                request.region, request.buildId,
+                static_cast<uint16_t>(peers.size())});
+            if (allocated) {
+                assignment.topology = MatchTopology::Dedicated;
+                assignment.dedicated = std::move(allocated.value);
+            } else if (request.topology == MatchTopology::Dedicated) {
+                failure = allocated.error;
+                failureMessage = allocated.message;
+            }
+        }
+
+        if (!assignment.dedicated.isValid() &&
+            request.topology != MatchTopology::Dedicated) {
+            if (!_impl->p2pSessions) {
+                failure = OnlineServiceError::BackendUnavailable;
+                failureMessage = "P2P session backend is not configured";
+            } else {
+                auto host = _impl->p2pSessions->createSession(
+                    {peers.front(), request.virtualPort, request.targetPlayers});
+                if (!host) {
+                    failure = mapSessionError(host.error);
+                    failureMessage = host.message;
+                } else {
+                    assignment.topology = MatchTopology::P2P;
+                    assignment.p2pGrants.push_back(host.value);
+                    for (size_t index = 1; index < peers.size(); ++index) {
+                        auto joined = _impl->p2pSessions->joinSession(
+                            {host.value.session.sessionId, peers[index]});
+                        if (!joined) {
+                            failure = mapSessionError(joined.error);
+                            failureMessage = joined.message;
+                            (void)_impl->p2pSessions->leaveSession(
+                                {host.value.member});
+                            assignment.p2pGrants.clear();
+                            break;
+                        }
+                        assignment.p2pGrants.push_back(std::move(joined.value));
+                    }
+                }
+            }
+        }
+
+        if (failure == OnlineServiceError::NoCapacity &&
+            request.topology == MatchTopology::Dedicated) {
+            if (!_impl->resetMatchBatch(batch, claim)) {
+                _impl->setDatabaseError(
+                    "failed to release durable match claim");
+            }
+            break;
+        }
+
+        if (!_impl->finalizeMatchBatch(
+                batch, claim, assignment, failure, failureMessage)) {
+            if (assignment.dedicated.isValid()) {
+                (void)releaseAllocation(
+                    assignment.dedicated.allocationId,
+                    assignment.dedicated.reservationToken);
+            }
+            if (!assignment.p2pGrants.empty() && _impl->p2pSessions) {
+                const auto host = std::find_if(
+                    assignment.p2pGrants.begin(), assignment.p2pGrants.end(),
+                    [](const P2PSessionGrant& grant) {
+                        return grant.member.peerId == grant.session.hostPeerId;
+                    });
+                if (host != assignment.p2pGrants.end()) {
+                    (void)_impl->p2pSessions->leaveSession({host->member});
+                }
+            }
+            _impl->setDatabaseError("failed to finalize durable match batch");
+            break;
+        }
+        ++processed;
+    }
+    return processed;
+}
+
+} // namespace ayt::net

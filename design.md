@@ -2026,12 +2026,33 @@ The online-service boundary and first-version behavior are documented in
   Lobby-to-P2P launch, solo-ticket grouping, grant polling, Dedicated register /
   heartbeat / reserve / drain / release / unregister, and clean shutdown.
 
+### 15.22 Durable Online Services backend (2026-08-28)
+
+- `SqliteOnlineServices` normalizes Lobby membership, matchmaking queue order,
+  Dedicated leases and allocations in SQLite WAL. `BEGIN IMMEDIATE` serializes
+  capacity reservations and revision transitions across same-host processes.
+- Expiring launch/match claims separate durable ownership from external P2P
+  side effects. Restart recovery requeues abandoned work, while final writes use
+  claim/revision compare-and-swap so late workers cannot overwrite a winner.
+- Dedicated credentials, reservation bearers and per-ticket P2P assignments are
+  XChaCha20-Poly1305 encrypted at rest. A sealed key check and schema-version
+  record reject wrong keys and unknown database formats during startup.
+- `PlayerAccessTokenVerifier` defines a provider-neutral, short-lived HMAC
+  bearer boundary. The application account service issues a token for a trusted
+  `PeerId`; AYNetwork verifies identity without depending on Steam or another
+  platform provider. Static credential files remain a development adapter.
+- Restart, retention, wrong-key, plaintext-at-rest, concurrent match/launch and
+  allocation-overbooking tests cover the durable invariants. A production
+  process E2E requires SQLite plus signed player authentication and executes all
+  Online Services route families through `SessionServer`.
+
 ---
 
 ## 16. Changelog
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-28 | **Durable Online Services backend**：新增规范化 SQLite Lobby/Match/Dedicated store、WAL/事务容量预留、跨进程过期 claim、assignment 与 server/allocation token 静态加密、schema/key 启动门禁；新增后端中立 HMAC 玩家 bearer、生产 SessionServer 接入、重启/并发/保密测试与 production E2E。 |
 | 2026-08-28 | **Authenticated Online Services HTTP**：新增 `HttpOnlineServices` 客户端和共享 SessionServer 路由；bearer 派生 PeerId、party 独立授权、fleet/server/reservation 三域凭证；在线路由复用限流/审计；新增 `AYNetwork_OnlineProbe` 多进程 E2E 与生产临时状态拒绝门禁。 |
 | 2026-08-28 | **Durable backend + Online Services v1**：SQLite WAL/事务 epoch CAS、token 静态加密、持久 Ed25519 key、HTTP 准入/限流/审计与生产启动门禁；补分区故障矩阵；新增 Lobby、party Matchmaking、Dedicated lease/drain/allocation 契约和线程安全参考实现，并接入现有 P2P session backend。 |
 | 2026-08-28 | **P2PSessionCoordinator**：异步 create/join/leave 与失败回滚；统一安装 grant/信令/Join Ticket/validator、启动 listen/connect 和 Host lease；非阻塞 authority gate 将优雅迁移后端 CAS 放在 Commit 前、崩溃 self-claim 放在 Promotion 前；覆盖 lease 等待、双候选 CAS、超时 fail-closed。 |

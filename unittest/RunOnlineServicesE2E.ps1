@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$SessionServer,
-    [Parameter(Mandatory = $true)][string]$OnlineProbe
+    [Parameter(Mandatory = $true)][string]$OnlineProbe,
+    [switch]$Production
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,20 +48,72 @@ function Read-Log([string]$Path) {
     }
 }
 
+function Convert-HexBytes([string]$Text) {
+    if (($Text.Length % 2) -ne 0) { throw "Invalid hex byte string" }
+    $bytes = New-Object byte[] ($Text.Length / 2)
+    for ($index = 0; $index -lt $bytes.Length; ++$index) {
+        $bytes[$index] = [Convert]::ToByte($Text.Substring($index * 2, 2), 16)
+    }
+    return $bytes
+}
+
+function Convert-Base64Url([byte[]]$Bytes) {
+    return [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function New-PlayerAccessToken(
+    [string]$PeerId, [long]$IssuedAt, [long]$ExpiresAt, [string]$KeyHex) {
+    $nonce = New-Object byte[] 16
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($nonce)
+    $peer = Convert-Base64Url ([Text.Encoding]::UTF8.GetBytes($PeerId))
+    $encodedNonce = Convert-Base64Url $nonce
+    $payload = "ay1.$peer.$IssuedAt.$ExpiresAt.$encodedNonce"
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+    try {
+        $hmac.Key = Convert-HexBytes $KeyHex
+        $signature = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload))
+        return "$payload.$(Convert-Base64Url $signature)"
+    }
+    finally { $hmac.Dispose() }
+}
+
 try {
-    $ownerToken = "owner-" + ("a" * 58)
-    $guestToken = "guest-" + ("b" * 58)
+    $authKey = "2b" * 32
+    if ($Production) {
+        $issuedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $ownerToken = New-PlayerAccessToken `
+            "online-owner" $issuedAt ($issuedAt + 300) $authKey
+        $guestToken = New-PlayerAccessToken `
+            "online-guest" $issuedAt ($issuedAt + 300) $authKey
+    }
+    else {
+        $ownerToken = "owner-" + ("a" * 58)
+        $guestToken = "guest-" + ("b" * 58)
+    }
     $fleetToken = "fleet-" + ("c" * 58)
-    Set-Content -LiteralPath $credentials -Value @(
-        "online-owner $ownerToken",
-        "online-guest $guestToken"
-    ) -Encoding ASCII
     $environment = @{
         AY_ONLINE_ENABLE = "1"
-        AY_ONLINE_CREDENTIALS_FILE = $credentials
         AY_ONLINE_SERVER_TOKEN = $fleetToken
         AY_ONLINE_OWNER_TOKEN = $ownerToken
         AY_ONLINE_GUEST_TOKEN = $guestToken
+    }
+    if ($Production) {
+        $environment.AY_SESSION_PRODUCTION = "1"
+        $environment.AY_SESSION_DB = Join-Path $tempRoot "sessions.db"
+        $environment.AY_SESSION_STATE_KEY = "1a" * 32
+        $environment.AY_SESSION_TICKET_KEY_FILE = Join-Path $tempRoot "ticket.key"
+        $environment.AY_SESSION_ADMISSION_TOKEN = "admission-test-" + ("a" * 50)
+        $environment.AY_SESSION_AUDIT_FILE = Join-Path $tempRoot "audit.jsonl"
+        $environment.AY_SESSION_HTTP_BIND = "127.0.0.1"
+        $environment.AY_ONLINE_DB = $environment.AY_SESSION_DB
+        $environment.AY_ONLINE_AUTH_KEY = $authKey
+    }
+    else {
+        Set-Content -LiteralPath $credentials -Value @(
+            "online-owner $ownerToken",
+            "online-guest $guestToken"
+        ) -Encoding ASCII
+        $environment.AY_ONLINE_CREDENTIALS_FILE = $credentials
     }
     foreach ($entry in $environment.GetEnumerator()) {
         $savedEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable(
@@ -88,6 +141,11 @@ try {
     if (!(Read-Log $serverOut).Contains("online=enabled")) {
         throw "Online SessionServer did not become ready: $(Read-Log $serverOut)"
     }
+    if ($Production -and
+        !(Read-Log $serverOut).Contains(
+            "mode=production store=sqlite online=enabled online_store=sqlite")) {
+        throw "Online SessionServer did not use durable production mode: $(Read-Log $serverOut)"
+    }
 
     $probe = Start-Process -FilePath $OnlineProbe -ArgumentList @(
         "127.0.0.1", [string]$httpPort
@@ -97,6 +155,22 @@ try {
     if ($probe.ExitCode -ne 0 -or
         !$probeText.Contains("AY_ONLINE_RESULT state=passed")) {
         throw "OnlineProbe failed ($($probe.ExitCode)): $probeText $(Read-Log $probeErr) server=$(Read-Log $serverOut) $(Read-Log $serverErr)"
+    }
+    if ($Production) {
+        foreach ($required in @(
+            $env:AY_SESSION_DB,
+            $env:AY_SESSION_TICKET_KEY_FILE,
+            $env:AY_SESSION_AUDIT_FILE)) {
+            if (!(Test-Path -LiteralPath $required)) {
+                throw "Production Online Services artifact missing: $required"
+            }
+        }
+        $audit = Get-Content -LiteralPath $env:AY_SESSION_AUDIT_FILE -Raw
+        if (!$audit.Contains('"status":200') -or
+            $audit.Contains($ownerToken) -or $audit.Contains($guestToken) -or
+            $audit.Contains($fleetToken)) {
+            throw "Production Online Services audit is incomplete or leaked a bearer"
+        }
     }
     Write-Output $probeText.Trim()
 }

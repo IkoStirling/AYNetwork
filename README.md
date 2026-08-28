@@ -158,9 +158,11 @@ Host/Client 通过 `HttpP2PSessionService` 创建或加入会话，再用
 `IDedicatedServerService`。`InMemoryOnlineServices` 是线程安全参考实现：Lobby 可按
 revision CAS 更新并直接启动 P2P session；匹配支持完整 party、P2P/Dedicated/Any
 拓扑和每个 ticket 的最小秘密暴露；Dedicated 目录支持注册凭证、租约、draining、容量
-预留和过期 fencing。`HttpOnlineServices` 提供可信身份派生的远程客户端，路由可与
-SessionServer 共用端口；参考进程支持凭证文件与 fleet token，生产可替换三个服务接口为
-持久实现。完整边界见 [docs/online-services.md](docs/online-services.md)。
+预留和过期 fencing。`SqliteOnlineServices` 提供 WAL、事务化容量预留、多进程 expiring
+claim、重启恢复和 XChaCha20-Poly1305 凭证静态加密。`HttpOnlineServices` 提供可信身份
+派生的远程客户端，路由可与 SessionServer 共用端口；生产参考进程使用账号服务签发的
+后端中立 HMAC 玩家 token、持久 SQLite state 与独立 fleet token。完整边界见
+[docs/online-services.md](docs/online-services.md)。
 
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。
