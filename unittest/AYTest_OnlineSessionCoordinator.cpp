@@ -4,6 +4,7 @@
 #include <AYNetwork/Session/HttpSessionService.h>
 #include <AYNetwork/Session/InMemoryOnlineServices.h>
 #include <AYNetwork/Session/InMemorySessionService.h>
+#include <AYNetwork/Session/OnlineFlowCoordinator.h>
 #include <AYNetwork/Session/OnlineSessionCoordinator.h>
 #include <AYNetwork/Session/OnlineSessionEvents.h>
 #include <AYNetwork/Session/OnlineSubSystem.h>
@@ -404,6 +405,26 @@ bool waitForSubSystemState(IOnlineSubSystem& subsystem,
     }, timeoutMs);
 }
 
+template <typename Predicate>
+bool waitForFlow(IOnlineSubSystem& subsystem,
+                 OnlineFlowCoordinator& flow,
+                 ayt::event::EventBus& eventBus,
+                 Predicate&& predicate,
+                 uint32_t timeoutMs = 2000) {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        subsystem.update(0.0f);
+        flow.update();
+        eventBus.pump();
+        const auto status = flow.getStatus();
+        if (predicate(status)) return true;
+        if (status.state == OnlineFlowState::Failed) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
 } // namespace
 
 TEST_SUITE(OnlineSessionCoordinator)
@@ -802,6 +823,48 @@ TEST_CASE(OnlineSubSystemBuildsHttpBackendAndRotatesPlayerToken) {
           OnlineSessionCoordinatorState::Idle);
     subsystem->shutdown();
     server.stop();
+}
+
+TEST_CASE(OnlineFlowRunsEndToEndOverInjectedSubSystem) {
+    ayt::test::setCurrentCase(
+        "OnlineFlowRunsEndToEndOverInjectedSubSystem");
+    std::atomic<uint64_t> now{11000};
+    auto sessions = makeSessionService(now);
+    auto online = std::make_shared<InMemoryOnlineServices>(
+        InMemoryOnlineServicesConfig{}, sessions);
+    OnlineCoordinatorNetwork network;
+    ayt::event::EventBus eventBus;
+    auto subsystem = createOnlineSubSystem(
+        network, subsystemConfig("flow-owner"),
+        subsystemDependencies(sessions, online), &eventBus);
+    CHECK(subsystem->initialize());
+    OnlineFlowCoordinator flow(*subsystem, {}, &eventBus);
+    CHECK(flow.getStatus().state == OnlineFlowState::MainMenu);
+
+    CHECK(flow.createLobby(lobbyRequest("forged-owner")));
+    CHECK(waitForFlow(*subsystem, flow, eventBus, [](const auto& status) {
+        return status.state == OnlineFlowState::InLobby;
+    }));
+    const LobbyId lobbyId = flow.getStatus().lobbyId;
+    CHECK(lobbyId != 0);
+
+    CHECK(flow.startLobbySession(7350));
+    CHECK(waitForFlow(*subsystem, flow, eventBus, [](const auto& status) {
+        return status.state == OnlineFlowState::LoadingSession;
+    }));
+    const uint64_t generation = flow.getStatus().loadingGeneration;
+    CHECK(generation != 0);
+    CHECK(flow.completeLoading(generation));
+    CHECK(waitForFlow(*subsystem, flow, eventBus, [](const auto& status) {
+        return status.state == OnlineFlowState::InSession;
+    }));
+
+    CHECK(flow.leaveSession());
+    CHECK(waitForFlow(*subsystem, flow, eventBus, [](const auto& status) {
+        return status.state == OnlineFlowState::MainMenu;
+    }));
+    CHECK(online->getLobby(lobbyId).error == OnlineServiceError::NotFound);
+    subsystem->shutdown();
 }
 
 TEST_SUITE_END

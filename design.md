@@ -2095,12 +2095,35 @@ The online-service boundary and first-version behavior are documented in
   fail-closed behavior, and the valid Closed Lobby tombstone returned by final
   member leave.
 
+### 15.25 Application Online flow (2026-08-29)
+
+- `OnlineFlowCoordinator` maps the transport/backend coordinator into UI and
+  scene-facing states from SignedOut and MainMenu through Lobby/Matchmaking,
+  LoadingSession, InSession, cleanup and terminal failure. It is deliberately
+  UI- and scene-loader-neutral and updates after `IOnlineSubSystem`.
+- Account authentication stays outside AYNetwork. `signIn()` accepts the
+  account layer's issued credentials, while `refreshCredentials()` rotates a
+  live access/admission token without rebuilding clients or state machines.
+- A committed assignment starts one generation-fenced loading transaction.
+  `OnlineFlowLoadRequestedEvent` contains IDs/topology but no secret; the scene
+  loader must acknowledge the same generation. Both network InSession and world
+  completion are required before gameplay state is exposed.
+- Return-to-menu and sign-out use one fail-closed cleanup path. Active or
+  committed transport is torn down before stale queued-ticket state, then the
+  ticket and Lobby are removed. Sign-out clears credentials only after cleanup.
+  Independent loading and cleanup deadlines prevent permanent transitional
+  states; cleanup timeout preserves credentials for a later authenticated retry.
+- Tests cover sign-in/browser/Lobby/sign-out, dual readiness, stale generation,
+  loading timeout and recovery, session failure cleanup, credential rotation,
+  cleanup timeout and wrong-state command rejection.
+
 ---
 
 ## 16. Changelog
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-29 | **Application Online flow**：新增 `OnlineFlowCoordinator`，统一登录结果、主菜单、Lobby/Matchmaking、generation-fenced 关卡加载、游戏态与退出/注销；网络和世界双就绪门禁，活跃 assignment 优先清理，加载/清理独立超时，运行时凭据刷新及无秘密流程事件。 |
 | 2026-08-29 | **GameLoop Online subsystem**：新增 `IOnlineSubSystem`，在 Network 后统一驱动 Lobby/Matchmaking/P2P；默认组装 HTTP 后端并支持完整服务注入、运行时凭证轮换、有界退出清理和无秘密 EventBus 状态/列表事件；修复快速请求漏事件及最终成员 HTTP leave 将合法 Closed 墓碑误判为无效的问题。 |
 | 2026-08-28 | **Online Session Coordinator**：新增非阻塞 Lobby/Matchmaking 游戏侧状态机；assignment grant 直接接入 `P2PSessionCoordinator`，避免重复 join；Dedicated reservation 通过可替换 connector 交付；取消竞争按 canonical ticket 对账，并覆盖 P2P/Dedicated/失败回滚测试。 |
 | 2026-08-28 | **Durable Online Services backend**：新增规范化 SQLite Lobby/Match/Dedicated store、WAL/事务容量预留、跨进程过期 claim、assignment 与 server/allocation token 静态加密、schema/key 启动门禁；新增后端中立 HMAC 玩家 bearer、生产 SessionServer 接入、重启/并发/保密测试与 production E2E。 |

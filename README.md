@@ -176,6 +176,12 @@ claim、重启恢复和 XChaCha20-Poly1305 凭证静态加密。`HttpOnlineServi
 状态和大厅列表变化通过 `OnlineSessionStatusChangedEvent` / `OnlineLobbyListChangedEvent`
 延迟发布，退出 Play Session 时会在有界时间内取消票据、离开会话和 Lobby。
 
+`OnlineFlowCoordinator` 再向上提供不绑定 UI/场景实现的应用流程：`SignedOut → MainMenu →
+Lobby/Matchmaking → LoadingSession → InSession → MainMenu`。账号层把签发结果交给
+`signIn()`/`refreshCredentials()`；关卡层订阅 `OnlineFlowLoadRequestedEvent`，使用同一
+generation 回调 `completeLoading()` 或 `failLoading()`。网络就绪与关卡加载必须同时完成
+才能进入游戏，退出/注销会按“活跃会话、票据、Lobby”的顺序清理并受独立超时保护。
+
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。
 

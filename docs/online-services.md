@@ -140,6 +140,42 @@ token 不进入状态对象、事件或普通日志。`shutdown()` 会在
 排队，完成状态由后续 GameLoop update 排队，因此即使本地/快速后端在一帧内完成也不会
 漏掉列表代次。
 
+## 应用在线流程
+
+`OnlineFlowCoordinator` 位于 UI/关卡系统与 `IOnlineSubSystem` 之间。它不实现账号登录，
+而是接收账号服务已经签发的短期 token，然后统一表示登录页、主菜单、大厅浏览、房间、
+匹配、会话加载、游戏中、清理和失败状态。应用每帧应先更新 Online subsystem，再调用
+`OnlineFlowCoordinator::update()`。
+
+```cpp
+#include <AYNetwork/Session/OnlineFlowCoordinator.h>
+
+auto* online = findRegisteredOnlineSubSystem();
+OnlineFlowCoordinator flow(*online);
+
+// 账号服务或平台适配器完成登录后：
+flow.signIn(playerAccessToken, p2pAdmissionToken);
+flow.browseLobbies({"asia", buildId, 1, 100});
+
+// UI 发起匹配；assignment 到达后流程发布加载事件。
+flow.startMatchmaking(matchRequest);
+const auto loading = flow.getStatus();
+
+// 场景异步加载回调必须带回同一个 generation。
+flow.completeLoading(loading.loadingGeneration);
+```
+
+`OnlineFlowLoadRequestedEvent` 只携带 topology、Lobby/ticket/session/allocation ID 和加载
+generation，不携带 bearer、信令 token 或 Dedicated reservation token。若场景加载先于
+网络完成，流程继续停留在 `LoadingSession`；若网络先完成，也会等待场景确认。旧回调的
+generation 不匹配时会被拒绝，避免取消后重匹配时误进入旧世界。
+
+`leaveLobby()`、`cancelMatchmaking()`、`leaveSession()` 和 `returnToMainMenu()` 都进入统一
+清理路径；已提交 assignment/活跃传输优先于可能残留的 queued ticket。`signOut()` 在资源
+清理完成后才清空凭据。连接/加载和清理分别由 `loadingTimeoutMs`、`cleanupTimeoutMs` 限时；
+清理超时会 fail-closed 并保留玩家 token，使应用仍有机会重试后端撤销。access token 续签
+使用 `refreshCredentials()`，无需重建流程、HTTP 客户端或会话。
+
 ## HTTP 接入
 
 `HttpOnlineServices` 实现三个客户端接口；同一组路由可选挂载到

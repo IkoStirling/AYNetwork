@@ -25,6 +25,7 @@ set(SRC_FILES
     src/Session/P2PSessionCoordinator.cpp
     src/Session/OnlineSessionCoordinator.cpp
     src/Session/OnlineSubSystem.cpp
+    src/Session/OnlineFlowCoordinator.cpp
     src/Session/InMemoryOnlineServices.cpp
     src/Protocol/PacketAssembler.cpp
     src/Protocol/PacketCodec.cpp
