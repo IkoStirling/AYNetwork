@@ -84,10 +84,18 @@ OnlineServiceError mapSessionError(SessionServiceError error) {
 } // namespace
 
 bool LobbyInfo::isValid() const {
-    return lobbyId != 0 && revision != 0 && ownerPeerId.isValid() &&
-           !name.empty() && validKey(region) && validKey(buildId) &&
-           capacity != 0 && !members.empty() && members.size() <= capacity &&
-           containsPeer(members, ownerPeerId) &&
+    if (lobbyId == 0 || revision == 0 || !ownerPeerId.isValid() ||
+        name.empty() || !validKey(region) || !validKey(buildId) ||
+        capacity == 0 || members.size() > capacity) {
+        return false;
+    }
+    // The final member leaving returns a closed tombstone so remote clients
+    // can distinguish a successful leave from a malformed response. There is
+    // deliberately no current owner/member in that terminal representation.
+    if (state == LobbyState::Closed) {
+        return members.empty() && sessionId == 0;
+    }
+    return !members.empty() && containsPeer(members, ownerPeerId) &&
            (state == LobbyState::InSession ? sessionId != 0 : sessionId == 0);
 }
 

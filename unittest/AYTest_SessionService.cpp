@@ -147,19 +147,20 @@ TEST_CASE(HttpAdmissionRateLimitAndSecretFreeAudit) {
     HttpP2PSessionServer server(std::move(serverConfig), service);
     CHECK(server.start());
 
-    HttpP2PSessionClientConfig deniedConfig;
-    deniedConfig.serverPort = server.getBoundPort();
-    HttpP2PSessionService denied(std::move(deniedConfig));
-    CHECK(denied.createSession(hostRequest()).error ==
+    std::string rotatingAdmissionToken;
+    HttpP2PSessionClientConfig clientConfig;
+    clientConfig.serverPort = server.getBoundPort();
+    clientConfig.admissionTokenProvider = [&] {
+        return rotatingAdmissionToken;
+    };
+    HttpP2PSessionService client(std::move(clientConfig));
+    CHECK(client.createSession(hostRequest()).error ==
           SessionServiceError::Unauthorized);
 
-    HttpP2PSessionClientConfig admittedConfig;
-    admittedConfig.serverPort = server.getBoundPort();
-    admittedConfig.admissionToken = "test-admission-secret";
-    HttpP2PSessionService admitted(std::move(admittedConfig));
-    const auto created = admitted.createSession(hostRequest());
+    rotatingAdmissionToken = "test-admission-secret";
+    const auto created = client.createSession(hostRequest());
     CHECK(created);
-    CHECK(admitted.getSession(created.value.session.sessionId).error ==
+    CHECK(client.getSession(created.value.session.sessionId).error ==
           SessionServiceError::RateLimited);
     server.stop();
 

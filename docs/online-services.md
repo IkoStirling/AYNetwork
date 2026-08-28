@@ -23,7 +23,8 @@ Lobby / Matchmaking / Dedicated Directory
 
 `ILobbyService` 支持创建、筛选、加入、离开、读取、按 revision CAS 更新，以及
 `launchLobbyP2P`。Owner 离开时所有权确定性转给成员列表中的下一人；最后一人离开删除
-Lobby。启动过程先把状态从 `Open` CAS 到 `Launching`，在锁外创建 P2P session 并为每个
+Lobby，并向该次 leave 返回一个无成员的 `Closed` 墓碑，随后读取该 Lobby 得到 NotFound。
+启动过程先把状态从 `Open` CAS 到 `Launching`，在锁外创建 P2P session 并为每个
 成员签发 grant，成功后进入 `InSession`；失败会关闭已创建的 Host session 并重新开放
 Lobby。启动期间不允许成员变化。
 
@@ -96,6 +97,48 @@ AYNetwork 不把某一种游戏服认证协议硬编码进通用 `connect()`。c
 的 assignment 不会被静默丢弃。连续临时轮询错误按配置重试，终止后仍可调用
 `cancelMatchmaking()` 清理活 ticket。`leaveSession()` 会先离开 P2P 或断开 Dedicated，
 Lobby 启动的会话随后再撤销 Lobby membership。
+
+## 引擎级 OnlineSubSystem
+
+普通引擎应用不需要自行持有两个协调器。`IOnlineSubSystem` 是 GameLoop facade：它在
+`Ingress` 阶段运行，严格要求 `Network` 先初始化并先更新；默认自动创建
+`HttpP2PSessionService` 与 `HttpOnlineServices`，把大厅、匹配、P2P 会话和 Dedicated
+connector 收束成一个生命周期。
+
+```cpp
+#include <AYNetwork/Session/OnlineSubSystem.h>
+
+OnlineSubSystemConfig config;
+config.localPeerId = PeerId{"account:player-42"};
+config.backend.serverAddress = "api.example.internal";
+config.backend.serverPort = 8080;
+config.p2p.p2p.icePolicy = P2PIcePolicy::DirectOnly;
+config.p2p.p2p.allowPrivateCandidates = true;
+
+// 必须在 preparePlaySession()/run() 前注册。
+registerOnlineSubSystem(std::move(config));
+
+// 账号登录或续签完成后可轮换，不需要重建 HTTP 客户端。
+auto* online = findRegisteredOnlineSubSystem();
+online->setPlayerAccessToken(accountAccessToken);
+online->listLobbies({"asia", buildId, 1, 100});
+```
+
+若平台 SDK、应用后端或测试已经实现三个后端接口，可通过
+`OnlineSubSystemDependencies` 同时注入 `IP2PSessionService`、`ILobbyService` 和
+`IMatchmakingService`；部分注入会被拒绝，避免同一会话混用两套 authority。可选的
+`IDedicatedSessionConnector` 可与默认 HTTP 后端一起使用。
+
+玩家 bearer 和 P2P admission token 都由线程安全 provider 在每次请求时读取，支持运行时
+轮换。存在 Lobby、匹配票据或会话时不允许清空玩家 bearer，防止失去清理资源所需的身份；
+token 不进入状态对象、事件或普通日志。`shutdown()` 会在
+`gracefulShutdownTimeoutMs` 的有界窗口内尝试取消匹配并离开会话/Lobby。
+
+应用可订阅 `OnlineSessionStatusChangedEvent` 和 `OnlineLobbyListChangedEvent`。两者都是
+可安全排队的平凡 payload，只携带状态、ID、epoch 和计数；详细 Lobby 列表通过
+`getLobbyResults()` 拉取，并用 `getLobbyListGeneration()` 判断版本。命令受理状态会立即
+排队，完成状态由后续 GameLoop update 排队，因此即使本地/快速后端在一帧内完成也不会
+漏掉列表代次。
 
 ## HTTP 接入
 

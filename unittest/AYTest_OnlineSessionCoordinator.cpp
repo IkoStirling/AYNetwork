@@ -1,13 +1,18 @@
 // Game-facing Lobby / Matchmaking assignment orchestration coverage.
 
+#include <AYEventSystem/EventBus.h>
+#include <AYNetwork/Session/HttpSessionService.h>
 #include <AYNetwork/Session/InMemoryOnlineServices.h>
 #include <AYNetwork/Session/InMemorySessionService.h>
 #include <AYNetwork/Session/OnlineSessionCoordinator.h>
+#include <AYNetwork/Session/OnlineSessionEvents.h>
+#include <AYNetwork/Session/OnlineSubSystem.h>
 #include <AYTest.h>
 
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -307,6 +312,25 @@ OnlineSessionCoordinatorConfig onlineConfig(const char* peer) {
     return config;
 }
 
+OnlineSubSystemConfig subsystemConfig(const char* peer) {
+    OnlineSubSystemConfig config;
+    config.localPeerId = PeerId{peer};
+    config.p2p = p2pConfig(peer);
+    config.sessions = onlineConfig(peer);
+    config.gracefulShutdownTimeoutMs = 500;
+    return config;
+}
+
+OnlineSubSystemDependencies subsystemDependencies(
+    const std::shared_ptr<InMemoryP2PSessionService>& sessions,
+    const std::shared_ptr<InMemoryOnlineServices>& online) {
+    OnlineSubSystemDependencies dependencies;
+    dependencies.sessionService = sessions;
+    dependencies.lobbyService = online;
+    dependencies.matchmakingService = online;
+    return dependencies;
+}
+
 CreateLobbyRequest lobbyRequest(const char* owner = "owner") {
     CreateLobbyRequest request;
     request.ownerPeerId = PeerId{owner};
@@ -349,6 +373,33 @@ bool waitForState(OnlineSessionCoordinator& coordinator,
                   OnlineSessionCoordinatorState state,
                   uint32_t timeoutMs = 1500) {
     return waitFor(coordinator, [state](const auto& status) {
+        return status.state == state;
+    }, timeoutMs);
+}
+
+template <typename Predicate>
+bool waitForSubSystem(IOnlineSubSystem& subsystem,
+                      ayt::event::EventBus& eventBus,
+                      Predicate&& predicate,
+                      uint32_t timeoutMs = 2000) {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        subsystem.update(0.0f);
+        eventBus.pump();
+        const auto status = subsystem.getOnlineStatus();
+        if (predicate(status)) return true;
+        if (status.state == OnlineSessionCoordinatorState::Failed) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+bool waitForSubSystemState(IOnlineSubSystem& subsystem,
+                           ayt::event::EventBus& eventBus,
+                           OnlineSessionCoordinatorState state,
+                           uint32_t timeoutMs = 2000) {
+    return waitForSubSystem(subsystem, eventBus, [state](const auto& status) {
         return status.state == state;
     }, timeoutMs);
 }
@@ -613,6 +664,144 @@ TEST_CASE(CommittedAssignmentWinsCancellationConflict) {
     CHECK(coordinator.getStatus().matchTicket.state ==
           MatchTicketState::Matched);
     CHECK(network.listening);
+}
+
+TEST_CASE(OnlineSubSystemPublishesLifecycleAndLobbyListEvents) {
+    ayt::test::setCurrentCase(
+        "OnlineSubSystemPublishesLifecycleAndLobbyListEvents");
+    std::atomic<uint64_t> now{9000};
+    auto sessions = makeSessionService(now);
+    auto online = std::make_shared<InMemoryOnlineServices>(
+        InMemoryOnlineServicesConfig{}, sessions);
+    CHECK(online->createLobby(lobbyRequest("seed-owner")));
+
+    OnlineCoordinatorNetwork network;
+    ayt::event::EventBus eventBus;
+    OnlineSubSystemDependencies partialDependencies;
+    partialDependencies.sessionService = sessions;
+    auto partial = createOnlineSubSystem(
+        network, subsystemConfig("owner"), partialDependencies, &eventBus);
+    CHECK(!partial->initialize());
+
+    uint32_t statusEventCount = 0;
+    uint32_t listEventCount = 0;
+    OnlineSessionStatusChangedEvent lastStatusEvent;
+    OnlineLobbyListChangedEvent lastListEvent;
+    const auto statusConnection =
+        eventBus.subscribe<OnlineSessionStatusChangedEvent>(
+            [&](const OnlineSessionStatusChangedEvent& event) {
+                ++statusEventCount;
+                lastStatusEvent = event;
+            });
+    const auto listConnection =
+        eventBus.subscribe<OnlineLobbyListChangedEvent>(
+            [&](const OnlineLobbyListChangedEvent& event) {
+                ++listEventCount;
+                lastListEvent = event;
+            });
+
+    auto subsystem = createOnlineSubSystem(
+        network, subsystemConfig("owner"),
+        subsystemDependencies(sessions, online), &eventBus);
+    CHECK(subsystem != nullptr);
+    const auto& descriptor = subsystem->getDescriptor();
+    CHECK(std::string_view(descriptor.name) == "Online");
+    CHECK_INT_EQ(descriptor.initializeAfter.size(), 1);
+    CHECK(std::string_view(descriptor.initializeAfter.front()) == "Network");
+    CHECK_INT_EQ(descriptor.runsAfter.size(), 1);
+    CHECK(std::string_view(descriptor.runsAfter.front()) == "Network");
+    CHECK(descriptor.phases ==
+          ayt::game::phaseBit(ayt::game::FramePhase::Ingress));
+    CHECK(subsystem->initialize());
+    CHECK(subsystem->isReady());
+    CHECK(subsystem->isAuthenticated());
+
+    CHECK(subsystem->listLobbies({"asia", "build-1", 1, 10}));
+    CHECK(waitForSubSystem(subsystem.operator*(), eventBus,
+        [&](const auto& status) {
+            return status.state == OnlineSessionCoordinatorState::Idle &&
+                   subsystem->getLobbyListGeneration() == 1;
+        }));
+    CHECK_INT_EQ(subsystem->getLobbyResults().size(), 1);
+    CHECK_INT_EQ(listEventCount, 1);
+    CHECK_INT_EQ(lastListEvent.generation, 1);
+    CHECK_INT_EQ(lastListEvent.lobbyCount, 1);
+
+    CHECK(subsystem->createLobby(lobbyRequest("forged-owner")));
+    CHECK(waitForSubSystemState(
+        *subsystem, eventBus, OnlineSessionCoordinatorState::InLobby));
+    const auto lobbyId = subsystem->getOnlineStatus().lobby.lobbyId;
+    CHECK(lobbyId != 0);
+    CHECK(subsystem->getOnlineStatus().lobby.ownerPeerId == PeerId{"owner"});
+    CHECK(statusEventCount >= 4);
+    CHECK(lastStatusEvent.state == OnlineSessionCoordinatorState::InLobby);
+    CHECK_INT_EQ(lastStatusEvent.lobbyId, lobbyId);
+
+    subsystem->shutdown();
+    CHECK(!subsystem->isReady());
+    CHECK(online->getLobby(lobbyId).error == OnlineServiceError::NotFound);
+    eventBus.unsubscribe(statusConnection);
+    eventBus.unsubscribe(listConnection);
+}
+
+TEST_CASE(OnlineSubSystemBuildsHttpBackendAndRotatesPlayerToken) {
+    ayt::test::setCurrentCase(
+        "OnlineSubSystemBuildsHttpBackendAndRotatesPlayerToken");
+    std::atomic<uint64_t> now{10000};
+    auto sessions = makeSessionService(now);
+    auto online = std::make_shared<InMemoryOnlineServices>(
+        InMemoryOnlineServicesConfig{}, sessions);
+
+    HttpP2PSessionServerConfig serverConfig;
+    serverConfig.bindAddress = "127.0.0.1";
+    serverConfig.playerAuthenticator = [](std::string_view token,
+                                           PeerId& peer) {
+        if (token != "owner-access-token") return false;
+        peer = PeerId{"owner"};
+        return true;
+    };
+    HttpP2PSessionServer server(
+        std::move(serverConfig), sessions, online, online);
+    CHECK(server.start());
+
+    auto config = subsystemConfig("owner");
+    config.backend.serverAddress = "127.0.0.1";
+    config.backend.serverPort = server.getBoundPort();
+    config.backend.connectTimeoutMs = 500;
+    config.backend.requestTimeoutMs = 1000;
+    OnlineCoordinatorNetwork network;
+    ayt::event::EventBus eventBus;
+    auto subsystem = createOnlineSubSystem(
+        network, std::move(config), {}, &eventBus);
+    CHECK(subsystem->initialize());
+    CHECK(subsystem->isReady());
+    CHECK(!subsystem->isAuthenticated());
+
+    CHECK(subsystem->setPlayerAccessToken("owner-access-token"));
+    CHECK(subsystem->isAuthenticated());
+    CHECK(subsystem->createLobby(lobbyRequest("forged-owner")));
+    CHECK(waitForSubSystemState(
+        *subsystem, eventBus, OnlineSessionCoordinatorState::InLobby));
+    CHECK(subsystem->getOnlineStatus().lobby.ownerPeerId == PeerId{"owner"});
+    CHECK(!subsystem->setPlayerAccessToken({}));
+
+    CHECK(subsystem->leaveLobby());
+    CHECK(waitForSubSystemState(
+        *subsystem, eventBus, OnlineSessionCoordinatorState::Idle));
+    CHECK(subsystem->setPlayerAccessToken({}));
+    CHECK(!subsystem->isAuthenticated());
+    CHECK(subsystem->createLobby(lobbyRequest("owner")));
+    CHECK(waitForSubSystem(
+        *subsystem, eventBus, [](const auto& status) {
+            return status.state == OnlineSessionCoordinatorState::Failed &&
+                   status.serviceError == OnlineServiceError::Unauthorized;
+        }));
+
+    CHECK(subsystem->reset());
+    CHECK(subsystem->getOnlineStatus().state ==
+          OnlineSessionCoordinatorState::Idle);
+    subsystem->shutdown();
+    server.stop();
 }
 
 TEST_SUITE_END

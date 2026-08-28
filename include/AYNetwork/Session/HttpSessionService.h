@@ -21,6 +21,9 @@ struct HttpP2PSessionClientConfig {
     // Optional deployment admission credential. It is sent only on create and
     // join; per-member bearer credentials continue to protect mutations.
     std::string admissionToken;
+    // Optional thread-safe source for rotating admission credentials. When
+    // present it takes precedence over admissionToken on each create/join.
+    std::function<std::string()> admissionTokenProvider;
 };
 
 class HttpP2PSessionService final : public IP2PSessionService {

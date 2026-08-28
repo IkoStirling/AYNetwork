@@ -170,6 +170,12 @@ claim、重启恢复和 XChaCha20-Poly1305 凭证静态加密。`HttpOnlineServi
 统一状态覆盖 `Idle / InLobby / Queueing / Assigned / Connecting / InSession / Failed`，
 取消竞争会以 canonical ticket 结果为准，不会静默丢弃已经提交的 assignment。
 
+引擎应用推荐注册 `IOnlineSubSystem`，由它在 GameLoop 的 `Ingress` 阶段、`Network`
+之后驱动上述两个协调器。默认配置会自动组装 HTTP Lobby/Matchmaking/Session 客户端，
+也可完整注入平台或测试后端；账号刷新后可直接轮换玩家 bearer，无需重建网络对象。
+状态和大厅列表变化通过 `OnlineSessionStatusChangedEvent` / `OnlineLobbyListChangedEvent`
+延迟发布，退出 Play Session 时会在有界时间内取消票据、离开会话和 Lobby。
+
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。
 

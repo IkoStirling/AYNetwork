@@ -2069,12 +2069,39 @@ The online-service boundary and first-version behavior are documented in
   and committed-assignment reconciliation, Dedicated reservation handoff/lifecycle,
   and malformed-assignment fail-closed.
 
+### 15.24 GameLoop Online subsystem integration (2026-08-29)
+
+- `IOnlineSubSystem` is the engine-facing facade over
+  `OnlineSessionCoordinator` and `P2PSessionCoordinator`. It runs in Ingress,
+  initializes and executes strictly after `Network`, and offers one owner-thread
+  API for Lobby, matchmaking, session leave/reset, status, and discovery data.
+- The default path assembles `HttpOnlineServices` and
+  `HttpP2PSessionService`. A complete injected service triple replaces HTTP for
+  platform adapters and tests; partial injection is rejected so one coordinator
+  never mixes authority sources. A Dedicated connector remains independently
+  injectable.
+- Player and admission credentials are read from synchronized per-request
+  providers. Login refresh can rotate either token without reconstructing HTTP
+  clients; a player token cannot be cleared while a Lobby, ticket, or session
+  still needs authenticated cleanup. Secrets never enter events or status.
+- Accepted commands publish their starting state immediately, then frame update
+  publishes completion. This preserves short-lived states and lobby-list
+  generations even when a local backend completes before the first update.
+  Deferred, trivially-copyable events expose session state and list generation;
+  full lists remain pull-based.
+- Shutdown performs bounded cancel/leave/reset cleanup before releasing clients.
+  Integration tests cover lifecycle ordering, deferred events, graceful Lobby
+  cleanup, automatic HTTP composition, runtime bearer rotation, unauthorized
+  fail-closed behavior, and the valid Closed Lobby tombstone returned by final
+  member leave.
+
 ---
 
 ## 16. Changelog
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-29 | **GameLoop Online subsystem**：新增 `IOnlineSubSystem`，在 Network 后统一驱动 Lobby/Matchmaking/P2P；默认组装 HTTP 后端并支持完整服务注入、运行时凭证轮换、有界退出清理和无秘密 EventBus 状态/列表事件；修复快速请求漏事件及最终成员 HTTP leave 将合法 Closed 墓碑误判为无效的问题。 |
 | 2026-08-28 | **Online Session Coordinator**：新增非阻塞 Lobby/Matchmaking 游戏侧状态机；assignment grant 直接接入 `P2PSessionCoordinator`，避免重复 join；Dedicated reservation 通过可替换 connector 交付；取消竞争按 canonical ticket 对账，并覆盖 P2P/Dedicated/失败回滚测试。 |
 | 2026-08-28 | **Durable Online Services backend**：新增规范化 SQLite Lobby/Match/Dedicated store、WAL/事务容量预留、跨进程过期 claim、assignment 与 server/allocation token 静态加密、schema/key 启动门禁；新增后端中立 HMAC 玩家 bearer、生产 SessionServer 接入、重启/并发/保密测试与 production E2E。 |
 | 2026-08-28 | **Authenticated Online Services HTTP**：新增 `HttpOnlineServices` 客户端和共享 SessionServer 路由；bearer 派生 PeerId、party 独立授权、fleet/server/reservation 三域凭证；在线路由复用限流/审计；新增 `AYNetwork_OnlineProbe` 多进程 E2E 与生产临时状态拒绝门禁。 |

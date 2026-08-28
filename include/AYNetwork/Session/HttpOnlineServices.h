@@ -4,6 +4,7 @@
 #include <AYNetwork/OnlineServices.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -20,6 +21,9 @@ struct HttpOnlineServicesClientConfig {
     // body. The server derives PeerId from its trusted authentication callback.
     PeerId localPeerId;
     std::string playerAccessToken;
+    // Optional thread-safe token source used by long-lived engine clients.
+    // When present it takes precedence over playerAccessToken on each request.
+    std::function<std::string()> playerAccessTokenProvider;
 
     // Trusted fleet/orchestrator operations: register/list/allocate servers.
     std::string dedicatedControlToken;

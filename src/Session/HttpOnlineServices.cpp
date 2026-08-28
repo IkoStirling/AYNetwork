@@ -479,15 +479,23 @@ struct HttpOnlineServices::Impl {
         return decodeResponse(operation(client));
     }
 
-    httplib::Headers playerHeaders() const {
-        return {{"Authorization", "Bearer " + config.playerAccessToken}};
+    httplib::Headers playerHeaders(const std::string& token) const {
+        return {{"Authorization", "Bearer " + token}};
     }
     httplib::Headers controlHeaders() const {
         return {{"X-AY-Server-Token", config.dedicatedControlToken}};
     }
-    bool actorMatches(const PeerId& actor) const {
+    bool actorMatches(const PeerId& actor, const std::string& token) const {
         return config.localPeerId.isValid() && actor == config.localPeerId &&
-               !config.playerAccessToken.empty();
+               !token.empty();
+    }
+    std::string playerToken() const {
+        if (!config.playerAccessTokenProvider) return config.playerAccessToken;
+        try {
+            return config.playerAccessTokenProvider();
+        } catch (...) {
+            return {};
+        }
     }
 
     HttpOnlineServicesClientConfig config;
@@ -499,14 +507,15 @@ HttpOnlineServices::~HttpOnlineServices() = default;
 
 OnlineServiceResult<LobbyInfo> HttpOnlineServices::createLobby(
     const CreateLobbyRequest& request) {
-    if (!_impl->actorMatches(request.ownerPeerId)) {
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(request.ownerPeerId, token)) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::Unauthorized, "local lobby actor does not match token");
     }
     const json body{{"name", request.name}, {"region", request.region},
                     {"build_id", request.buildId}, {"capacity", request.capacity}};
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Post("/v1/lobbies", _impl->playerHeaders(), body.dump(),
+        return client.Post("/v1/lobbies", _impl->playerHeaders(token), body.dump(),
                            "application/json");
     });
     if (response.error != OnlineServiceError::None) {
@@ -522,8 +531,9 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::createLobby(
 
 OnlineServiceResult<std::vector<LobbyInfo>> HttpOnlineServices::listLobbies(
     const ListLobbiesRequest& request) {
+    const std::string token = _impl->playerToken();
     if (!_impl->config.localPeerId.isValid() ||
-        _impl->config.playerAccessToken.empty()) {
+        token.empty()) {
         return OnlineServiceResult<std::vector<LobbyInfo>>::failure(
             OnlineServiceError::Unauthorized, "player authentication is missing");
     }
@@ -532,7 +542,7 @@ OnlineServiceResult<std::vector<LobbyInfo>> HttpOnlineServices::listLobbies(
         "&minimum_open_slots=" + std::to_string(request.minimumOpenSlots) +
         "&limit=" + std::to_string(request.limit);
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Get(path, _impl->playerHeaders());
+        return client.Get(path, _impl->playerHeaders(token));
     });
     if (response.error != OnlineServiceError::None) {
         return OnlineServiceResult<std::vector<LobbyInfo>>::failure(
@@ -554,11 +564,12 @@ OnlineServiceResult<std::vector<LobbyInfo>> HttpOnlineServices::listLobbies(
 
 OnlineServiceResult<LobbyInfo> HttpOnlineServices::joinLobby(
     LobbyId lobbyId, const PeerId& actor) {
-    if (!_impl->actorMatches(actor)) return OnlineServiceResult<LobbyInfo>::failure(
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(actor, token)) return OnlineServiceResult<LobbyInfo>::failure(
         OnlineServiceError::Unauthorized, "local lobby actor does not match token");
     const std::string path = "/v1/lobbies/" + std::to_string(lobbyId) + "/join";
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Post(path, _impl->playerHeaders(), "{}", "application/json");
+        return client.Post(path, _impl->playerHeaders(token), "{}", "application/json");
     });
     if (response.error != OnlineServiceError::None) return
         OnlineServiceResult<LobbyInfo>::failure(response.error, response.message);
@@ -571,11 +582,12 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::joinLobby(
 
 OnlineServiceResult<LobbyInfo> HttpOnlineServices::leaveLobby(
     LobbyId lobbyId, const PeerId& actor) {
-    if (!_impl->actorMatches(actor)) return OnlineServiceResult<LobbyInfo>::failure(
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(actor, token)) return OnlineServiceResult<LobbyInfo>::failure(
         OnlineServiceError::Unauthorized, "local lobby actor does not match token");
     const std::string path = "/v1/lobbies/" + std::to_string(lobbyId) + "/leave";
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Post(path, _impl->playerHeaders(), "{}", "application/json");
+        return client.Post(path, _impl->playerHeaders(token), "{}", "application/json");
     });
     if (response.error != OnlineServiceError::None) return
         OnlineServiceResult<LobbyInfo>::failure(response.error, response.message);
@@ -588,7 +600,8 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::leaveLobby(
 
 OnlineServiceResult<LobbyInfo> HttpOnlineServices::updateLobby(
     const UpdateLobbyRequest& request) {
-    if (!_impl->actorMatches(request.actorPeerId)) return
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(request.actorPeerId, token)) return
         OnlineServiceResult<LobbyInfo>::failure(OnlineServiceError::Unauthorized,
             "local lobby actor does not match token");
     const json body{{"expected_revision", request.expectedRevision},
@@ -596,7 +609,7 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::updateLobby(
     const std::string path = "/v1/lobbies/" + std::to_string(request.lobbyId) +
         "/update";
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Post(path, _impl->playerHeaders(), body.dump(),
+        return client.Post(path, _impl->playerHeaders(token), body.dump(),
                            "application/json");
     });
     if (response.error != OnlineServiceError::None) return
@@ -609,13 +622,14 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::updateLobby(
 }
 
 OnlineServiceResult<LobbyInfo> HttpOnlineServices::getLobby(LobbyId lobbyId) {
+    const std::string token = _impl->playerToken();
     if (!_impl->config.localPeerId.isValid() ||
-        _impl->config.playerAccessToken.empty()) return
+        token.empty()) return
         OnlineServiceResult<LobbyInfo>::failure(OnlineServiceError::Unauthorized,
                                                  "player authentication is missing");
     const std::string path = "/v1/lobbies/" + std::to_string(lobbyId);
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Get(path, _impl->playerHeaders());
+        return client.Get(path, _impl->playerHeaders(token));
     });
     if (response.error != OnlineServiceError::None) return
         OnlineServiceResult<LobbyInfo>::failure(response.error, response.message);
@@ -628,7 +642,8 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::getLobby(LobbyId lobbyId) {
 
 OnlineServiceResult<LobbyLaunchResult> HttpOnlineServices::launchLobbyP2P(
     const LaunchLobbyRequest& request) {
-    if (!_impl->actorMatches(request.actorPeerId)) return
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(request.actorPeerId, token)) return
         OnlineServiceResult<LobbyLaunchResult>::failure(
             OnlineServiceError::Unauthorized,
             "local lobby actor does not match token");
@@ -637,7 +652,7 @@ OnlineServiceResult<LobbyLaunchResult> HttpOnlineServices::launchLobbyP2P(
     const std::string path = "/v1/lobbies/" + std::to_string(request.lobbyId) +
         "/launch-p2p";
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Post(path, _impl->playerHeaders(), body.dump(),
+        return client.Post(path, _impl->playerHeaders(token), body.dump(),
                            "application/json");
     });
     if (response.error != OnlineServiceError::None) return
@@ -652,12 +667,14 @@ OnlineServiceResult<LobbyLaunchResult> HttpOnlineServices::launchLobbyP2P(
 
 OnlineServiceResult<MatchTicketInfo> HttpOnlineServices::enqueueMatch(
     const MatchmakingRequest& request) {
+    const std::string token = _impl->playerToken();
     if (!_impl->config.localPeerId.isValid() ||
+        token.empty() ||
         !containsPeer(request.partyMembers, _impl->config.localPeerId)) return
         OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::Unauthorized, "local peer is not in match party");
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Post("/v1/matches", _impl->playerHeaders(),
+        return client.Post("/v1/matches", _impl->playerHeaders(token),
                            matchRequestToJson(request).dump(), "application/json");
     });
     if (response.error != OnlineServiceError::None) return
@@ -672,11 +689,12 @@ OnlineServiceResult<MatchTicketInfo> HttpOnlineServices::enqueueMatch(
 
 OnlineServiceResult<MatchTicketInfo> HttpOnlineServices::getMatch(
     MatchTicketId ticketId, const PeerId& actor) {
-    if (!_impl->actorMatches(actor)) return OnlineServiceResult<MatchTicketInfo>::failure(
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(actor, token)) return OnlineServiceResult<MatchTicketInfo>::failure(
         OnlineServiceError::Unauthorized, "local match actor does not match token");
     const std::string path = "/v1/matches/" + std::to_string(ticketId);
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Get(path, _impl->playerHeaders());
+        return client.Get(path, _impl->playerHeaders(token));
     });
     if (response.error != OnlineServiceError::None) return
         OnlineServiceResult<MatchTicketInfo>::failure(response.error,
@@ -690,11 +708,12 @@ OnlineServiceResult<MatchTicketInfo> HttpOnlineServices::getMatch(
 
 OnlineServiceResult<MatchTicketInfo> HttpOnlineServices::cancelMatch(
     MatchTicketId ticketId, const PeerId& actor) {
-    if (!_impl->actorMatches(actor)) return OnlineServiceResult<MatchTicketInfo>::failure(
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(actor, token)) return OnlineServiceResult<MatchTicketInfo>::failure(
         OnlineServiceError::Unauthorized, "local match actor does not match token");
     const std::string path = "/v1/matches/" + std::to_string(ticketId) + "/cancel";
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Post(path, _impl->playerHeaders(), "{}", "application/json");
+        return client.Post(path, _impl->playerHeaders(token), "{}", "application/json");
     });
     if (response.error != OnlineServiceError::None) return
         OnlineServiceResult<MatchTicketInfo>::failure(response.error,

@@ -289,6 +289,15 @@ TransportResponse decodeResponse(const httplib::Result& response) {
 struct HttpP2PSessionService::Impl {
     explicit Impl(HttpP2PSessionClientConfig input) : config(std::move(input)) {}
 
+    std::string admissionToken() const {
+        if (!config.admissionTokenProvider) return config.admissionToken;
+        try {
+            return config.admissionTokenProvider();
+        } catch (...) {
+            return {};
+        }
+    }
+
     template <typename Operation>
     TransportResponse invoke(Operation&& operation) const {
         if (config.serverAddress.empty() || config.serverPort == 0) {
@@ -328,8 +337,9 @@ HttpP2PSessionService::createSession(const P2PSessionCreateRequest& request) {
         {"capacity", request.capacity},
     };
     httplib::Headers headers;
-    if (!_impl->config.admissionToken.empty()) {
-        headers.emplace("X-AY-Admission-Token", _impl->config.admissionToken);
+    const std::string admissionToken = _impl->admissionToken();
+    if (!admissionToken.empty()) {
+        headers.emplace("X-AY-Admission-Token", admissionToken);
     }
     const auto response = _impl->invoke([&](httplib::Client& client) {
         return client.Post("/v1/sessions", headers, body.dump(),
@@ -353,8 +363,9 @@ HttpP2PSessionService::joinSession(const P2PSessionJoinRequest& request) {
     const std::string path = "/v1/sessions/" +
         std::to_string(request.sessionId) + "/join";
     httplib::Headers headers;
-    if (!_impl->config.admissionToken.empty()) {
-        headers.emplace("X-AY-Admission-Token", _impl->config.admissionToken);
+    const std::string admissionToken = _impl->admissionToken();
+    if (!admissionToken.empty()) {
+        headers.emplace("X-AY-Admission-Token", admissionToken);
     }
     const auto response = _impl->invoke([&](httplib::Client& client) {
         return client.Post(path, headers, body.dump(), "application/json");
