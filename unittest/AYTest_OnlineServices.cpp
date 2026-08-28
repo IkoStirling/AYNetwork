@@ -1,5 +1,7 @@
 // Lobby, matchmaking and dedicated-server reference backend coverage.
 
+#include <AYNetwork/Session/HttpOnlineServices.h>
+#include <AYNetwork/Session/HttpSessionService.h>
 #include <AYNetwork/Session/InMemoryOnlineServices.h>
 #include <AYNetwork/Session/InMemorySessionService.h>
 #include <AYTest.h>
@@ -195,6 +197,131 @@ TEST_CASE(MatchmakingAnyPrefersDedicatedAndDedicatedOnlyWaitsForCapacity) {
     CHECK(matched.value.state == MatchTicketState::Matched);
     CHECK(matched.value.assignment.topology == MatchTopology::Dedicated);
     CHECK(matched.value.assignment.dedicated.isValid());
+}
+
+TEST_CASE(OnlineServicesEnforceResourceCapsAndRateLimitConfiguration) {
+    ayt::test::setCurrentCase(
+        "OnlineServicesEnforceResourceCapsAndRateLimitConfiguration");
+    InMemoryOnlineServicesConfig limits;
+    limits.maxLobbyCapacity = 2;
+    limits.maxMatchPlayers = 2;
+    limits.maxDedicatedServerCapacity = 4;
+    InMemoryOnlineServices online(limits);
+
+    auto oversizedLobby = lobbyRequest();
+    oversizedLobby.capacity = 3;
+    CHECK(online.createLobby(oversizedLobby).error ==
+          OnlineServiceError::InvalidRequest);
+
+    auto oversizedMatch = matchRequest({PeerId{"owner"}});
+    oversizedMatch.targetPlayers = 3;
+    CHECK(online.enqueueMatch(oversizedMatch).error ==
+          OnlineServiceError::InvalidRequest);
+
+    CHECK(online.registerServer(
+        {"server-a", "asia", "build-1", "203.0.113.10", 7000, 5}).error ==
+          OnlineServiceError::InvalidRequest);
+    CHECK(online.allocateServer({"asia", "build-1", 3}).error ==
+          OnlineServiceError::InvalidRequest);
+
+    uint64_t now = 4500;
+    HttpP2PSessionServerConfig serverConfig;
+    serverConfig.bindAddress = "127.0.0.1";
+    serverConfig.rateLimitRequestsPerMinute = 1;
+    serverConfig.rateLimitBurst = 1;
+    serverConfig.rateLimitTrackedSources = 0;
+    HttpP2PSessionServer server(std::move(serverConfig), p2pBackend(now));
+    CHECK(!server.start());
+}
+
+TEST_CASE(HttpOnlineServicesDerivesIdentityAndCoversAllRouteFamilies) {
+    ayt::test::setCurrentCase(
+        "HttpOnlineServicesDerivesIdentityAndCoversAllRouteFamilies");
+    uint64_t now = 5000;
+    auto sessions = p2pBackend(now);
+    auto online = std::make_shared<InMemoryOnlineServices>(
+        InMemoryOnlineServicesConfig{}, sessions);
+
+    HttpP2PSessionServerConfig serverConfig;
+    serverConfig.bindAddress = "127.0.0.1";
+    serverConfig.playerAuthenticator = [](std::string_view token, PeerId& peer) {
+        if (token == "owner-access-token") peer = PeerId{"owner"};
+        else if (token == "guest-access-token") peer = PeerId{"guest"};
+        else return false;
+        return true;
+    };
+    serverConfig.dedicatedControlAuthenticator = [](std::string_view token) {
+        return token == "fleet-control-token";
+    };
+    HttpP2PSessionServer server(
+        std::move(serverConfig), sessions, online, online, online);
+    CHECK(server.start());
+
+    auto clientFor = [&](const char* peer, const char* token) {
+        HttpOnlineServicesClientConfig config;
+        config.serverPort = server.getBoundPort();
+        config.localPeerId = PeerId{peer};
+        config.playerAccessToken = token;
+        config.dedicatedControlToken = "fleet-control-token";
+        return std::make_unique<HttpOnlineServices>(std::move(config));
+    };
+    auto owner = clientFor("owner", "owner-access-token");
+    auto guest = clientFor("guest", "guest-access-token");
+    auto denied = clientFor("owner", "wrong-token");
+
+    CHECK(denied->createLobby(lobbyRequest()).error ==
+          OnlineServiceError::Unauthorized);
+    const auto created = owner->createLobby(lobbyRequest());
+    CHECK(created);
+    const auto joined = guest->joinLobby(created.value.lobbyId, PeerId{"guest"});
+    CHECK(joined);
+    CHECK_INT_EQ(owner->listLobbies({"asia", "build-1", 1, 10}).value.size(), 1);
+
+    MatchmakingRequest forged = matchRequest(
+        {PeerId{"owner"}, PeerId{"guest"}});
+    forged.targetPlayers = 2;
+    CHECK(owner->enqueueMatch(forged).error == OnlineServiceError::Unauthorized);
+
+    LaunchLobbyRequest launch;
+    launch.lobbyId = created.value.lobbyId;
+    launch.actorPeerId = PeerId{"owner"};
+    launch.expectedRevision = joined.value.revision;
+    launch.virtualPort = 7350;
+    const auto launched = owner->launchLobbyP2P(launch);
+    CHECK(launched);
+    CHECK_INT_EQ(launched.value.memberGrants.size(), 2);
+
+    auto firstRequest = matchRequest({PeerId{"owner"}});
+    firstRequest.targetPlayers = 2;
+    auto secondRequest = matchRequest({PeerId{"guest"}});
+    secondRequest.targetPlayers = 2;
+    const auto first = owner->enqueueMatch(firstRequest);
+    const auto second = guest->enqueueMatch(secondRequest);
+    CHECK(first && second);
+    CHECK_INT_EQ(owner->runMatchmaking(1), 1);
+    CHECK(owner->getMatch(first.value.ticketId, PeerId{"owner"}).value.state ==
+          MatchTicketState::Matched);
+    CHECK(guest->getMatch(second.value.ticketId, PeerId{"guest"}).value.state ==
+          MatchTicketState::Matched);
+
+    DedicatedServerRegistration registration;
+    registration.instanceName = "http-server-a";
+    registration.region = "asia";
+    registration.buildId = "build-1";
+    registration.address = "203.0.113.20";
+    registration.port = 7100;
+    registration.capacity = 8;
+    const auto dedicated = owner->registerServer(registration);
+    CHECK(dedicated);
+    CHECK_INT_EQ(owner->listServers().value.size(), 1);
+    CHECK(owner->heartbeatServer(dedicated.value.credential));
+    const auto allocation = owner->allocateServer({"asia", "build-1", 3});
+    CHECK(allocation);
+    CHECK(owner->releaseAllocation(allocation.value.allocationId,
+                                   allocation.value.reservationToken));
+    CHECK(owner->setServerDraining(dedicated.value.credential, true));
+    CHECK(owner->unregisterServer(dedicated.value.credential));
+    server.stop();
 }
 
 TEST_SUITE_END

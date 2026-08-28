@@ -1,37 +1,39 @@
 #pragma once
-// Thread-safe reference Lobby / Matchmaking / Dedicated Server backend.
+// cpp-httplib client adapter for Lobby, Matchmaking and Dedicated services.
 
 #include <AYNetwork/OnlineServices.h>
 
-#include <functional>
+#include <cstdint>
 #include <memory>
+#include <string>
 
 namespace ayt::net
 {
 
-struct InMemoryOnlineServicesConfig {
-    size_t maxLobbies = 4096;
-    size_t maxMatchTickets = 65536;
-    size_t maxDedicatedServers = 4096;
-    uint16_t maxLobbyCapacity = 64;
-    uint16_t maxMatchPlayers = 64;
-    uint16_t maxDedicatedServerCapacity = 4096;
-    uint32_t dedicatedLeaseSeconds = 15;
-    uint32_t allocationLifetimeSeconds = 60;
-    std::function<uint64_t()> nowUnixSeconds;
+struct HttpOnlineServicesClientConfig {
+    std::string serverAddress = "127.0.0.1";
+    uint16_t serverPort = 0;
+    uint32_t connectTimeoutMs = 2000;
+    uint32_t requestTimeoutMs = 3000;
+
+    // Player operations use this bearer and never transmit actorPeerId in the
+    // body. The server derives PeerId from its trusted authentication callback.
+    PeerId localPeerId;
+    std::string playerAccessToken;
+
+    // Trusted fleet/orchestrator operations: register/list/allocate servers.
+    std::string dedicatedControlToken;
 };
 
-class InMemoryOnlineServices final : public ILobbyService,
-                                     public IMatchmakingService,
-                                     public IDedicatedServerService {
+class HttpOnlineServices final : public ILobbyService,
+                                 public IMatchmakingService,
+                                 public IDedicatedServerService {
 public:
-    explicit InMemoryOnlineServices(
-        InMemoryOnlineServicesConfig config,
-        std::shared_ptr<IP2PSessionService> p2pSessions = {});
-    ~InMemoryOnlineServices() override;
+    explicit HttpOnlineServices(HttpOnlineServicesClientConfig config);
+    ~HttpOnlineServices() override;
 
-    InMemoryOnlineServices(const InMemoryOnlineServices&) = delete;
-    InMemoryOnlineServices& operator=(const InMemoryOnlineServices&) = delete;
+    HttpOnlineServices(const HttpOnlineServices&) = delete;
+    HttpOnlineServices& operator=(const HttpOnlineServices&) = delete;
 
     OnlineServiceResult<LobbyInfo> createLobby(
         const CreateLobbyRequest& request) override;

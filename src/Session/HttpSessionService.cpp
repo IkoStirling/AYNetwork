@@ -1,5 +1,7 @@
 #include <AYNetwork/Session/HttpSessionService.h>
 
+#include "HttpOnlineServicesRoutes.h"
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -7,6 +9,7 @@
 #include <charconv>
 #include <chrono>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -457,10 +460,29 @@ HttpP2PSessionService::getSession(uint64_t sessionId) {
 
 struct HttpP2PSessionServer::Impl {
     Impl(HttpP2PSessionServerConfig input,
-         std::shared_ptr<IP2PSessionService> sessionService)
-        : config(std::move(input)), service(std::move(sessionService)) {
+         std::shared_ptr<IP2PSessionService> sessionService,
+         std::shared_ptr<ILobbyService> lobbies,
+         std::shared_ptr<IMatchmakingService> matchmaking,
+         std::shared_ptr<IDedicatedServerService> dedicated)
+        : config(std::move(input)), service(std::move(sessionService)),
+          hasPlayerRoutes(static_cast<bool>(lobbies) ||
+                          static_cast<bool>(matchmaking)),
+          hasDedicatedRoutes(static_cast<bool>(dedicated)) {
         server.set_payload_max_length(kMaxRequestBytes);
         installRoutes();
+        HttpOnlineServicesRouteConfig routes;
+        routes.lobbies = std::move(lobbies);
+        routes.matchmaking = std::move(matchmaking);
+        routes.dedicated = std::move(dedicated);
+        routes.permit = [this](const httplib::Request& request,
+                               httplib::Response& response) {
+            return permit(request, response);
+        };
+        routes.playerAuthenticator = config.playerAuthenticator;
+        routes.partyAuthorizer = config.partyAuthorizer;
+        routes.dedicatedControlAuthenticator =
+            config.dedicatedControlAuthenticator;
+        installHttpOnlineServicesRoutes(server, std::move(routes));
     }
 
     void badRequest(httplib::Response& response, const char* message) {
@@ -486,6 +508,23 @@ struct HttpP2PSessionServer::Impl {
         bool allowed = false;
         {
             std::lock_guard<std::mutex> lock(rateMutex);
+            if (rateBuckets.find(source) == rateBuckets.end() &&
+                rateBuckets.size() >= config.rateLimitTrackedSources) {
+                const auto staleBefore = now - std::chrono::minutes(10);
+                for (auto it = rateBuckets.begin(); it != rateBuckets.end();) {
+                    it = it->second.updated < staleBefore
+                        ? rateBuckets.erase(it) : std::next(it);
+                }
+            }
+            if (rateBuckets.find(source) == rateBuckets.end() &&
+                rateBuckets.size() >= config.rateLimitTrackedSources) {
+                writeFailure(response,
+                    SessionServiceResult<SessionServiceEmpty>::failure(
+                        SessionServiceError::RateLimited,
+                        "session service source table is full"));
+                response.set_header("Retry-After", "1");
+                return false;
+            }
             auto [it, inserted] = rateBuckets.try_emplace(source);
             RateBucket& bucket = it->second;
             const double burst = static_cast<double>(config.rateLimitBurst);
@@ -688,12 +727,19 @@ struct HttpP2PSessionServer::Impl {
     uint16_t boundPort = 0;
     std::mutex rateMutex;
     std::unordered_map<std::string, RateBucket> rateBuckets;
+    bool hasPlayerRoutes = false;
+    bool hasDedicatedRoutes = false;
 };
 
 HttpP2PSessionServer::HttpP2PSessionServer(
     HttpP2PSessionServerConfig config,
-    std::shared_ptr<IP2PSessionService> service)
-    : _impl(std::make_unique<Impl>(std::move(config), std::move(service))) {}
+    std::shared_ptr<IP2PSessionService> service,
+    std::shared_ptr<ILobbyService> lobbies,
+    std::shared_ptr<IMatchmakingService> matchmaking,
+    std::shared_ptr<IDedicatedServerService> dedicated)
+    : _impl(std::make_unique<Impl>(
+          std::move(config), std::move(service), std::move(lobbies),
+          std::move(matchmaking), std::move(dedicated))) {}
 
 HttpP2PSessionServer::~HttpP2PSessionServer() { stop(); }
 
@@ -702,8 +748,13 @@ bool HttpP2PSessionServer::start() {
         _impl->config.bindAddress.empty() ||
         (_impl->config.requireAdmissionAuthentication &&
          !_impl->config.admissionAuthenticator) ||
+        (_impl->hasPlayerRoutes && !_impl->config.playerAuthenticator) ||
+        (_impl->hasDedicatedRoutes &&
+         !_impl->config.dedicatedControlAuthenticator) ||
         ((_impl->config.rateLimitRequestsPerMinute == 0) !=
-         (_impl->config.rateLimitBurst == 0))) return false;
+         (_impl->config.rateLimitBurst == 0)) ||
+        (_impl->config.rateLimitRequestsPerMinute != 0 &&
+         _impl->config.rateLimitTrackedSources == 0)) return false;
     const int port = _impl->config.port == 0
         ? _impl->server.bind_to_any_port(_impl->config.bindAddress)
         : (_impl->server.bind_to_port(

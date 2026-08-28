@@ -190,7 +190,8 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::createLobby(
     const CreateLobbyRequest& request) {
     if (!request.ownerPeerId.isValid() || request.name.empty() ||
         request.name.size() > kMaxNameBytes || !validKey(request.region) ||
-        !validKey(request.buildId) || request.capacity == 0) {
+        !validKey(request.buildId) || request.capacity == 0 ||
+        request.capacity > _impl->config.maxLobbyCapacity) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::InvalidRequest, "invalid lobby request");
     }
@@ -301,6 +302,7 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::leaveLobby(
     if (info.members.empty()) {
         LobbyInfo closed = info;
         closed.state = LobbyState::Closed;
+        closed.sessionId = 0;
         ++closed.revision;
         _impl->lobbies.erase(found);
         return OnlineServiceResult<LobbyInfo>::success(std::move(closed));
@@ -450,7 +452,8 @@ OnlineServiceResult<DedicatedServerGrant> InMemoryOnlineServices::registerServer
     if (request.instanceName.empty() || request.instanceName.size() > kMaxNameBytes ||
         !validKey(request.region) || !validKey(request.buildId) ||
         request.address.empty() || request.address.size() > 255 ||
-        request.port == 0 || request.capacity == 0) {
+        request.port == 0 || request.capacity == 0 ||
+        request.capacity > _impl->config.maxDedicatedServerCapacity) {
         return OnlineServiceResult<DedicatedServerGrant>::failure(
             OnlineServiceError::InvalidRequest, "invalid server registration");
     }
@@ -564,7 +567,8 @@ OnlineServiceResult<DedicatedAllocation>
 InMemoryOnlineServices::allocateServer(
     const DedicatedAllocationRequest& request) {
     if (!validKey(request.region) || !validKey(request.buildId) ||
-        request.playerCount == 0) {
+        request.playerCount == 0 ||
+        request.playerCount > _impl->config.maxMatchPlayers) {
         return OnlineServiceResult<DedicatedAllocation>::failure(
             OnlineServiceError::InvalidRequest, "invalid allocation request");
     }
@@ -665,7 +669,8 @@ OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::enqueueMatch(
     if (!validParty(request.partyMembers, request.targetPlayers) ||
         !validKey(request.queue) || !validKey(request.region) ||
         !validKey(request.buildId) || request.targetPlayers < 2 ||
-        request.virtualPort == 0) {
+        request.virtualPort == 0 ||
+        request.targetPlayers > _impl->config.maxMatchPlayers) {
         return OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::InvalidRequest, "invalid matchmaking request");
     }

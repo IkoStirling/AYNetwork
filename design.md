@@ -2006,12 +2006,33 @@ The deployment and integration contract is documented in
 The online-service boundary and first-version behavior are documented in
 `docs/online-services.md`.
 
+### 15.21 Authenticated Online Services HTTP adapter (2026-08-28)
+
+- `HttpOnlineServices` carries all Lobby, Matchmaking, Dedicated registration,
+  lease, drain, allocation and release operations over the existing bounded
+  JSON response envelope. P2P grants remain per-ticket or owner-only results.
+- Player identity is derived from a bearer callback and is never accepted from
+  a body actor field. Party tickets require a separate authorization callback;
+  the safe default permits solo tickets only. Fleet operations and per-server /
+  per-allocation credentials use distinct authentication domains.
+- Online routes share SessionServer's source limiter and secret-free audit
+  logger. The limiter now caps tracked source buckets and evicts stale entries,
+  preventing an address-cardinality memory attack.
+- The reference executable can load a bounded player credential file and pump
+  matchmaking off the HTTP worker. Production mode rejects its ephemeral online
+  store unless staging explicitly opts in; persistent services are injected at
+  the three backend-neutral interfaces without changing HTTP or engine clients.
+- `AYNetwork_OnlineProbe` and its process-level CTest cover identity rejection,
+  Lobby-to-P2P launch, solo-ticket grouping, grant polling, Dedicated register /
+  heartbeat / reserve / drain / release / unregister, and clean shutdown.
+
 ---
 
 ## 16. Changelog
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-28 | **Authenticated Online Services HTTP**：新增 `HttpOnlineServices` 客户端和共享 SessionServer 路由；bearer 派生 PeerId、party 独立授权、fleet/server/reservation 三域凭证；在线路由复用限流/审计；新增 `AYNetwork_OnlineProbe` 多进程 E2E 与生产临时状态拒绝门禁。 |
 | 2026-08-28 | **Durable backend + Online Services v1**：SQLite WAL/事务 epoch CAS、token 静态加密、持久 Ed25519 key、HTTP 准入/限流/审计与生产启动门禁；补分区故障矩阵；新增 Lobby、party Matchmaking、Dedicated lease/drain/allocation 契约和线程安全参考实现，并接入现有 P2P session backend。 |
 | 2026-08-28 | **P2PSessionCoordinator**：异步 create/join/leave 与失败回滚；统一安装 grant/信令/Join Ticket/validator、启动 listen/connect 和 Host lease；非阻塞 authority gate 将优雅迁移后端 CAS 放在 Commit 前、崩溃 self-claim 放在 Promotion 前；覆盖 lease 等待、双候选 CAS、超时 fail-closed。 |
 | 2026-08-28 | **Backend authority session service v1**：后端无关 create/join/heartbeat/claim/leave 契约；10 秒 Host lease + 3 秒后台续租 + epoch CAS；Ed25519 短期 Join Ticket；HTTP 参考客户端/服务端与安全 UDP 信令共进程部署；多进程 E2E 覆盖凭证、信令、迁移和清理。 |

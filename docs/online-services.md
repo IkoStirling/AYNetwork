@@ -52,9 +52,51 @@ draining server 不再接新局，仍有 allocation 时注销会进入排空并�
 参考选择器优先选择占用比例最低的 server，再以 server ID 打破平局，结果可复现且不会
 超卖声明容量。
 
-## 当前实现与后续适配
+## HTTP 接入
 
-`InMemoryOnlineServices` 是线程安全、有限容量的第一版参考实现，并真实接入现有 P2P
-session backend。它适合引擎集成测试、单进程服务和规则原型；当前不包含 HTTP wire、
-数据库 schema、玩家技能评分、跨区延迟测量、party 邀请/隐私、Dedicated 进程拉起或云
-厂商 API。生产服务可分别实现三个接口，保持引擎侧 Lobby/匹配流程与 GNS 传输解耦。
+`HttpOnlineServices` 实现三个客户端接口；同一组路由可选挂载到
+`HttpP2PSessionServer`，因此 authority session 与在线 API 可以共享 TCP 端口、请求大小
+限制、来源限流和无秘密审计。玩家请求只发送 bearer，服务端通过
+`playerAuthenticator` 派生可信 `PeerId`，不会读取 body 中的 actor。Party 请求还必须通过
+`partyAuthorizer`；未安装 party 认证器时只允许单人 ticket，防止客户端冒充队友。
+
+主要路由：
+
+| 方法 | 路径 | 身份 |
+|---|---|---|
+| POST/GET | `/v1/lobbies` | Player Bearer |
+| GET | `/v1/lobbies/{id}` | Player Bearer |
+| POST | `/v1/lobbies/{id}/join|leave|update|launch-p2p` | Player Bearer |
+| POST/GET | `/v1/matches`、`/v1/matches/{id}` | Player Bearer |
+| POST | `/v1/matches/{id}/cancel` | Player Bearer |
+| POST | `/v1/matches/run` | Fleet control token |
+| POST/GET | `/v1/dedicated/servers` | Fleet control token |
+| POST | `/v1/dedicated/servers/{id}/heartbeat|drain|unregister` | Server Bearer |
+| POST | `/v1/dedicated/allocations` | Fleet control token |
+| POST | `/v1/dedicated/allocations/{id}/release` | Reservation Bearer |
+
+参考 `AYNetwork_SessionServer` 可通过以下环境变量启用该 API：
+
+```powershell
+$env:AY_ONLINE_ENABLE = "1"
+$env:AY_ONLINE_CREDENTIALS_FILE = "D:\AYNetwork\players.txt"
+$env:AY_ONLINE_SERVER_TOKEN = "<至少 32 字符的 fleet/orchestrator token>"
+```
+
+凭证文件每行是 `<PeerId> <token>`，PeerId 与 token 都不可重复，token 至少 32 字符。
+该文件仅是可执行 E2E 和受控联调使用的认证适配器；正式账号服务应直接设置
+`playerAuthenticator` / `partyAuthorizer`。`AY_ONLINE_SERVER_TOKEN` 只用于受信 fleet
+操作，Dedicated 实例注册后会获得自己的 server bearer。
+
+## 当前实现与持久化边界
+
+`InMemoryOnlineServices` 是线程安全、有限容量的第一版参考业务实现，并真实接入现有 P2P
+session backend。默认最多 64 人 Lobby/Match、4096 容量 Dedicated Server，防止单请求
+产生无界 grant 响应。它适合引擎集成测试、单进程服务和规则原型。
+
+HTTP server 只依赖 `ILobbyService`、`IMatchmakingService`、
+`IDedicatedServerService`，没有依赖内存实现，这就是持久化替换边界。参考 SessionServer
+在生产模式下默认拒绝启用临时 online state；`AY_ONLINE_ALLOW_EPHEMERAL=1` 只允许 staging
+明确放行。正式部署应注入数据库实现，并保持 ticket/allocation 状态、revision CAS 和
+容量预留事务化。尚未内置玩家技能评分、跨区延迟测量、party 邀请/隐私、Dedicated
+进程拉起或云厂商 API。

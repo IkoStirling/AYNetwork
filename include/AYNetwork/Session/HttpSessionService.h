@@ -2,6 +2,7 @@
 // cpp-httplib transport for the backend-neutral P2P session contract.
 
 #include <AYNetwork/SessionService.h>
+#include <AYNetwork/OnlineServices.h>
 
 #include <cstdint>
 #include <functional>
@@ -58,6 +59,7 @@ struct HttpP2PSessionServerConfig {
     // Per-source token bucket. A zero rate disables limiting in development.
     uint32_t rateLimitRequestsPerMinute = 0;
     uint32_t rateLimitBurst = 0;
+    size_t rateLimitTrackedSources = 16384;
 
     struct AuditEvent {
         std::string method;
@@ -67,12 +69,22 @@ struct HttpP2PSessionServerConfig {
         uint64_t occurredAtUnixSeconds = 0;
     };
     std::function<void(const AuditEvent&)> auditSink;
+
+    // Online-service routes derive the caller identity from this callback.
+    // The request body is never allowed to choose actorPeerId.
+    std::function<bool(std::string_view, PeerId&)> playerAuthenticator;
+    std::function<bool(const PeerId&, const std::vector<PeerId>&)>
+        partyAuthorizer;
+    std::function<bool(std::string_view)> dedicatedControlAuthenticator;
 };
 
 class HttpP2PSessionServer {
 public:
     HttpP2PSessionServer(HttpP2PSessionServerConfig config,
-                         std::shared_ptr<IP2PSessionService> service);
+                         std::shared_ptr<IP2PSessionService> service,
+                         std::shared_ptr<ILobbyService> lobbies = {},
+                         std::shared_ptr<IMatchmakingService> matchmaking = {},
+                         std::shared_ptr<IDedicatedServerService> dedicated = {});
     ~HttpP2PSessionServer();
 
     HttpP2PSessionServer(const HttpP2PSessionServer&) = delete;

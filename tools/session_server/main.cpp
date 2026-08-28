@@ -2,6 +2,7 @@
 
 #include <AYNetwork/Session/HttpSessionService.h>
 #include <AYNetwork/Session/InMemorySessionService.h>
+#include <AYNetwork/Session/InMemoryOnlineServices.h>
 #include <AYNetwork/Session/SqliteSessionService.h>
 #include <AYNetwork/Signaling/SecureUdpSignaling.h>
 
@@ -22,6 +23,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -116,6 +119,46 @@ private:
     std::ofstream _output;
 };
 
+class PlayerCredentialDirectory {
+public:
+    bool load(const std::string& path) {
+        std::ifstream input(path);
+        if (!input) return false;
+        std::string peer;
+        std::string token;
+        while (input >> peer >> token) {
+            ayt::net::PeerId peerId{peer};
+            if (!peerId.isValid() || token.size() < 32 || token.size() > 256) {
+                _entries.clear();
+                return false;
+            }
+            for (const auto& entry : _entries) {
+                if (entry.first == peerId || entry.second == token) {
+                    _entries.clear();
+                    return false;
+                }
+            }
+            _entries.emplace_back(std::move(peerId), std::move(token));
+        }
+        return !_entries.empty() && input.eof();
+    }
+
+    bool authenticate(std::string_view supplied, ayt::net::PeerId& peer) const {
+        bool matched = false;
+        ayt::net::PeerId result;
+        for (const auto& entry : _entries) {
+            const bool equal = constantTimeEqual(supplied, entry.second);
+            if (equal) result = entry.first;
+            matched = matched || equal;
+        }
+        if (matched) peer = std::move(result);
+        return matched;
+    }
+
+private:
+    std::vector<std::pair<ayt::net::PeerId, std::string>> _entries;
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -139,6 +182,11 @@ int main(int argc, char** argv) {
     const std::string storageKeyText = environment("AY_SESSION_STATE_KEY");
     const std::string admissionToken = environment("AY_SESSION_ADMISSION_TOKEN");
     const std::string auditPath = environment("AY_SESSION_AUDIT_FILE");
+    const bool onlineEnabled = enabled("AY_ONLINE_ENABLE");
+    const std::string onlineCredentials =
+        environment("AY_ONLINE_CREDENTIALS_FILE");
+    const std::string onlineServerToken =
+        environment("AY_ONLINE_SERVER_TOKEN");
     std::string httpBind = environment("AY_SESSION_HTTP_BIND");
     if (httpBind.empty()) httpBind = argv[1];
 
@@ -156,6 +204,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "production HTTP must bind loopback behind a TLS reverse proxy; "
             "set AY_SESSION_HTTP_BIND=127.0.0.1\n");
+        return 2;
+    }
+    if (onlineEnabled &&
+        (onlineCredentials.empty() || onlineServerToken.size() < 32)) {
+        std::fprintf(stderr,
+            "online services require AY_ONLINE_CREDENTIALS_FILE and "
+            "AY_ONLINE_SERVER_TOKEN (32+ chars)\n");
+        return 2;
+    }
+    if (production && onlineEnabled &&
+        !enabled("AY_ONLINE_ALLOW_EPHEMERAL")) {
+        std::fprintf(stderr,
+            "reference online state is in-memory; production must inject durable "
+            "ILobbyService/IMatchmakingService/IDedicatedServerService adapters "
+            "or explicitly set AY_ONLINE_ALLOW_EPHEMERAL=1 for staging\n");
         return 2;
     }
 
@@ -218,6 +281,18 @@ int main(int argc, char** argv) {
         core = std::move(memory);
     }
 
+    std::shared_ptr<ayt::net::InMemoryOnlineServices> online;
+    std::shared_ptr<PlayerCredentialDirectory> playerCredentials;
+    if (onlineEnabled) {
+        playerCredentials = std::make_shared<PlayerCredentialDirectory>();
+        if (!playerCredentials->load(onlineCredentials)) {
+            std::fprintf(stderr, "failed to load AY_ONLINE_CREDENTIALS_FILE\n");
+            return 1;
+        }
+        online = std::make_shared<ayt::net::InMemoryOnlineServices>(
+            ayt::net::InMemoryOnlineServicesConfig{}, core);
+    }
+
     ayt::net::SecureUdpSignalingServerConfig signalingConfig;
     signalingConfig.bindAddress = argv[1];
     signalingConfig.port = signalingPort;
@@ -272,7 +347,18 @@ int main(int argc, char** argv) {
             audit->write(event);
         };
     }
-    ayt::net::HttpP2PSessionServer http(std::move(httpConfig), core);
+    if (online) {
+        httpConfig.playerAuthenticator =
+            [playerCredentials](std::string_view token, ayt::net::PeerId& peer) {
+                return playerCredentials->authenticate(token, peer);
+            };
+        httpConfig.dedicatedControlAuthenticator =
+            [onlineServerToken](std::string_view supplied) {
+                return constantTimeEqual(supplied, onlineServerToken);
+            };
+    }
+    ayt::net::HttpP2PSessionServer http(
+        std::move(httpConfig), core, online, online, online);
     if (!http.start()) {
         signaling.stop();
         std::fprintf(stderr, "failed to bind SessionServer HTTP socket\n");
@@ -281,14 +367,16 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
-    std::printf("AY_SESSION_SERVER state=ready mode=%s store=%s http=%s:%u signaling=%s:%u\n",
+    std::printf("AY_SESSION_SERVER state=ready mode=%s store=%s online=%s http=%s:%u signaling=%s:%u\n",
                 production ? "production" : "development",
                 databasePath.empty() ? "memory" : "sqlite",
+                online ? "enabled" : "disabled",
                 httpBind.c_str(), http.getBoundPort(), argv[3],
                 signaling.getBoundPort());
     std::fflush(stdout);
 
     while (g_running.load() && http.isRunning()) {
+        if (online) (void)online->runMatchmaking(8);
         if (signaling.pump() == 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
