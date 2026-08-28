@@ -1865,6 +1865,11 @@ temporary transport loss recoverable and permits the authority role to move.
   that state and ACK Prepare before the Host sends Commit. Commit is retried
   until every survivor returns a Commit ACK or the three-second retry window
   expires; the old Host never departs on a fixed sub-RTT timer.
+- Prepare snapshots the exact connected/admitted participant set before the
+  freeze. Join/resume is rejected as `SessionClosed`, Ready mutation and seat
+  expiry are paused, and Prepare/Commit/Abort address only that snapshot. A
+  participant lost while its route is observably down aborts immediately;
+  otherwise the bounded Prepare timeout remains the deterministic fallback.
 - Election is deterministic among connected non-Host members: lowest seat,
   then lexical PeerId. Survivors retain session ID and seat while the epoch
   advances exactly once, only on Commit. Abort restores the old authority and
@@ -1879,6 +1884,13 @@ temporary transport loss recoverable and permits the authority role to move.
   buffers, stale connection ownership, and all per-peer replication baselines.
   Reconnecting peers therefore receive reliable Full snapshots without stale
   traffic from the previous authority epoch.
+- Replicated-object ownership is registered through
+  `bindP2PObjectOwner(netId, PeerId, seatId)` after object registration. The
+  stable identity survives route replacement; each roster/admission/authority
+  change resolves it to the current connection ID on the authority and to
+  `AutonomousProxy` only on the locally owning client. Applications can inspect
+  the resolved binding with `getP2PObjectOwner` and must not persist transport
+  connection IDs as gameplay ownership.
 - Graceful migration can carry at most 64 KiB of non-replicated application
   state through `setP2PMigrationStateCallbacks()`. `capture` runs on the old
   Host after its final replication tick; `validate` runs while survivors are
@@ -1891,6 +1903,11 @@ temporary transport loss recoverable and permits the authority role to move.
   must pause while it is true. Unencoded application sends and receives are
   suppressed by AYNetwork during the freeze; replication control remains active
   for the final Full/Prepare/Commit sequence.
+- `P2PMigrationFailureReason` is carried in Prepare rejection and Abort wire
+  messages and exposed by both `P2PSessionInfo::migrationFailure` and
+  `P2PSessionEvent::migrationFailure`. This distinguishes state mismatch,
+  callback rejection, participant loss, Prepare/Commit timeout, promotion and
+  reconnect failures without log parsing.
 - This is deterministic failover, not consensus. A network partition can form
   competing authorities, and stale/mismatched epochs are rejected only within
   a connected session. A matchmaking/backend epoch lease is required when
@@ -1903,6 +1920,7 @@ temporary transport loss recoverable and permits the authority role to move.
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-28 | **Host Migration membership/ownership hardening**：Prepare 固定参与者集合并关闭 Join/Ready/席位过期变更；失败原因结构化上 wire/event/session；PeerId/seat ownership 在重连及迁移后自动重绑 connectionId；新增 normal/reject/drop 三条多进程 CTest。 |
 | 2026-08-28 | **Host Migration correctness transaction**：final Full → Prepare/hash/optional 64 KiB app state → all Prepare ACK → Commit/retry → Commit ACK → departure；Abort 不推进 epoch；迁移冻结 RPC/Input/应用发送并重置 RPC、Prediction、ownership、interpolation 与 replication baselines。AYEditor 暂停迁移期 Play 更新。 |
 | 2026-07-26 | 工业级审计；R1–R6 重置；GNS 选型 §14 |
 | 2026-07-27 | **设计审计补丁**：§1/§3/§4 统一 GNS；§3.3 Protocol↔GNS 切分；§4.2 多连接+断线；§5 应用消息头；**§6.6 Authority**；§8/§10/§12/§14.6 同步；废止 KCP 正文 |

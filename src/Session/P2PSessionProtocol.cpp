@@ -299,10 +299,15 @@ bool encodeMigrationAck(const MigrationAck& ack, std::vector<uint8_t>& out) {
     out.clear();
     if (ack.sessionId == 0 || ack.currentEpoch == 0 ||
         ack.currentEpoch == std::numeric_limits<uint32_t>::max() ||
-        ack.nextEpoch != ack.currentEpoch + 1) return false;
-    out.reserve(34);
+        ack.nextEpoch != ack.currentEpoch + 1 ||
+        static_cast<uint8_t>(ack.failure) >
+            static_cast<uint8_t>(P2PMigrationFailureReason::ReconnectFailed) ||
+        (ack.accepted !=
+         (ack.failure == P2PMigrationFailureReason::None))) return false;
+    out.reserve(35);
     out.push_back(kSessionWireVersion);
     out.push_back(ack.accepted ? 1u : 0u);
+    out.push_back(static_cast<uint8_t>(ack.failure));
     appendU64(out, ack.sessionId);
     appendU32(out, ack.currentEpoch);
     appendU32(out, ack.nextEpoch);
@@ -313,18 +318,23 @@ bool encodeMigrationAck(const MigrationAck& ack, std::vector<uint8_t>& out) {
 
 bool decodeMigrationAck(const uint8_t* data, size_t size, MigrationAck& ack) {
     ack = {};
-    if (!data || size != 34 || data[0] != kSessionWireVersion || data[1] > 1) {
+    if (!data || size != 35 || data[0] != kSessionWireVersion || data[1] > 1 ||
+        data[2] > static_cast<uint8_t>(
+            P2PMigrationFailureReason::ReconnectFailed)) {
         return false;
     }
     ack.accepted = data[1] != 0;
-    ack.sessionId = readU64(data + 2);
-    ack.currentEpoch = readU32(data + 10);
-    ack.nextEpoch = readU32(data + 14);
-    ack.replicatedStateHash = readU64(data + 18);
-    ack.applicationStateHash = readU64(data + 26);
+    ack.failure = static_cast<P2PMigrationFailureReason>(data[2]);
+    ack.sessionId = readU64(data + 3);
+    ack.currentEpoch = readU32(data + 11);
+    ack.nextEpoch = readU32(data + 15);
+    ack.replicatedStateHash = readU64(data + 19);
+    ack.applicationStateHash = readU64(data + 27);
     return ack.sessionId != 0 && ack.currentEpoch != 0 &&
            ack.currentEpoch != std::numeric_limits<uint32_t>::max() &&
-           ack.nextEpoch == ack.currentEpoch + 1;
+           ack.nextEpoch == ack.currentEpoch + 1 &&
+           (ack.accepted ==
+            (ack.failure == P2PMigrationFailureReason::None));
 }
 
 bool encodeMigrationDecision(const MigrationDecision& decision,
@@ -333,10 +343,15 @@ bool encodeMigrationDecision(const MigrationDecision& decision,
     if (decision.sessionId == 0 || decision.currentEpoch == 0 ||
         decision.currentEpoch == std::numeric_limits<uint32_t>::max() ||
         decision.nextEpoch != decision.currentEpoch + 1 ||
-        !decision.electedHostPeerId.isValid()) return false;
-    out.reserve(19 + decision.electedHostPeerId.value.size());
+        !decision.electedHostPeerId.isValid() ||
+        static_cast<uint8_t>(decision.failure) >
+            static_cast<uint8_t>(P2PMigrationFailureReason::ReconnectFailed) ||
+        (decision.commit !=
+         (decision.failure == P2PMigrationFailureReason::None))) return false;
+    out.reserve(20 + decision.electedHostPeerId.value.size());
     out.push_back(kSessionWireVersion);
     out.push_back(decision.commit ? 1u : 0u);
+    out.push_back(static_cast<uint8_t>(decision.failure));
     appendU64(out, decision.sessionId);
     appendU32(out, decision.currentEpoch);
     appendU32(out, decision.nextEpoch);
@@ -346,19 +361,24 @@ bool encodeMigrationDecision(const MigrationDecision& decision,
 bool decodeMigrationDecision(const uint8_t* data, size_t size,
                              MigrationDecision& decision) {
     decision = {};
-    if (!data || size < 19 || data[0] != kSessionWireVersion || data[1] > 1) {
+    if (!data || size < 20 || data[0] != kSessionWireVersion || data[1] > 1 ||
+        data[2] > static_cast<uint8_t>(
+            P2PMigrationFailureReason::ReconnectFailed)) {
         return false;
     }
     decision.commit = data[1] != 0;
-    decision.sessionId = readU64(data + 2);
-    decision.currentEpoch = readU32(data + 10);
-    decision.nextEpoch = readU32(data + 14);
-    size_t cursor = 18;
+    decision.failure = static_cast<P2PMigrationFailureReason>(data[2]);
+    decision.sessionId = readU64(data + 3);
+    decision.currentEpoch = readU32(data + 11);
+    decision.nextEpoch = readU32(data + 15);
+    size_t cursor = 19;
     if (!readPeerId(data, size, cursor, decision.electedHostPeerId)) return false;
     return cursor == size && decision.sessionId != 0 &&
            decision.currentEpoch != 0 &&
            decision.currentEpoch != std::numeric_limits<uint32_t>::max() &&
-           decision.nextEpoch == decision.currentEpoch + 1;
+           decision.nextEpoch == decision.currentEpoch + 1 &&
+           (decision.commit ==
+            (decision.failure == P2PMigrationFailureReason::None));
 }
 
 bool encodeMigrationDecisionAck(const MigrationDecisionAck& ack,

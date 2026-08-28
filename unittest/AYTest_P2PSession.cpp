@@ -186,7 +186,19 @@ TEST_CASE(MigrationAckAndDecisionRoundTrip) {
     CHECK(session::decodeMigrationAck(wire.data(), wire.size(), decodedAck));
     CHECK(decodedAck.sessionId == ack.sessionId);
     CHECK(decodedAck.accepted);
+    CHECK(decodedAck.failure == P2PMigrationFailureReason::None);
     CHECK(decodedAck.replicatedStateHash == ack.replicatedStateHash);
+
+    ack.accepted = false;
+    ack.failure = P2PMigrationFailureReason::ApplicationStateRejected;
+    CHECK(session::encodeMigrationAck(ack, wire));
+    CHECK(session::decodeMigrationAck(wire.data(), wire.size(), decodedAck));
+    CHECK(!decodedAck.accepted);
+    CHECK(decodedAck.failure ==
+          P2PMigrationFailureReason::ApplicationStateRejected);
+    ack.failure = P2PMigrationFailureReason::None;
+    CHECK(!session::encodeMigrationAck(ack, wire));
+    ack.accepted = true;
 
     session::MigrationDecision decision;
     decision.sessionId = ack.sessionId;
@@ -199,7 +211,20 @@ TEST_CASE(MigrationAckAndDecisionRoundTrip) {
     CHECK(session::decodeMigrationDecision(
         wire.data(), wire.size(), decodedDecision));
     CHECK(decodedDecision.commit);
+    CHECK(decodedDecision.failure == P2PMigrationFailureReason::None);
     CHECK(decodedDecision.electedHostPeerId == decision.electedHostPeerId);
+
+    decision.commit = false;
+    decision.failure = P2PMigrationFailureReason::ParticipantLost;
+    CHECK(session::encodeMigrationDecision(decision, wire));
+    CHECK(session::decodeMigrationDecision(
+        wire.data(), wire.size(), decodedDecision));
+    CHECK(!decodedDecision.commit);
+    CHECK(decodedDecision.failure ==
+          P2PMigrationFailureReason::ParticipantLost);
+    decision.failure = P2PMigrationFailureReason::None;
+    CHECK(!session::encodeMigrationDecision(decision, wire));
+    decision.commit = true;
 
     session::MigrationDecisionAck decisionAck;
     decisionAck.sessionId = decision.sessionId;

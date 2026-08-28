@@ -1174,6 +1174,11 @@ ProxyKind ReplicationManager::getObjectProxyKind(uint32_t netId) const {
     return it->second;
 }
 
+uint32_t ReplicationManager::getObjectOwnerConnectionId(uint32_t netId) const {
+    const auto it = _proxyOwnerConnections.find(netId);
+    return it == _proxyOwnerConnections.end() ? 0u : it->second;
+}
+
 bool ReplicationManager::isLocallyControlled(uint32_t netId) const {
     return getObjectProxyKind(netId) == ProxyKind::AutonomousProxy
         && !isAuthority();

@@ -78,6 +78,28 @@ enum class P2PHostMigrationState : uint8_t {
     Committing = 8,
 };
 
+// Stable, application-visible reason for the most recent migration failure.
+// None is restored when a new migration starts or an authority epoch commits.
+enum class P2PMigrationFailureReason : uint8_t {
+    None = 0,
+    InvalidSession = 1,
+    NoEligibleHost = 2,
+    ParticipantLost = 3,
+    CaptureFailed = 4,
+    ApplicationStateTooLarge = 5,
+    ProtocolError = 6,
+    PrepareSendFailed = 7,
+    ReplicatedStateMismatch = 8,
+    ApplicationStateMismatch = 9,
+    ApplicationStateUnsupported = 10,
+    ApplicationStateRejected = 11,
+    PrepareAckSendFailed = 12,
+    PrepareTimeout = 13,
+    CommitTimeout = 14,
+    PromotionFailed = 15,
+    ReconnectFailed = 16,
+};
+
 enum class P2PAdmissionState : uint8_t {
     NotRequired = 0,
     Pending = 1,
@@ -213,6 +235,19 @@ struct P2PSessionInfo {
     PeerId previousHostPeerId;
     PeerId electedHostPeerId;
     bool migrationFrozen = false;
+    P2PMigrationFailureReason migrationFailure =
+        P2PMigrationFailureReason::None;
+};
+
+// Stable ownership identity for a replicated object. The binding survives
+// transport reconnects and Host migration; connectionId is resolved from the
+// current session roster whenever the concrete route changes.
+struct P2PObjectOwnerInfo {
+    uint32_t netId = 0;
+    PeerId peerId;
+    uint32_t seatId = 0;
+    uint32_t connectionId = 0;
+    bool locallyControlled = false;
 };
 
 struct P2PMigrationContext {
@@ -259,6 +294,8 @@ struct P2PSessionEvent {
     P2PSessionInfo session;
     PeerId subjectPeerId;
     uint32_t seatId = 0;
+    P2PMigrationFailureReason migrationFailure =
+        P2PMigrationFailureReason::None;
 };
 
 // Signaling carries opaque GNS rendezvous blobs.  Implementations may use the

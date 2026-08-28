@@ -87,6 +87,20 @@ if(AYNETWORK_BUILD_SIGNALING_SERVER)
     target_link_libraries(AYNetwork_SecureSignalingServer PRIVATE AYNetwork)
     add_executable(AYNetwork_P2PSmokePeer tools/p2p_smoke/main.cpp)
     target_link_libraries(AYNetwork_P2PSmokePeer PRIVATE AYNetwork)
+    if(WIN32 AND BUILD_TESTING)
+        foreach(SCENARIO IN ITEMS normal reject drop)
+            add_test(
+                NAME AYNetwork_P2P_Migration_${SCENARIO}
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                    -File ${CMAKE_CURRENT_SOURCE_DIR}/unittest/RunP2PMigrationE2E.ps1
+                    -SignalingServer $<TARGET_FILE:AYNetwork_SignalingServer>
+                    -SmokePeer $<TARGET_FILE:AYNetwork_P2PSmokePeer>
+                    -Scenario ${SCENARIO})
+            set_tests_properties(
+                AYNetwork_P2P_Migration_${SCENARIO}
+                PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+        endforeach()
+    endif()
 endif()
 
 # P0 audit fix (2026-07-26): avoid winsock.h (v1) vs winsock2.h (v2) collision

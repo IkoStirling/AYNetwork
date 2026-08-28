@@ -58,6 +58,7 @@ struct MigrationAck {
     uint64_t replicatedStateHash = 0;
     uint64_t applicationStateHash = 0;
     bool accepted = false;
+    P2PMigrationFailureReason failure = P2PMigrationFailureReason::None;
 };
 
 struct MigrationDecision {
@@ -66,6 +67,7 @@ struct MigrationDecision {
     uint32_t nextEpoch = 0;
     PeerId electedHostPeerId;
     bool commit = false;
+    P2PMigrationFailureReason failure = P2PMigrationFailureReason::None;
 };
 
 struct MigrationDecisionAck {

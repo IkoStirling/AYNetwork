@@ -335,6 +335,19 @@ public:
         (void)callbacks;
     }
     virtual bool isP2PMigrationFrozen() const { return false; }
+    // Bind replicated-object ownership to stable session identity. PeerId is
+    // preferred; seatId permits rebinding before a platform identity is known.
+    // When both are supplied they must describe the same current member.
+    virtual bool bindP2PObjectOwner(uint32_t netId, const PeerId& peerId,
+                                    uint32_t seatId = 0) {
+        (void)netId; (void)peerId; (void)seatId; return false;
+    }
+    virtual bool unbindP2PObjectOwner(uint32_t netId) {
+        (void)netId; return false;
+    }
+    virtual P2PObjectOwnerInfo getP2PObjectOwner(uint32_t netId) const {
+        (void)netId; return {};
+    }
     using P2PSessionEventHandler = std::function<void(const P2PSessionEvent&)>;
     // Listener id 0 is invalid. Events remain installed across connection
     // cycles until explicitly removed or the subsystem is destroyed.
@@ -855,6 +868,7 @@ public:
     void setObjectProxyKind(uint32_t netId, ProxyKind kind,
                             uint32_t ownerConnectionId = 0);
     ProxyKind getObjectProxyKind(uint32_t netId) const;
+    uint32_t getObjectOwnerConnectionId(uint32_t netId) const;
 
     // Sugar for game code: true on the locally-controlling client, false
     // everywhere else. Equivalent to

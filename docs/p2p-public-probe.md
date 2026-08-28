@@ -138,6 +138,11 @@ Prepare timeout aborts without advancing the epoch. After Commit, loss of the
 old Host accelerates the already-decided election rather than starting a second
 epoch.
 
+The participant roster is immutable from Prepare through Commit/Abort. New
+Join/resume requests receive `SessionClosed`, Ready changes are ignored, and
+reservation expiry is paused. `P2PSessionInfo::migrationFailure` and the same
+field on `MigrationFailed` events report the typed Abort reason.
+
 ## Engine lifecycle integration
 
 Applications should subscribe with `addP2PSessionEventListener()` after the
@@ -159,6 +164,23 @@ capture is limited to 64 KiB, validation must be side-effect-free, and apply is
 called only after Commit. Do not duplicate ReplicationManager-owned fields in
 this payload. Crash recovery has no old Host to capture from and therefore does
 not provide this optional state bridge.
+
+For client-controlled replicated objects, register the object first and then
+call `bindP2PObjectOwner(netId, peerId, seatId)` on every peer. The stable
+binding is automatically resolved to the replacement connection after resume
+or Host Migration. `getP2PObjectOwner()` reports the current connection ID and
+local-control state; application code should not cache the old connection ID.
+
+Windows release builds with signaling tools enabled also register three local,
+serial CTest gates:
+
+```text
+ctest --test-dir out/build/windows-release -C Release -j 1 \
+  -R "^AYNetwork_P2P_Migration_"
+```
+
+They cover normal Commit plus application-state/ownership transfer, typed
+Prepare rejection, and a participant dropping after Prepare (bounded timeout).
 
 AYEditor consumes this contract directly. A promoted client keeps its launch
 role for World teardown, marks retained `NetworkComponent` instances as owned,

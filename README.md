@@ -110,6 +110,15 @@ Client 调用 `reconnectP2P()` 会携带该恢复元组，校验成功后恢复�
 先尝试恢复原 Host，失败后按最低稳定席位、再按 PeerId 确定性选举。新 Host 保留
 sessionId 和存活成员席位、递增 epoch，并强制向重连成员发送完整复制基线。
 `getP2PSessionMembers()` 与 `getP2PSessionInfo()` 可观察席位、保留状态、epoch 和迁移阶段。
+Prepare 开始时成员集会被冻结；期间新的 Join/Resume 返回 `SessionClosed`，Ready 修改和
+席位过期暂停，Commit/Abort 只发给该固定参与者集合。`migrationFailure` 提供稳定的
+类型化失败原因，而不是要求应用解析日志。
+
+玩家控制对象应在 `ReplicationManager::registerObject()` 后调用
+`bindP2PObjectOwner(netId, peerId, seatId)`。AYNetwork 保存稳定 PeerId/seat，并在断线
+恢复或 Host Migration 后把它重新解析为当前 connectionId；`getP2PObjectOwner()` 可用于
+诊断，`unbindP2PObjectOwner()` 恢复为 `SimulatedProxy`。游戏层不应长期保存旧
+connectionId 作为 ownership 身份。
 
 迁移只能继承每个候选节点已收到的复制状态；仅存在旧 Host 内存中的未复制状态、
 未持久化 RPC 副作用和连接局部状态会丢失。该机制也不是分区共识：无法互通的网络

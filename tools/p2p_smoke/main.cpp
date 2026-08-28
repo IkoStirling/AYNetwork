@@ -45,6 +45,9 @@ struct ProbeOptions {
     bool resumeReconnects = false;
     bool hostMigration = false;
     uint32_t migrationMembers = 3;
+    bool migrationRejectPrepare = false;
+    bool migrationDropAfterPrepare = false;
+    uint32_t expectedMigrationFailure = 0;
 };
 
 struct ProbeStats {
@@ -285,6 +288,10 @@ bool makeProbeOptions(ProbeOptions& options) {
         options.expectedJoinTicket.size() > kP2PMaxJoinTicketBytes) return false;
     return envFlag("AY_P2P_RESUME_RECONNECTS", options.resumeReconnects) &&
            envFlag("AY_P2P_HOST_MIGRATION", options.hostMigration) &&
+           envFlag("AY_P2P_MIGRATION_REJECT_PREPARE",
+                   options.migrationRejectPrepare) &&
+           envFlag("AY_P2P_MIGRATION_DROP_AFTER_PREPARE",
+                   options.migrationDropAfterPrepare) &&
            envUnsigned("AY_P2P_PROBE_SECONDS", 0, 0, 3600, seconds) &&
            envUnsigned("AY_P2P_PROBE_INTERVAL_MS", 100, 10, 60000, options.intervalMs) &&
            envUnsigned("AY_P2P_PROBE_REPLY_WAIT_MS", 2000, 100, 30000, options.replyWaitMs) &&
@@ -292,6 +299,11 @@ bool makeProbeOptions(ProbeOptions& options) {
            envUnsigned("AY_P2P_EXPECT_SESSIONS", 1, 1, 64, options.expectedSessions) &&
            envUnsigned("AY_P2P_MIGRATION_MEMBERS", 3, 2, 64,
                        options.migrationMembers) &&
+           envUnsigned(
+               "AY_P2P_EXPECT_MIGRATION_FAILURE", 0, 0,
+               static_cast<uint32_t>(
+                   P2PMigrationFailureReason::ReconnectFailed),
+               options.expectedMigrationFailure) &&
            envUnsigned("AY_P2P_RECONNECTS", 0, 0, 16, options.reconnects) &&
            ((options.durationMs = seconds * 1000u), true);
 }
@@ -424,6 +436,21 @@ void pump(INetworkSubSystem& network) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
+P2PSessionMemberInfo chooseMigrationObjectOwner(
+    const std::vector<P2PSessionMemberInfo>& members,
+    const PeerId& currentHost) {
+    P2PSessionMemberInfo owner;
+    for (const auto& member : members) {
+        if (!member.connected || member.peerId == currentHost) continue;
+        if (!owner.peerId.isValid() || member.seatId > owner.seatId ||
+            (member.seatId == owner.seatId &&
+             member.peerId.value > owner.peerId.value)) {
+            owner = member;
+        }
+    }
+    return owner;
+}
+
 int runHost(const PeerId& local,
             const std::shared_ptr<ISignalingTransport>& signaling,
             INetworkSubSystem& network,
@@ -448,6 +475,16 @@ int runHost(const PeerId& local,
     } authorityReset;
     network.getReplicationManager()->registerObject(
         &authorityState, probeType, kProbeNetId);
+    network.setP2PMigrationStateCallbacks({
+        [&authorityState](const P2PMigrationContext&,
+                          std::vector<uint8_t>& out) {
+            out.resize(sizeof(uint32_t));
+            putU32(out.data(), static_cast<uint32_t>(authorityState.value));
+            return true;
+        },
+        {},
+        {},
+    });
     network.setP2PHostMigrationEnabled(options.hostMigration);
     (void)network.setP2PReconnectGracePeriodMs(30000);
 
@@ -567,13 +604,35 @@ int runHost(const PeerId& local,
         }
         const auto before = network.getP2PSessionInfo();
         const auto barrier = network.getP2PReadyBarrierInfo();
+        const auto owner = chooseMigrationObjectOwner(
+            network.getP2PSessionMembers(), before.hostPeerId);
+        if (!owner.peerId.isValid() ||
+            !network.bindP2PObjectOwner(
+                kProbeNetId, owner.peerId, owner.seatId) ||
+            network.getP2PObjectOwner(kProbeNetId).connectionId == 0) {
+            std::fprintf(stderr,
+                         "AY_P2P_FAILURE local=%s phase=ownership-bind\n",
+                         local.value.c_str());
+            return 18;
+        }
         if (!barrier.open || barrier.totalMemberCount != options.migrationMembers ||
-            !network.requestP2PHostMigration()) {
+            !owner.peerId.isValid()) {
             std::fprintf(stderr,
                          "AY_P2P_FAILURE local=%s phase=migration-handoff "
                          "ready=%zu total=%zu\n",
                          local.value.c_str(), barrier.readyMemberCount,
                          barrier.totalMemberCount);
+            return 16;
+        }
+        // Give every peer a deterministic opportunity to observe the final
+        // roster and install the same stable ownership binding before Freeze.
+        const auto ownershipSettle =
+            Clock::now() + std::chrono::milliseconds(500);
+        while (Clock::now() < ownershipSettle) pump(network);
+        if (!network.requestP2PHostMigration()) {
+            std::fprintf(stderr,
+                         "AY_P2P_FAILURE local=%s phase=migration-request\n",
+                         local.value.c_str());
             return 16;
         }
         std::printf(
@@ -582,12 +641,45 @@ int runHost(const PeerId& local,
             static_cast<unsigned long long>(before.sessionId), before.epoch,
             barrier.totalMemberCount);
         std::fflush(stdout);
-        // Keep servicing the reliable signaling/control path long enough for
-        // every client to receive the migration plan before the old Host
-        // performs its scheduled departure.
-        const auto handoffLinger = Clock::now() + std::chrono::milliseconds(300);
-        while (Clock::now() < handoffLinger) pump(network);
-        return 0;
+        const auto expectedFailure = static_cast<P2PMigrationFailureReason>(
+            options.expectedMigrationFailure);
+        const auto handoffDeadline = Clock::now() + std::chrono::seconds(15);
+        while (Clock::now() < handoffDeadline) {
+            const auto info = network.getP2PSessionInfo();
+            if (expectedFailure != P2PMigrationFailureReason::None) {
+                if (info.migration == P2PHostMigrationState::Stable &&
+                    info.migrationFailure == expectedFailure) {
+                    std::printf(
+                        "AY_P2P_MIGRATION local=%s phase=aborted reason=%u epoch=%u\n",
+                        local.value.c_str(),
+                        static_cast<unsigned>(info.migrationFailure), info.epoch);
+                    std::fflush(stdout);
+                    // Abort is reliable but still queued on the transport.
+                    // A real Host remains active; this finite probe must
+                    // emulate that lifetime long enough for every survivor
+                    // to consume the decision.
+                    const auto abortLinger =
+                        Clock::now() + std::chrono::seconds(1);
+                    while (Clock::now() < abortLinger) pump(network);
+                    return 0;
+                }
+            } else if (!network.isListening() &&
+                       info.migration == P2PHostMigrationState::Disabled) {
+                std::printf(
+                    "AY_P2P_MIGRATION local=%s phase=departed epoch=%u\n",
+                    local.value.c_str(), info.epoch);
+                return 0;
+            }
+            pump(network);
+        }
+        const auto failed = network.getP2PSessionInfo();
+        std::fprintf(stderr,
+                     "AY_P2P_FAILURE local=%s phase=migration-handoff-timeout "
+                     "state=%u reason=%u\n",
+                     local.value.c_str(),
+                     static_cast<unsigned>(failed.migration),
+                     static_cast<unsigned>(failed.migrationFailure));
+        return 16;
     }
 
     const auto deadline = Clock::now() + std::chrono::seconds(options.hostTimeoutSeconds);
@@ -810,12 +902,25 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
         uint32_t authorityChanged = 0;
         uint32_t seatRestored = 0;
         uint32_t migrationFailed = 0;
+        P2PMigrationFailureReason lastFailure =
+            P2PMigrationFailureReason::None;
     } events;
+    bool droppedAfterPrepare = false;
     const uint64_t eventListenerId = network.addP2PSessionEventListener(
-        [&events](const P2PSessionEvent& event) {
+        [&events, &network, &options, &droppedAfterPrepare, &local](
+            const P2PSessionEvent& event) {
             switch (event.type) {
             case P2PSessionEventType::MigrationStarted:
                 ++events.migrationStarted;
+                if (options.migrationDropAfterPrepare &&
+                    !droppedAfterPrepare) {
+                    droppedAfterPrepare = true;
+                    std::printf(
+                        "AY_P2P_MIGRATION local=%s phase=drop-after-prepare\n",
+                        local.value.c_str());
+                    std::fflush(stdout);
+                    network.disconnect();
+                }
                 break;
             case P2PSessionEventType::AuthorityChanged:
                 ++events.authorityChanged;
@@ -825,6 +930,7 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
                 break;
             case P2PSessionEventType::MigrationFailed:
                 ++events.migrationFailed;
+                events.lastFailure = event.migrationFailure;
                 break;
             case P2PSessionEventType::SeatReserved:
             case P2PSessionEventType::SeatReservationExpired:
@@ -846,6 +952,22 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
     if (!probeType || !network.getRpcHandler()->registerMethod(
             "AYP2PProbeRpc", "SetAuthorityValue", &rpcReceiver)) return 10;
     network.getReplicationManager()->registerObject(&state, probeType, kProbeNetId);
+    uint32_t migratedApplicationState = 0;
+    network.setP2PMigrationStateCallbacks({
+        {},
+        [&options](const P2PMigrationContext&, const uint8_t* data,
+                   size_t size) {
+            return !options.migrationRejectPrepare &&
+                   size == sizeof(uint32_t) && data &&
+                   getU32(data) == 4242u;
+        },
+        [&migratedApplicationState](const P2PMigrationContext&,
+                                    const uint8_t* data, size_t size) {
+            if (data && size == sizeof(uint32_t)) {
+                migratedApplicationState = getU32(data);
+            }
+        },
+    });
     gProbeAuthorityState = &state;
     struct AuthorityReset {
         ~AuthorityReset() { gProbeAuthorityState = nullptr; }
@@ -859,6 +981,7 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
         return 16;
     }
     P2PSessionInfo before;
+    P2PSessionMemberInfo objectOwner;
     bool capturedInitialSession = false;
     const auto joinDeadline = Clock::now() + std::chrono::seconds(30);
     while (Clock::now() < joinDeadline) {
@@ -876,6 +999,7 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
                 before.hostPeerId = info.previousHostPeerId;
             }
             capturedInitialSession = true;
+            objectOwner = chooseMigrationObjectOwner(members, info.hostPeerId);
             break;
         }
         pump(network);
@@ -884,6 +1008,14 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
         printSignalingStatus(local, signaling, "migration-initial-session");
         return 16;
     }
+    if (!objectOwner.peerId.isValid() ||
+        !network.bindP2PObjectOwner(
+            kProbeNetId, objectOwner.peerId, objectOwner.seatId)) {
+        std::fprintf(stderr,
+                     "AY_P2P_FAILURE local=%s phase=ownership-bind\n",
+                     local.value.c_str());
+        return 18;
+    }
     std::printf(
         "AY_P2P_MIGRATION local=%s phase=armed session_id=%llu epoch=%u seat=%u\n",
         local.value.c_str(),
@@ -891,15 +1023,39 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
         before.localSeatId);
     std::fflush(stdout);
 
+    const auto expectedFailure = static_cast<P2PMigrationFailureReason>(
+        options.expectedMigrationFailure);
     const auto migrationDeadline = Clock::now() + std::chrono::seconds(45);
     while (Clock::now() < migrationDeadline) {
         const auto info = network.getP2PSessionInfo();
+        if (droppedAfterPrepare) return 0;
+        if (expectedFailure != P2PMigrationFailureReason::None &&
+            events.migrationFailed != 0 &&
+            info.migration == P2PHostMigrationState::Stable &&
+            info.migrationFailure == expectedFailure) {
+            std::printf(
+                "AY_P2P_MIGRATION local=%s phase=aborted reason=%u epoch=%u\n",
+                local.value.c_str(),
+                static_cast<unsigned>(info.migrationFailure), info.epoch);
+            return 0;
+        }
         const auto barrier = network.getP2PReadyBarrierInfo();
         if (info.epoch > before.epoch &&
             info.migration == P2PHostMigrationState::Stable &&
             barrier.open && barrier.totalMemberCount == options.migrationMembers - 1 &&
             (info.role == P2PSessionRole::Host || network.isConnected())) break;
         pump(network);
+    }
+    if (expectedFailure != P2PMigrationFailureReason::None) {
+        const auto failed = network.getP2PSessionInfo();
+        std::fprintf(stderr,
+                     "AY_P2P_FAILURE local=%s phase=migration-abort-timeout "
+                     "state=%u reason=%u events=%u\n",
+                     local.value.c_str(),
+                     static_cast<unsigned>(failed.migration),
+                     static_cast<unsigned>(failed.migrationFailure),
+                     events.migrationFailed);
+        return 16;
     }
     const auto after = network.getP2PSessionInfo();
     const auto migratedBarrier = network.getP2PReadyBarrierInfo();
@@ -924,6 +1080,25 @@ int runMigrationJoin(const PeerId& local, const PeerId& remote,
                      events.migrationStarted, events.authorityChanged,
                      events.seatRestored, events.migrationFailed);
         return 16;
+    }
+    const auto reboundOwner = network.getP2PObjectOwner(kProbeNetId);
+    const bool localOwner = objectOwner.peerId == local;
+    const bool ownershipOk =
+        reboundOwner.peerId == objectOwner.peerId &&
+        reboundOwner.seatId == objectOwner.seatId &&
+        reboundOwner.locallyControlled ==
+            (after.role == P2PSessionRole::Client && localOwner) &&
+        (after.role != P2PSessionRole::Host || localOwner ||
+         reboundOwner.connectionId != 0);
+    if (!ownershipOk || migratedApplicationState != 4242u) {
+        std::fprintf(stderr,
+                     "AY_P2P_FAILURE local=%s phase=migration-rebind "
+                     "owner=%s seat=%u conn=%u local=%u app=%u\n",
+                     local.value.c_str(), reboundOwner.peerId.value.c_str(),
+                     reboundOwner.seatId, reboundOwner.connectionId,
+                     reboundOwner.locallyControlled ? 1u : 0u,
+                     migratedApplicationState);
+        return 18;
     }
 
     constexpr int32_t kMigratedAuthorityValue = 17777;
@@ -1038,7 +1213,9 @@ int main(int argc, char** argv) {
             "     AY_P2P_EXPECT_SESSIONS, AY_P2P_HOST_TIMEOUT_SECONDS,\n"
             "     AY_P2P_JOIN_TICKET (join), AY_P2P_EXPECT_JOIN_TICKET (host),\n"
             "     AY_P2P_RESUME_RECONNECTS, AY_P2P_HOST_MIGRATION,\n"
-            "     AY_P2P_MIGRATION_MEMBERS\n");
+            "     AY_P2P_MIGRATION_MEMBERS, AY_P2P_MIGRATION_REJECT_PREPARE,\n"
+            "     AY_P2P_MIGRATION_DROP_AFTER_PREPARE,\n"
+            "     AY_P2P_EXPECT_MIGRATION_FAILURE\n");
         return 2;
     }
     const bool host = std::strcmp(argv[1], "host") == 0;
