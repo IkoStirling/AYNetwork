@@ -313,10 +313,19 @@ public:
     }
     using P2PJoinValidator = std::function<P2PJoinDecision(
         const PeerId& peer, const uint8_t* ticket, size_t ticketSize)>;
+    using P2PSessionJoinValidator = std::function<P2PJoinDecision(
+        uint64_t sessionId, uint32_t epoch, const PeerId& peer,
+        const uint8_t* ticket, size_t ticketSize)>;
     virtual bool setP2PJoinTicket(const void* ticket, size_t size) {
         (void)ticket; (void)size; return false;
     }
     virtual void setP2PJoinValidator(P2PJoinValidator validator) {
+        (void)validator;
+    }
+    // Session-aware variant used by signed backend tickets. All peers should
+    // install the same verifier before connecting so a promoted Host validates
+    // against its current epoch instead of retaining a captured old epoch.
+    virtual void setP2PSessionJoinValidator(P2PSessionJoinValidator validator) {
         (void)validator;
     }
     virtual bool setP2PLocalReady(bool ready) { (void)ready; return false; }
@@ -333,6 +342,17 @@ public:
     virtual void setP2PMigrationStateCallbacks(
         P2PMigrationStateCallbacks callbacks) {
         (void)callbacks;
+    }
+    using P2PAuthorityTransitionGate = std::function<
+        P2PAuthorityTransitionDecision(const P2PMigrationContext&)>;
+    // The gate must return immediately. Implementations should launch backend
+    // I/O elsewhere and report Pending until its result is available.
+    virtual void setP2PAuthorityTransitionGate(
+        P2PAuthorityTransitionGate gate) {
+        (void)gate;
+    }
+    virtual bool setP2PAuthorityTransitionTimeoutMs(uint32_t timeoutMs) {
+        (void)timeoutMs; return false;
     }
     virtual bool isP2PMigrationFrozen() const { return false; }
     // Bind replicated-object ownership to stable session identity. PeerId is

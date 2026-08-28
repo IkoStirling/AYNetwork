@@ -13,6 +13,14 @@ set(SRC_FILES
     src/Signaling/UdpSignaling.cpp
     src/Signaling/SecureUdpSignaling.cpp
     src/Session/P2PSessionProtocol.cpp
+    src/Session/SessionTicket.cpp
+    src/Session/InMemorySessionService.cpp
+    src/Session/SqliteSessionService.cpp
+    src/Session/HttpSessionService.cpp
+    src/Session/P2PSessionBackend.cpp
+    src/Session/P2PSessionLeaseKeeper.cpp
+    src/Session/P2PSessionCoordinator.cpp
+    src/Session/InMemoryOnlineServices.cpp
     src/Protocol/PacketAssembler.cpp
     src/Protocol/PacketCodec.cpp
     src/Protocol/AckPipeline.cpp
@@ -44,6 +52,10 @@ find_package(GameNetworkingSockets CONFIG REQUIRED)
 # encode side. Decode side reuses ayt::storage::Lz4Decompressor from
 # AYStorage. Pattern copied from AYTool/package_tool/CMakeLists.txt.
 find_package(lz4 CONFIG REQUIRED)
+find_package(httplib CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(unofficial-sodium CONFIG REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 add_library(${MODULE_NAME} STATIC ${SRC_FILES})
 
@@ -56,6 +68,16 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
     AYCrypto                               # authenticated P2P signaling tokens/HMAC
     GameNetworkingSockets::GameNetworkingSockets   # R1: GNS shared variant
     lz4::lz4                               # R2: PacketCodec encode side
+)
+
+# Session-service implementation dependencies stay out of AYNetwork's public
+# compile interface.  CMake still propagates their link-only requirements to
+# consumers of this static library.
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    httplib::httplib                       # P2P session-service HTTP transport
+    nlohmann_json::nlohmann_json           # SessionServer wire JSON
+    unofficial-sodium::sodium              # Ed25519 Join Ticket signatures
+    unofficial::sqlite3::sqlite3            # durable P2P authority store
 )
 
 # P0 audit note (2026-07-26): we previously linked AYEntity here because
@@ -76,10 +98,42 @@ if(WIN32)
     target_link_libraries(${PROJECT_NAME} PUBLIC ws2_32)
 endif()
 
+option(AYNETWORK_BUILD_SIGNALING_SERVER "Build AYNetwork UDP signaling server" OFF)
+
+# Reference authority-session service. HTTP room/lease control and secure UDP
+# signaling are logically separate components but share one process and one
+# in-memory credential directory in this first deployable implementation.
+option(AYNETWORK_BUILD_SESSION_SERVER
+    "Build AYNetwork reference P2P session service" ${AYNETWORK_BUILD_SIGNALING_SERVER})
+if(AYNETWORK_BUILD_SESSION_SERVER)
+    add_executable(AYNetwork_SessionServer tools/session_server/main.cpp)
+    target_link_libraries(AYNetwork_SessionServer PRIVATE AYNetwork)
+    add_executable(AYNetwork_SessionProbe tools/session_probe/main.cpp)
+    target_link_libraries(AYNetwork_SessionProbe PRIVATE AYNetwork)
+    if(WIN32 AND BUILD_TESTING)
+        add_test(
+            NAME AYNetwork_P2P_SessionService_E2E
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File ${CMAKE_CURRENT_SOURCE_DIR}/unittest/RunP2PSessionServiceE2E.ps1
+                -SessionServer $<TARGET_FILE:AYNetwork_SessionServer>
+                -SessionProbe $<TARGET_FILE:AYNetwork_SessionProbe>)
+        set_tests_properties(AYNetwork_P2P_SessionService_E2E
+            PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+        add_test(
+            NAME AYNetwork_P2P_SessionService_Production_E2E
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File ${CMAKE_CURRENT_SOURCE_DIR}/unittest/RunP2PSessionServiceE2E.ps1
+                -SessionServer $<TARGET_FILE:AYNetwork_SessionServer>
+                -SessionProbe $<TARGET_FILE:AYNetwork_SessionProbe>
+                -Production)
+        set_tests_properties(AYNetwork_P2P_SessionService_Production_E2E
+            PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+    endif()
+endif()
+
 # Optional standalone rendezvous process for the built-in UDP signaling
 # backend. It hosts no simulation state and may be replaced by an application's
 # authenticated signaling service.
-option(AYNETWORK_BUILD_SIGNALING_SERVER "Build AYNetwork UDP signaling server" OFF)
 if(AYNETWORK_BUILD_SIGNALING_SERVER)
     add_executable(AYNetwork_SignalingServer tools/signaling/main.cpp)
     target_link_libraries(AYNetwork_SignalingServer PRIVATE AYNetwork)
@@ -88,7 +142,7 @@ if(AYNETWORK_BUILD_SIGNALING_SERVER)
     add_executable(AYNetwork_P2PSmokePeer tools/p2p_smoke/main.cpp)
     target_link_libraries(AYNetwork_P2PSmokePeer PRIVATE AYNetwork)
     if(WIN32 AND BUILD_TESTING)
-        foreach(SCENARIO IN ITEMS normal reject drop)
+        foreach(SCENARIO IN ITEMS normal authority reject drop)
             add_test(
                 NAME AYNetwork_P2P_Migration_${SCENARIO}
                 COMMAND powershell -NoProfile -ExecutionPolicy Bypass

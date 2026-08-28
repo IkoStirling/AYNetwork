@@ -47,6 +47,7 @@ struct ProbeOptions {
     uint32_t migrationMembers = 3;
     bool migrationRejectPrepare = false;
     bool migrationDropAfterPrepare = false;
+    uint32_t migrationAuthorityDelayMs = 0;
     uint32_t expectedMigrationFailure = 0;
 };
 
@@ -299,6 +300,8 @@ bool makeProbeOptions(ProbeOptions& options) {
            envUnsigned("AY_P2P_EXPECT_SESSIONS", 1, 1, 64, options.expectedSessions) &&
            envUnsigned("AY_P2P_MIGRATION_MEMBERS", 3, 2, 64,
                        options.migrationMembers) &&
+           envUnsigned("AY_P2P_MIGRATION_AUTHORITY_DELAY_MS", 0, 0, 5000,
+                       options.migrationAuthorityDelayMs) &&
            envUnsigned(
                "AY_P2P_EXPECT_MIGRATION_FAILURE", 0, 0,
                static_cast<uint32_t>(
@@ -485,6 +488,37 @@ int runHost(const PeerId& local,
         {},
         {},
     });
+    if (options.migrationAuthorityDelayMs != 0) {
+        struct AuthorityDelayState {
+            Clock::time_point started{};
+            bool approvedPrinted = false;
+        };
+        auto state = std::make_shared<AuthorityDelayState>();
+        const auto delay = std::chrono::milliseconds(
+            options.migrationAuthorityDelayMs);
+        network.setP2PAuthorityTransitionGate(
+            [state, delay, &local](const P2PMigrationContext&) {
+                const auto now = Clock::now();
+                if (state->started == Clock::time_point{}) {
+                    state->started = now;
+                    std::printf(
+                        "AY_P2P_MIGRATION local=%s phase=authority-pending\n",
+                        local.value.c_str());
+                    std::fflush(stdout);
+                }
+                if (now - state->started < delay) {
+                    return P2PAuthorityTransitionDecision::Pending;
+                }
+                if (!state->approvedPrinted) {
+                    state->approvedPrinted = true;
+                    std::printf(
+                        "AY_P2P_MIGRATION local=%s phase=authority-approved\n",
+                        local.value.c_str());
+                    std::fflush(stdout);
+                }
+                return P2PAuthorityTransitionDecision::Approved;
+            });
+    }
     network.setP2PHostMigrationEnabled(options.hostMigration);
     (void)network.setP2PReconnectGracePeriodMs(30000);
 
@@ -1215,6 +1249,7 @@ int main(int argc, char** argv) {
             "     AY_P2P_RESUME_RECONNECTS, AY_P2P_HOST_MIGRATION,\n"
             "     AY_P2P_MIGRATION_MEMBERS, AY_P2P_MIGRATION_REJECT_PREPARE,\n"
             "     AY_P2P_MIGRATION_DROP_AFTER_PREPARE,\n"
+            "     AY_P2P_MIGRATION_AUTHORITY_DELAY_MS,\n"
             "     AY_P2P_EXPECT_MIGRATION_FAILURE\n");
         return 2;
     }

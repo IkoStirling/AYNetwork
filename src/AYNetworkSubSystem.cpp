@@ -214,6 +214,8 @@ public:
         _p2pConfig = {};
         _p2pJoinTicket.clear();
         _p2pJoinValidator = {};
+        _p2pSessionJoinValidator = {};
+        _p2pAuthorityTransitionGate = {};
         _clientAdmission = P2PAdmissionState::NotRequired;
         _clientJoinRejection = P2PJoinRejectReason::None;
         _p2pBarrier = {};
@@ -532,9 +534,11 @@ public:
     }
 
     void initializeHostedSession() {
-        _p2pSessionId = createSessionId(
-            _p2pConfig.localPeerId, _p2pConfig.virtualPort);
-        _p2pSessionEpoch = 1;
+        _p2pSessionId = _p2pConfig.sessionId != 0
+            ? _p2pConfig.sessionId
+            : createSessionId(_p2pConfig.localPeerId, _p2pConfig.virtualPort);
+        _p2pSessionEpoch = _p2pConfig.sessionEpoch != 0
+            ? _p2pConfig.sessionEpoch : 1;
         _p2pRosterRevision = 0;
         _p2pSessionHost = _p2pConfig.localPeerId;
         _p2pPreviousHost = {};
@@ -652,6 +656,9 @@ public:
         _p2pMigrationDecisionAcks.clear();
         _p2pMigrationAckDeadlineMs = 0;
         _p2pMigrationDecisionRetryAtMs = 0;
+        _p2pMigrationAuthorityDeadlineMs = 0;
+        _p2pMigrationAuthorityPollAtMs = 0;
+        _p2pCrashAuthorityPending = false;
         if (unfreeze) _p2pMigrationFrozen = false;
     }
 
@@ -745,6 +752,46 @@ public:
         // acknowledged Commit (or the bounded retry window expires).
         if (_p2pMigrationDecisionAcks.empty()) {
             _p2pPlannedHostDepartureAtMs = sessionNowMs();
+        }
+    }
+
+    void beginGracefulAuthorityTransition() {
+        _p2pMigrationState = P2PHostMigrationState::AwaitingAuthority;
+        _p2pMigrationAuthorityDeadlineMs =
+            sessionNowMs() + _p2pMigrationAuthorityTimeoutMs;
+        _p2pMigrationAuthorityPollAtMs = sessionNowMs();
+    }
+
+    P2PAuthorityTransitionDecision pollAuthorityTransition(
+        const P2PMigrationContext& context) {
+        if (!_p2pAuthorityTransitionGate) {
+            return P2PAuthorityTransitionDecision::Approved;
+        }
+        try {
+            return _p2pAuthorityTransitionGate(context);
+        } catch (...) {
+            return P2PAuthorityTransitionDecision::Rejected;
+        }
+    }
+
+    void processGracefulAuthorityTransition() {
+        if (!_p2pListening ||
+            _p2pMigrationState != P2PHostMigrationState::AwaitingAuthority ||
+            _p2pPendingMigrationPlan.sessionId == 0) return;
+        const uint64_t now = sessionNowMs();
+        if (_p2pMigrationAuthorityDeadlineMs != 0 &&
+            now >= _p2pMigrationAuthorityDeadlineMs) {
+            abortHostMigration(P2PMigrationFailureReason::AuthorityTimeout);
+            return;
+        }
+        if (now < _p2pMigrationAuthorityPollAtMs) return;
+        _p2pMigrationAuthorityPollAtMs = now + 25u;
+        const auto decision = pollAuthorityTransition(
+            migrationContext(_p2pPendingMigrationPlan, true));
+        if (decision == P2PAuthorityTransitionDecision::Approved) {
+            commitHostMigration();
+        } else if (decision == P2PAuthorityTransitionDecision::Rejected) {
+            abortHostMigration(P2PMigrationFailureReason::AuthorityRejected);
         }
     }
 
@@ -852,7 +899,8 @@ public:
         // Give the client two coordinator windows before declaring the
         // decision lost so an early ACKing peer cannot race the last voter.
         _p2pMigrationAckDeadlineMs =
-            sessionNowMs() + 2u * _p2pMigrationAckTimeoutMs;
+            sessionNowMs() + 2u * _p2pMigrationAckTimeoutMs +
+            _p2pMigrationAuthorityTimeoutMs;
     }
 
     void markMigrationFailed(P2PMigrationFailureReason failure) {
@@ -884,12 +932,21 @@ public:
                 P2PMigrationFailureReason::NoEligibleHost);
             return;
         }
-        ++_p2pSessionEpoch;
-        if (_p2pSessionEpoch == 0) ++_p2pSessionEpoch;
+        if (_p2pSessionEpoch == std::numeric_limits<uint32_t>::max()) {
+            markMigrationFailed(P2PMigrationFailureReason::InvalidSession);
+            return;
+        }
+        _p2pPendingMigrationPlan = {};
+        _p2pPendingMigrationPlan.sessionId = _p2pSessionId;
+        _p2pPendingMigrationPlan.currentEpoch = _p2pSessionEpoch;
+        _p2pPendingMigrationPlan.nextEpoch = _p2pSessionEpoch + 1;
+        _p2pPendingMigrationPlan.electedHostPeerId = _p2pElectedHost;
+        _p2pCrashAuthorityPending = true;
+        _p2pMigrationAuthorityDeadlineMs =
+            sessionNowMs() + _p2pMigrationAuthorityTimeoutMs;
+        _p2pMigrationAuthorityPollAtMs = sessionNowMs();
         _p2pMigrationFailure = P2PMigrationFailureReason::None;
         beginMigrationFreeze();
-        resetForCommittedAuthorityEpoch(
-            _p2pElectedHost == _p2pConfig.localPeerId);
         _p2pMigrationState = P2PHostMigrationState::Electing;
         _p2pMigrationActionAtMs = sessionNowMs() +
             (_p2pElectedHost == _p2pConfig.localPeerId ? 0u : 400u);
@@ -1035,6 +1092,7 @@ public:
 
     void tickP2PSessionMaintenance() {
         expireSessionReservations();
+        processGracefulAuthorityTransition();
         if (_p2pListening &&
             _p2pMigrationState == P2PHostMigrationState::AwaitingCommit &&
             _p2pMigrationAckDeadlineMs != 0 &&
@@ -1087,6 +1145,33 @@ public:
             _p2pMigrationActionAtMs == 0 ||
             sessionNowMs() < _p2pMigrationActionAtMs) return;
         _p2pMigrationActionAtMs = 0;
+        if (_p2pMigrationState == P2PHostMigrationState::Electing &&
+            _p2pCrashAuthorityPending) {
+            const uint64_t now = sessionNowMs();
+            if (_p2pMigrationAuthorityDeadlineMs != 0 &&
+                now >= _p2pMigrationAuthorityDeadlineMs) {
+                markMigrationFailed(
+                    P2PMigrationFailureReason::AuthorityTimeout);
+                return;
+            }
+            const P2PMigrationContext context = migrationContext(
+                _p2pPendingMigrationPlan, false);
+            const auto decision = pollAuthorityTransition(context);
+            if (decision == P2PAuthorityTransitionDecision::Pending) {
+                _p2pMigrationActionAtMs = now + 100u;
+                return;
+            }
+            if (decision == P2PAuthorityTransitionDecision::Rejected) {
+                markMigrationFailed(
+                    P2PMigrationFailureReason::AuthorityRejected);
+                return;
+            }
+            _p2pSessionEpoch = _p2pPendingMigrationPlan.nextEpoch;
+            _p2pCrashAuthorityPending = false;
+            _p2pMigrationAuthorityDeadlineMs = 0;
+            resetForCommittedAuthorityEpoch(
+                _p2pElectedHost == _p2pConfig.localPeerId);
+        }
         if (_p2pElectedHost == _p2pConfig.localPeerId) {
             (void)promoteToMigrationHost();
             return;
@@ -1229,6 +1314,14 @@ public:
                     request.seatId == member->seatId && !member->host;
                 decision = resumed ? P2PJoinDecision::accept() :
                     P2PJoinDecision::reject(P2PJoinRejectReason::InvalidTicket);
+            } else if (_p2pSessionJoinValidator) {
+                decision = _p2pSessionJoinValidator(
+                    _p2pSessionId, _p2pSessionEpoch, remotePeer,
+                    request.ticket.data(), request.ticket.size());
+                if (decision.accepted) decision.reason = P2PJoinRejectReason::None;
+                else if (decision.reason == P2PJoinRejectReason::None) {
+                    decision.reason = P2PJoinRejectReason::InvalidTicket;
+                }
             } else if (_p2pJoinValidator) {
                 decision = _p2pJoinValidator(
                     remotePeer, request.ticket.data(), request.ticket.size());
@@ -1316,11 +1409,15 @@ public:
             const bool authorityWillChange = requestedResume &&
                 _p2pPreviousHost.isValid() &&
                 _clientConn->getRemotePeerId() != _p2pPreviousHost;
+            const bool backendSessionMismatch = !requestedResume &&
+                _p2pConfig.sessionId != 0 &&
+                (result.sessionId != _p2pConfig.sessionId ||
+                 result.epoch != _p2pConfig.sessionEpoch);
             const bool invalidResumeResult = requestedResume
                 ? (!result.resumed || result.sessionId != _p2pSessionId ||
                    result.epoch != _p2pSessionEpoch ||
                    result.seatId != _p2pLocalSeatId)
-                : result.resumed;
+                : (result.resumed || backendSessionMismatch);
             if (invalidResumeResult) {
                 _clientAdmission = P2PAdmissionState::Rejected;
                 _clientJoinRejection = P2PJoinRejectReason::MalformedRequest;
@@ -1490,7 +1587,7 @@ public:
             const bool allAcknowledged = std::all_of(
                 _p2pMigrationAcks.begin(), _p2pMigrationAcks.end(),
                 [](const auto& entry) { return entry.second; });
-            if (allAcknowledged) commitHostMigration();
+            if (allAcknowledged) beginGracefulAuthorityTransition();
             return true;
         }
         case kMsgTypeSessionMigrationDecision: {
@@ -2100,8 +2197,8 @@ public:
         if (!_p2pResumeRequested) {
             resetMigrationTransaction(true);
             _p2pMigrationFailure = P2PMigrationFailureReason::None;
-            _p2pSessionId = 0;
-            _p2pSessionEpoch = 0;
+            _p2pSessionId = _p2pConfig.sessionId;
+            _p2pSessionEpoch = _p2pConfig.sessionEpoch;
             _p2pRosterRevision = 0;
             _p2pLocalSeatId = 0;
             _p2pSessionHost = remotePeer;
@@ -2362,6 +2459,15 @@ public:
         _p2pJoinValidator = std::move(validator);
     }
 
+    void setP2PSessionJoinValidator(P2PSessionJoinValidator validator) override {
+        if (_p2pListening || !_serverClients.empty()) {
+            ::fprintf(stderr,
+                "[Network] setP2PSessionJoinValidator ignored while P2P host is active\n");
+            return;
+        }
+        _p2pSessionJoinValidator = std::move(validator);
+    }
+
     bool setP2PLocalReady(bool ready) override {
         if (!_p2pConfigured || _p2pMigrationFrozen) return false;
         if (_p2pLocalReady == ready) return true;
@@ -2480,6 +2586,34 @@ public:
     void setP2PMigrationStateCallbacks(
         P2PMigrationStateCallbacks callbacks) override {
         _p2pMigrationStateCallbacks = std::move(callbacks);
+    }
+
+    void setP2PAuthorityTransitionGate(
+        P2PAuthorityTransitionGate gate) override {
+        if (_p2pMigrationFrozen) {
+            // Clearing a coordinator during migration must not leave a
+            // dangling callback or silently approve authority. Replace it by
+            // a capture-free fail-closed gate for the active transaction.
+            if (!gate) {
+                _p2pAuthorityTransitionGate =
+                    [](const P2PMigrationContext&) {
+                        return P2PAuthorityTransitionDecision::Rejected;
+                    };
+            } else {
+                ::fprintf(stderr,
+                    "[Network] authority transition gate ignored during migration\n");
+            }
+            return;
+        }
+        _p2pAuthorityTransitionGate = std::move(gate);
+    }
+
+    bool setP2PAuthorityTransitionTimeoutMs(uint32_t timeoutMs) override {
+        if (_p2pMigrationFrozen || timeoutMs == 0 || timeoutMs > 60000u) {
+            return false;
+        }
+        _p2pMigrationAuthorityTimeoutMs = timeoutMs;
+        return true;
     }
 
     bool isP2PMigrationFrozen() const override {
@@ -3244,6 +3378,7 @@ private:
     bool _p2pListening = false;
     std::vector<uint8_t> _p2pJoinTicket;
     P2PJoinValidator _p2pJoinValidator;
+    P2PSessionJoinValidator _p2pSessionJoinValidator;
     P2PAdmissionState _clientAdmission = P2PAdmissionState::NotRequired;
     P2PJoinRejectReason _clientJoinRejection = P2PJoinRejectReason::None;
     P2PReadyBarrierInfo _p2pBarrier{};
@@ -3269,6 +3404,7 @@ private:
     uint64_t _p2pPlannedHostDepartureAtMs = 0;
     uint32_t _p2pMigrationAttempts = 0;
     P2PMigrationStateCallbacks _p2pMigrationStateCallbacks;
+    P2PAuthorityTransitionGate _p2pAuthorityTransitionGate;
     bool _p2pMigrationFrozen = false;
     bool _p2pHostPreparePending = false;
     bool _p2pClientPreparePending = false;
@@ -3279,6 +3415,10 @@ private:
     uint64_t _p2pMigrationAckDeadlineMs = 0;
     uint64_t _p2pMigrationDecisionRetryAtMs = 0;
     uint32_t _p2pMigrationAckTimeoutMs = 3000;
+    uint32_t _p2pMigrationAuthorityTimeoutMs = 15000;
+    uint64_t _p2pMigrationAuthorityDeadlineMs = 0;
+    uint64_t _p2pMigrationAuthorityPollAtMs = 0;
+    bool _p2pCrashAuthorityPending = false;
     std::map<uint64_t, P2PSessionEventHandler> _p2pSessionEventListeners;
     std::deque<P2PSessionEvent> _pendingP2PSessionEvents;
     uint64_t _nextP2PSessionEventListenerId = 0;

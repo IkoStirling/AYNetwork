@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$SignalingServer,
     [Parameter(Mandatory = $true)][string]$SmokePeer,
-    [ValidateSet("normal", "reject", "drop")][string]$Scenario = "normal",
+    [ValidateSet("normal", "authority", "reject", "drop")][string]$Scenario = "normal",
     [int]$TimeoutSeconds = 70
 )
 
@@ -54,7 +54,8 @@ function Set-CommonPeerEnvironment([int]$expectedFailure) {
         "AY_P2P_SIGNAL_ROOM", "AY_P2P_SIGNAL_TOKEN", "AY_P2P_STUN",
         "AY_P2P_TURN", "AY_P2P_TURN_USER", "AY_P2P_TURN_PASS",
         "AY_P2P_MIGRATION_REJECT_PREPARE",
-        "AY_P2P_MIGRATION_DROP_AFTER_PREPARE"
+        "AY_P2P_MIGRATION_DROP_AFTER_PREPARE",
+        "AY_P2P_MIGRATION_AUTHORITY_DELAY_MS"
     )
     foreach ($name in $remove) {
         Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
@@ -66,6 +67,9 @@ function Set-CommonPeerEnvironment([int]$expectedFailure) {
     $env:AY_P2P_MIGRATION_MEMBERS = "3"
     $env:AY_P2P_HOST_TIMEOUT_SECONDS = "35"
     $env:AY_P2P_EXPECT_MIGRATION_FAILURE = [string]$expectedFailure
+    if ($Scenario -eq "authority") {
+        $env:AY_P2P_MIGRATION_AUTHORITY_DELAY_MS = "350"
+    }
 }
 
 function Assert-Contains([string]$name, [string]$needle) {
@@ -143,10 +147,14 @@ try {
         }
     }
 
-    if ($Scenario -eq "normal") {
+    if ($Scenario -eq "normal" -or $Scenario -eq "authority") {
         Assert-Contains "host" "phase=departed"
         Assert-Contains "join-a" "phase=complete"
         Assert-Contains "join-b" "phase=complete"
+        if ($Scenario -eq "authority") {
+            Assert-Contains "host" "phase=authority-pending"
+            Assert-Contains "host" "phase=authority-approved"
+        }
     } elseif ($Scenario -eq "reject") {
         Assert-Contains "host" "phase=aborted reason=11"
         Assert-Contains "join-a" "phase=aborted reason=11"

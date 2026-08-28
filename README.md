@@ -16,7 +16,7 @@ AYNetwork 是网络传输、协议、复制与 RPC 模块，使用 GameNetworkin
 ## 依赖
 
 - AYCore、AYGameLoop、AYStorage、AYReflect
-- GameNetworkingSockets、LZ4
+- GameNetworkingSockets、LZ4、cpp-httplib、nlohmann-json、libsodium、SQLite
 - Win32：ws2_32
 
 ## P2P、NAT 穿透与中继
@@ -123,6 +123,42 @@ connectionId 作为 ownership 身份。
 迁移只能继承每个候选节点已收到的复制状态；仅存在旧 Host 内存中的未复制状态、
 未持久化 RPC 副作用和连接局部状态会丢失。该机制也不是分区共识：无法互通的网络
 分区可能各自选主，游戏/匹配服务仍需 epoch 仲裁或会话终止策略。
+
+### 参考会话后端
+
+`AYNetwork_SessionServer` 提供第一版可替换的会话后端：TCP/HTTP 管理房间、成员凭证、
+10 秒 Host 租约与 epoch CAS，UDP 端继续运行既有安全信令。两者只是参考部署中共用
+一个进程和凭证目录；游戏数据仍由两端的 GNS P2P 连接直接传输。
+
+```text
+AYNetwork_SessionServer 0.0.0.0 18080 203.0.113.10 28080
+AYNetwork_SessionProbe 203.0.113.10 18080
+```
+
+Host/Client 通过 `HttpP2PSessionService` 创建或加入会话，再用
+`P2PSessionCoordinator` 异步完成 grant 安装、安全信令配置、listen/connect、Host
+续租、离开和迁移 epoch CAS。应用只需在正常网络循环中调用 `update()`；后端 HTTP 不会
+阻塞网络线程。优雅迁移在 Prepare ACK 后先提交后端 CAS，再允许 AYNetwork Commit；
+崩溃迁移则要求确定性候选在 Promotion 前完成过期 lease 的 self-claim。低层的
+`applyP2PSessionGrant()`、validator、Join Ticket 和 `P2PSessionLeaseKeeper` 仍可供
+自定义大厅流程单独使用。
+
+开发模式使用内存状态；生产模式可启用 SQLite WAL 持久化、ChaCha20-Poly1305 token
+静态加密、持久 Ed25519 签名身份、准入认证、限流和 JSONL 审计。HTTP 仍应只监听回环
+地址并由反向代理终止 TLS；SQLite 多实例仅限同机，跨主机需要事务数据库适配器。
+后端 CAS 与 AYNetwork 的多节点 Prepare/Commit 由非阻塞 authority gate 串联，但仍不
+是假装成一个分布式原子提交：CAS 后进程崩溃等跨系统失败必须按后端 epoch 关闭旧会话并
+重新加入，不能回退 epoch。
+接口、端点和完整接入顺序见
+[docs/p2p-session-service.md](docs/p2p-session-service.md)。
+
+### Lobby、Matchmaking 与 Dedicated Server
+
+`OnlineServices.h` 提供后端中立的 `ILobbyService`、`IMatchmakingService` 和
+`IDedicatedServerService`。`InMemoryOnlineServices` 是线程安全参考实现：Lobby 可按
+revision CAS 更新并直接启动 P2P session；匹配支持完整 party、P2P/Dedicated/Any
+拓扑和每个 ticket 的最小秘密暴露；Dedicated 目录支持注册凭证、租约、draining、容量
+预留和过期 fencing。完整边界见 [docs/online-services.md](docs/online-services.md)。
 
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。

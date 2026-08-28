@@ -1914,12 +1914,107 @@ temporary transport loss recoverable and permits the authority role to move.
   split-brain safety matters; hostless lockstep/consensus remains a separate
   architecture.
 
+### 15.19 Backend authority session service v1 (2026-08-28)
+
+The backend-neutral authority contract closes the gap between engine-local P2P
+state and a deployable room authority. It remains separate from both opaque GNS
+signaling and real-time game traffic.
+
+- `IP2PSessionService` defines create, join, Host heartbeat, epoch-CAS Host
+  claim/transfer, leave, and public session lookup. `HttpP2PSessionService` is
+  one transport adapter; applications may replace it with their account,
+  platform, lobby, or cloud SDK without changing AYNetwork P2P configuration.
+- `InMemoryP2PSessionService` is the bounded reference core. Session IDs,
+  member bearer tokens, and per-member signaling tokens are cryptographically
+  random. The default Host lease is 10 seconds. Only the live Host renews it;
+  an admitted candidate may self-claim after expiry, while a live Host may
+  transfer to a different admitted member. Every mutation compares the exact
+  expected epoch and increments it once.
+- An expired Host can neither select a successor nor delete the session. This
+  makes lease expiry an actual authority boundary instead of only a liveness
+  hint. A Host-claim response contains public session metadata only and never
+  discloses the promoted member's credential to the old Host.
+- `P2PSessionLeaseKeeper` performs the default three-second heartbeat on a
+  private worker and retries only transient service failures. Unauthorized,
+  expired, missing-session, protocol, and epoch errors stop renewal. Successful
+  self-claim starts renewal at the returned epoch; transfer away stops it.
+- `P2PSessionCoordinator` is the application-facing asynchronous state machine.
+  It owns grant application, secure signaling configuration, Join Ticket and
+  validator installation, listen/connect, Host lease lifetime, leave rollback,
+  and migration authority reconciliation. Its `update()` consumes completed
+  worker results only and never performs backend HTTP on the network thread.
+- Create/join grants carry a bounded Ed25519-signed Join Ticket with
+  `sessionId/epoch/PeerId/issuedAt/expiry/nonce`, a member credential, and the
+  existing secure-signaling credential. The default ticket lifetime is 60
+  seconds. Every admitted peer installs the public-key validator before
+  connecting so a later promoted Host can validate tickets for its current
+  epoch.
+- `P2PConfig` accepts an externally allocated session tuple only when both
+  `sessionId` and `sessionEpoch` are non-zero. A Host publishes that tuple and
+  a Client rejects a successful engine JoinResult whose tuple differs from its
+  backend grant.
+- `AYNetwork_SessionServer` runs the HTTP authority API and secure UDP
+  signaling in one reference process because they share the in-memory member
+  directory. They are logically distinct services and may be deployed or
+  replaced independently. `AYNetwork_SessionProbe` verifies create/join,
+  signed ticket decoding, issued signaling credentials, heartbeat, successful
+  CAS, stale-CAS rejection, promoted-Host heartbeat, leave, and cleanup across
+  process boundaries.
+- HTTP request and response bodies are bounded and integer fields are parsed
+  without narrowing. Supplied Ed25519 key pairs are checked for a matching
+  public/secret pair. The secure signaling server rechecks membership-backed
+  credentials periodically, so leave/revocation takes effect without waiting
+  for the token's nominal expiry.
+- The reference core is deliberately in-memory and the HTTP listener is
+  plaintext. Process restart invalidates rooms and its ephemeral signing key;
+  account authentication, durable storage, rate limiting for the HTTP API,
+  TLS termination, key rotation, token refresh, and multi-instance consensus
+  belong to a production backend.
+- The coordinator installs a non-blocking authority gate. Graceful migration
+  stops after all Prepare ACKs, commits the backend epoch CAS on a worker, then
+  permits engine Commit. Crash migration stops before Promotion; only the
+  deterministic local candidate self-claims after lease expiry while observers
+  wait for the canonical epoch. Rejection and timeout fail closed without
+  advancing the engine epoch.
+- Backend CAS and engine Commit remain two adjacent transactions, not a
+  distributed atomic commit. If CAS succeeds and the process dies before
+  Commit, survivors must observe the canonical backend epoch, terminate stale
+  engine state, and rejoin; rolling an epoch backward is forbidden.
+
+The deployment and integration contract is documented in
+`docs/p2p-session-service.md`.
+
+### 15.20 Durable backend and online-service foundation (2026-08-28)
+
+- `SqliteP2PSessionService` adds restart-durable sessions with WAL,
+  `synchronous=FULL`, transactional exact-epoch CAS, encrypted member/signaling
+  credentials, and database binding to both the storage key and persistent
+  Ed25519 identity. SQLite multi-process safety is same-host only.
+- The HTTP adapter now accepts any `IP2PSessionService`, supports admission
+  authentication for create/join, per-source token-bucket limiting, 429 retry
+  semantics, and secret-free audit events. Production `SessionServer` refuses
+  incomplete configuration and defaults to loopback HTTP behind a TLS proxy.
+- Partition coverage includes slow/unreachable backends, a committed CAS whose
+  response is lost, leave-response loss, concurrent CAS, timeout fail-closed,
+  and stale-Host fencing after healing.
+- `ILobbyService`, `IMatchmakingService`, and `IDedicatedServerService` establish
+  the online layer above transport. The bounded thread-safe reference backend
+  launches Lobby and P2P match assignments through `IP2PSessionService`, keeps
+  party tickets atomic, and manages dedicated leases, drain state, reservations,
+  expiry, and capacity selection.
+
+The online-service boundary and first-version behavior are documented in
+`docs/online-services.md`.
+
 ---
 
 ## 16. Changelog
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-28 | **Durable backend + Online Services v1**：SQLite WAL/事务 epoch CAS、token 静态加密、持久 Ed25519 key、HTTP 准入/限流/审计与生产启动门禁；补分区故障矩阵；新增 Lobby、party Matchmaking、Dedicated lease/drain/allocation 契约和线程安全参考实现，并接入现有 P2P session backend。 |
+| 2026-08-28 | **P2PSessionCoordinator**：异步 create/join/leave 与失败回滚；统一安装 grant/信令/Join Ticket/validator、启动 listen/connect 和 Host lease；非阻塞 authority gate 将优雅迁移后端 CAS 放在 Commit 前、崩溃 self-claim 放在 Promotion 前；覆盖 lease 等待、双候选 CAS、超时 fail-closed。 |
+| 2026-08-28 | **Backend authority session service v1**：后端无关 create/join/heartbeat/claim/leave 契约；10 秒 Host lease + 3 秒后台续租 + epoch CAS；Ed25519 短期 Join Ticket；HTTP 参考客户端/服务端与安全 UDP 信令共进程部署；多进程 E2E 覆盖凭证、信令、迁移和清理。 |
 | 2026-08-28 | **Host Migration membership/ownership hardening**：Prepare 固定参与者集合并关闭 Join/Ready/席位过期变更；失败原因结构化上 wire/event/session；PeerId/seat ownership 在重连及迁移后自动重绑 connectionId；新增 normal/reject/drop 三条多进程 CTest。 |
 | 2026-08-28 | **Host Migration correctness transaction**：final Full → Prepare/hash/optional 64 KiB app state → all Prepare ACK → Commit/retry → Commit ACK → departure；Abort 不推进 epoch；迁移冻结 RPC/Input/应用发送并重置 RPC、Prediction、ownership、interpolation 与 replication baselines。AYEditor 暂停迁移期 Play 更新。 |
 | 2026-07-26 | 工业级审计；R1–R6 重置；GNS 选型 §14 |

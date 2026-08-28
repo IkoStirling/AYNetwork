@@ -68,6 +68,10 @@ add_executable(${P2P_TEST_NAME}
     AYTest_P2P.cpp
     AYTest_P2PSession.cpp
     AYTest_SecureSignaling.cpp
+    AYTest_SessionService.cpp
+    AYTest_SessionCoordinator.cpp
+    AYTest_DurableSessionService.cpp
+    AYTest_OnlineServices.cpp
 )
 target_compile_definitions(${P2P_TEST_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
 target_link_libraries(${P2P_TEST_NAME} PRIVATE AYNetwork AYTest AYCore)

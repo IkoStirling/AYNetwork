@@ -76,6 +76,7 @@ enum class P2PHostMigrationState : uint8_t {
     Preparing = 6,
     AwaitingCommit = 7,
     Committing = 8,
+    AwaitingAuthority = 9,
 };
 
 // Stable, application-visible reason for the most recent migration failure.
@@ -98,6 +99,8 @@ enum class P2PMigrationFailureReason : uint8_t {
     CommitTimeout = 14,
     PromotionFailed = 15,
     ReconnectFailed = 16,
+    AuthorityRejected = 17,
+    AuthorityTimeout = 18,
 };
 
 enum class P2PAdmissionState : uint8_t {
@@ -143,6 +146,12 @@ enum class P2PPeerState : uint8_t {
 struct P2PConfig {
     PeerId localPeerId;
     uint16_t virtualPort = 0;
+    // Optional authority-session identity supplied by an account/session
+    // backend. Both values must be zero (development/local allocation) or
+    // non-zero. Hosts publish this exact tuple; clients reject a JoinResult
+    // that does not match it.
+    uint64_t sessionId = 0;
+    uint32_t sessionEpoch = 0;
     P2PIcePolicy icePolicy = P2PIcePolicy::DirectOrRelay;
 
     // Comma-separated values are assembled by AYNetwork before passing them
@@ -165,6 +174,7 @@ struct P2PConfig {
             return true;
         };
         if (!localPeerId.isValid()) return false;
+        if ((sessionId == 0) != (sessionEpoch == 0)) return false;
         if (!validList(stunServers) || !validList(turnServers) ||
             !validList(turnUsers) || !validList(turnPasswords)) return false;
         if (turnUsers.size() != turnPasswords.size()) return false;
@@ -256,6 +266,15 @@ struct P2PMigrationContext {
     uint32_t nextEpoch = 0;
     PeerId electedHostPeerId;
     bool graceful = false;
+};
+
+// Non-blocking backend authority gate polled by AYNetwork while migration is
+// frozen. Pending keeps the transaction frozen, Approved permits Commit or
+// Promotion, and Rejected fails closed without advancing the engine epoch.
+enum class P2PAuthorityTransitionDecision : uint8_t {
+    Pending = 0,
+    Approved = 1,
+    Rejected = 2,
 };
 
 // Optional game-state bridge for data that is not represented by registered
