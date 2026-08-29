@@ -2117,12 +2117,35 @@ The online-service boundary and first-version behavior are documented in
   loading timeout and recovery, session failure cleanup, credential rotation,
   cleanup timeout and wrong-state command rejection.
 
+### 15.26 Content identity and scene integration (2026-08-29)
+
+- Lobby creation and matchmaking requests carry an exact
+  `OnlineContentDescriptor` (`contentId`, `contentVersion`, `contentSeed`). The
+  reference in-memory, HTTP, and durable SQLite adapters validate and preserve
+  it; matchmaking only groups tickets with the same descriptor.
+- Match and Lobby assignments expose that descriptor through
+  `OnlineFlowStatus` pull state. Event payloads remain trivial and secret-free;
+  applications pull the richer descriptor after receiving the generation-only
+  load event.
+- Durable Online storage schema is v2. Compatibility migration is intentionally
+  omitted while no shipped project consumes the protocol; a v1 database fails
+  the existing schema gate and must be recreated.
+- AYApplication owns `RuntimeSceneLoader`, an Egress subsystem that loads into a
+  staging Play Scene and changes `SceneManager::current()` only after parsing
+  and activation preparation succeed. Failure preserves the active world.
+- The optional `AYOnlineApplication` target resolves logical content to trusted
+  local assets, applies the session seed before activation, fences scene and
+  flow generations independently, acknowledges world readiness, and restores
+  the local main menu after cleanup. AYNetwork remains independent of AYScene,
+  and AYApplication core does not acquire a GNS dependency.
+
 ---
 
 ## 16. Changelog
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-29 | **Online content / Scene integration**：Lobby、匹配、HTTP 与 SQLite v2 统一携带逻辑内容 ID/版本/种子；新增 `OnlineFlow` GameLoop 子系统、AYApplication 帧末 staging Scene loader 和独立 `AYOnlineApplication` 桥接目标，完成 assignment 到本地内容解析、原子切场景、加载回执及返回主菜单闭环。 |
 | 2026-08-29 | **Application Online flow**：新增 `OnlineFlowCoordinator`，统一登录结果、主菜单、Lobby/Matchmaking、generation-fenced 关卡加载、游戏态与退出/注销；网络和世界双就绪门禁，活跃 assignment 优先清理，加载/清理独立超时，运行时凭据刷新及无秘密流程事件。 |
 | 2026-08-29 | **GameLoop Online subsystem**：新增 `IOnlineSubSystem`，在 Network 后统一驱动 Lobby/Matchmaking/P2P；默认组装 HTTP 后端并支持完整服务注入、运行时凭证轮换、有界退出清理和无秘密 EventBus 状态/列表事件；修复快速请求漏事件及最终成员 HTTP leave 将合法 Closed 墓碑误判为无效的问题。 |
 | 2026-08-28 | **Online Session Coordinator**：新增非阻塞 Lobby/Matchmaking 游戏侧状态机；assignment grant 直接接入 `P2PSessionCoordinator`，避免重复 join；Dedicated reservation 通过可替换 connector 交付；取消竞争按 canonical ticket 对账，并覆盖 P2P/Dedicated/失败回滚测试。 |

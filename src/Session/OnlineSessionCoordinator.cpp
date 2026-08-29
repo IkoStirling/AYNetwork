@@ -444,6 +444,12 @@ struct OnlineSessionCoordinator::Impl {
     }
 
     bool beginAssignment(MatchAssignment assignment) {
+        if (!assignment.content.isValid()) {
+            fail(OnlineSessionCoordinatorError::InvalidAssignment,
+                 OnlineServiceError::InternalError,
+                 "match assignment omitted a valid content descriptor");
+            return false;
+        }
         status.assignment = std::move(assignment);
         status.state = OnlineSessionCoordinatorState::Assigned;
         if (status.assignment.topology == MatchTopology::P2P) {
@@ -660,6 +666,7 @@ struct OnlineSessionCoordinator::Impl {
             status.lobby = std::move(result.launch.lobby);
             MatchAssignment assignment;
             assignment.topology = MatchTopology::P2P;
+            assignment.content = status.lobby.content;
             assignment.p2pGrants = std::move(result.launch.memberGrants);
             (void)beginAssignment(std::move(assignment));
             break;

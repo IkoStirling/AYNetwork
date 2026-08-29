@@ -25,6 +25,7 @@ CreateLobbyRequest lobbyRequest() {
     request.name = "Public Lobby";
     request.region = "asia";
     request.buildId = "build-1";
+    request.content = {"maps/test", "content-1", 42};
     request.capacity = 3;
     return request;
 }
@@ -36,6 +37,7 @@ MatchmakingRequest matchRequest(std::vector<PeerId> party,
     request.queue = "ranked";
     request.region = "asia";
     request.buildId = "build-1";
+    request.content = {"maps/test", "content-1", 42};
     request.topology = topology;
     request.targetPlayers = 3;
     request.virtualPort = 7350;
@@ -173,6 +175,35 @@ TEST_CASE(MatchmakingGroupsFIFOAndReturnsOnlyPartyP2PGrants) {
           partyResult.value.assignment.p2pGrants[0].session.sessionId);
     CHECK(online.getMatch(solo.value.ticketId, PeerId{"stranger"}).error ==
           OnlineServiceError::Unauthorized);
+}
+
+TEST_CASE(MatchmakingDoesNotMixDifferentContentDescriptors) {
+    ayt::test::setCurrentCase(
+        "MatchmakingDoesNotMixDifferentContentDescriptors");
+    uint64_t now = 4050;
+    InMemoryOnlineServices online({}, p2pBackend(now));
+    auto firstRequest = matchRequest({PeerId{"first"}});
+    firstRequest.targetPlayers = 2;
+    auto incompatibleRequest = matchRequest({PeerId{"incompatible"}});
+    incompatibleRequest.targetPlayers = 2;
+    incompatibleRequest.content.contentSeed = 43;
+    const auto first = online.enqueueMatch(firstRequest);
+    const auto incompatible = online.enqueueMatch(incompatibleRequest);
+    CHECK(first && incompatible);
+    CHECK_INT_EQ(online.runMatchmaking(1), 0);
+
+    auto compatibleRequest = firstRequest;
+    compatibleRequest.partyMembers = {PeerId{"compatible"}};
+    const auto compatible = online.enqueueMatch(compatibleRequest);
+    CHECK(compatible);
+    CHECK_INT_EQ(online.runMatchmaking(1), 1);
+    const auto result = online.getMatch(
+        first.value.ticketId, PeerId{"first"});
+    CHECK(result);
+    CHECK(result.value.assignment.content == firstRequest.content);
+    CHECK(online.getMatch(
+        incompatible.value.ticketId, PeerId{"incompatible"}).value.state ==
+        MatchTicketState::Queued);
 }
 
 TEST_CASE(MatchmakingAnyPrefersDedicatedAndDedicatedOnlyWaitsForCapacity) {

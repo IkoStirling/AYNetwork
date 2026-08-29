@@ -86,7 +86,7 @@ OnlineServiceError mapSessionError(SessionServiceError error) {
 bool LobbyInfo::isValid() const {
     if (lobbyId == 0 || revision == 0 || !ownerPeerId.isValid() ||
         name.empty() || !validKey(region) || !validKey(buildId) ||
-        capacity == 0 || members.size() > capacity) {
+        !content.isValid() || capacity == 0 || members.size() > capacity) {
         return false;
     }
     // The final member leaving returns a closed tombstone so remote clients
@@ -162,6 +162,7 @@ struct InMemoryOnlineServices::Impl {
                          const MatchmakingRequest& right) const {
         return left.queue == right.queue && left.region == right.region &&
                left.buildId == right.buildId &&
+               left.content == right.content &&
                left.topology == right.topology &&
                left.targetPlayers == right.targetPlayers &&
                left.virtualPort == right.virtualPort;
@@ -198,7 +199,8 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::createLobby(
     const CreateLobbyRequest& request) {
     if (!request.ownerPeerId.isValid() || request.name.empty() ||
         request.name.size() > kMaxNameBytes || !validKey(request.region) ||
-        !validKey(request.buildId) || request.capacity == 0 ||
+        !validKey(request.buildId) || !request.content.isValid() ||
+        request.capacity == 0 ||
         request.capacity > _impl->config.maxLobbyCapacity) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::InvalidRequest, "invalid lobby request");
@@ -220,6 +222,7 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::createLobby(
     info.name = request.name;
     info.region = request.region;
     info.buildId = request.buildId;
+    info.content = request.content;
     info.capacity = request.capacity;
     info.state = LobbyState::Open;
     info.members.push_back(request.ownerPeerId);
@@ -676,7 +679,8 @@ OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::enqueueMatch(
     const MatchmakingRequest& request) {
     if (!validParty(request.partyMembers, request.targetPlayers) ||
         !validKey(request.queue) || !validKey(request.region) ||
-        !validKey(request.buildId) || request.targetPlayers < 2 ||
+        !validKey(request.buildId) || !request.content.isValid() ||
+        request.targetPlayers < 2 ||
         request.virtualPort == 0 ||
         request.targetPlayers > _impl->config.maxMatchPlayers) {
         return OnlineServiceResult<MatchTicketInfo>::failure(
@@ -796,6 +800,7 @@ size_t InMemoryOnlineServices::runMatchmaking(size_t maxMatches) {
         }
 
         MatchAssignment assignment;
+        assignment.content = matchRequest.content;
         OnlineServiceError failure = OnlineServiceError::None;
         std::string failureMessage;
         if (matchRequest.topology == MatchTopology::Dedicated ||
@@ -866,6 +871,7 @@ size_t InMemoryOnlineServices::runMatchmaking(size_t maxMatches) {
             }
             info.state = MatchTicketState::Matched;
             info.assignment.topology = assignment.topology;
+            info.assignment.content = assignment.content;
             if (assignment.topology == MatchTopology::Dedicated) {
                 info.assignment.dedicated = assignment.dedicated;
             } else {

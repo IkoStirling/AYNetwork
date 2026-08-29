@@ -2,6 +2,7 @@
 
 #include <AYEventSystem/EventBus.h>
 #include <AYNetwork/Session/OnlineFlowCoordinator.h>
+#include <AYNetwork/Session/OnlineFlowSubSystem.h>
 #include <AYTest.h>
 
 #include <cstdint>
@@ -146,6 +147,7 @@ public:
         info.name = "Visible lobby";
         info.region = "asia";
         info.buildId = "build-1";
+        info.content = {"maps/flow", "content-1", 11};
         info.capacity = 4;
         info.state = LobbyState::Open;
         info.members = {PeerId{"owner"}};
@@ -161,6 +163,7 @@ public:
         session.lobby.name = "Flow lobby";
         session.lobby.region = "asia";
         session.lobby.buildId = "build-1";
+        session.lobby.content = {"maps/flow", "content-1", 11};
         session.lobby.capacity = 4;
         session.lobby.state = LobbyState::Open;
         session.lobby.members = {PeerId{"flow-peer"}};
@@ -169,6 +172,7 @@ public:
 
     void connectP2PSession(bool active) {
         session.topology = OnlineSessionTopology::P2P;
+        session.assignment.content = {"maps/flow", "content-1", 11};
         session.state = active ? OnlineSessionCoordinatorState::InSession
                                : OnlineSessionCoordinatorState::Connecting;
         p2p.backendSession.sessionId = 700;
@@ -213,6 +217,7 @@ MatchmakingRequest flowMatchRequest() {
     request.queue = "default";
     request.region = "asia";
     request.buildId = "build-1";
+    request.content = {"maps/flow", "content-1", 11};
     request.topology = MatchTopology::P2P;
     request.targetPlayers = 2;
     request.virtualPort = 7350;
@@ -224,6 +229,7 @@ CreateLobbyRequest flowLobbyRequest() {
     request.name = "Flow lobby";
     request.region = "asia";
     request.buildId = "build-1";
+    request.content = {"maps/flow", "content-1", 11};
     request.capacity = 4;
     return request;
 }
@@ -425,6 +431,31 @@ TEST_CASE(CommandsRejectWrongStateWithoutMutatingBackend) {
     CHECK(!flow.startMatchmaking(flowMatchRequest()));
     CHECK(flow.getStatus().error == OnlineFlowError::CommandRejected);
     CHECK_INT_EQ(online.matchCalls, 0);
+}
+
+TEST_CASE(FlowSubSystemRunsAfterOnlineAndOwnsCoordinatorLifecycle) {
+    ayt::test::setCurrentCase(
+        "FlowSubSystemRunsAfterOnlineAndOwnsCoordinatorLifecycle");
+    FlowOnlineSubSystem online;
+    online.authenticated = true;
+    ayt::event::EventBus eventBus;
+    auto subsystem = createOnlineFlowSubSystem(online, {}, &eventBus);
+
+    CHECK(subsystem != nullptr);
+    CHECK(subsystem->getDescriptor().phases ==
+          ayt::game::phaseBit(ayt::game::FramePhase::Ingress));
+    CHECK(subsystem->getDescriptor().runsAfter.size() == 1);
+    CHECK(std::string{subsystem->getDescriptor().runsAfter.front()} == "Online");
+    CHECK(subsystem->initialize());
+    CHECK(subsystem->isReady());
+    CHECK(subsystem->coordinator() != nullptr);
+    CHECK(subsystem->coordinator()->getStatus().state ==
+          OnlineFlowState::MainMenu);
+
+    subsystem->update(0.0f);
+    subsystem->shutdown();
+    CHECK(!subsystem->isReady());
+    CHECK(subsystem->coordinator() == nullptr);
 }
 
 TEST_SUITE_END

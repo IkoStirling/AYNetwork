@@ -24,7 +24,7 @@ constexpr size_t kMaxNameBytes = 128;
 constexpr size_t kMaxKeyBytes = 64;
 constexpr size_t kMaxAddressBytes = 255;
 constexpr size_t kMaxAssignmentBytes = 2u * 1024u * 1024u;
-constexpr uint8_t kSchemaVersion = 1;
+constexpr uint8_t kSchemaVersion = 2;
 constexpr char kHex[] = "0123456789abcdef";
 constexpr std::array<uint8_t, 32> kStorageCheck = {
     'A','Y','N','e','t','w','o','r','k','-','O','n','l','i','n','e',
@@ -61,7 +61,8 @@ bool validParty(const std::vector<PeerId>& party, uint16_t target) {
 bool matchCompatible(const MatchmakingRequest& left,
                      const MatchmakingRequest& right) {
     return left.queue == right.queue && left.region == right.region &&
-           left.buildId == right.buildId && left.topology == right.topology &&
+           left.buildId == right.buildId && left.content == right.content &&
+           left.topology == right.topology &&
            left.targetPlayers == right.targetPlayers &&
            left.virtualPort == right.virtualPort;
 }
@@ -313,6 +314,9 @@ bool serializeAssignment(const MatchAssignment& assignment,
             grants.push_back(grantToJson(grant));
         }
         json value{{"topology", static_cast<uint8_t>(assignment.topology)},
+                   {"content_id", assignment.content.contentId},
+                   {"content_version", assignment.content.contentVersion},
+                   {"content_seed", assignment.content.contentSeed},
                    {"grants", std::move(grants)},
                    {"dedicated", assignment.dedicated.isValid()
                         ? allocationToJson(assignment.dedicated) : json(nullptr)}};
@@ -331,6 +335,11 @@ bool deserializeAssignment(const std::vector<uint8_t>& bytes,
         if (topology > static_cast<uint8_t>(MatchTopology::Any)) return false;
         MatchAssignment parsed;
         parsed.topology = static_cast<MatchTopology>(topology);
+        parsed.content.contentId = value.at("content_id").get<std::string>();
+        parsed.content.contentVersion =
+            value.at("content_version").get<std::string>();
+        parsed.content.contentSeed = value.at("content_seed").get<uint64_t>();
+        if (!parsed.content.isValid()) return false;
         for (const auto& item : value.at("grants")) {
             P2PSessionGrant grant;
             if (!grantFromJson(item, grant)) return false;
@@ -441,7 +450,9 @@ struct SqliteOnlineServices::Impl {
             "CREATE TABLE IF NOT EXISTS ay_online_lobbies("
             "lobby_id INTEGER PRIMARY KEY,revision INTEGER NOT NULL,"
             "owner_peer TEXT NOT NULL,name TEXT NOT NULL,region TEXT NOT NULL,"
-            "build_id TEXT NOT NULL,capacity INTEGER NOT NULL,state INTEGER NOT NULL,"
+            "build_id TEXT NOT NULL,content_id TEXT NOT NULL,"
+            "content_version TEXT NOT NULL,content_seed INTEGER NOT NULL,"
+            "capacity INTEGER NOT NULL,state INTEGER NOT NULL,"
             "session_id INTEGER NOT NULL DEFAULT 0,launch_claim TEXT NOT NULL DEFAULT '',"
             "launch_expires INTEGER NOT NULL DEFAULT 0);"
             "CREATE INDEX IF NOT EXISTS ay_online_lobby_filter ON "
@@ -467,7 +478,9 @@ struct SqliteOnlineServices::Impl {
             "CREATE TABLE IF NOT EXISTS ay_online_tickets("
             "queue_seq INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL UNIQUE,"
             "state INTEGER NOT NULL,queue_name TEXT NOT NULL,region TEXT NOT NULL,"
-            "build_id TEXT NOT NULL,topology INTEGER NOT NULL,target_players INTEGER NOT NULL,"
+            "build_id TEXT NOT NULL,content_id TEXT NOT NULL,"
+            "content_version TEXT NOT NULL,content_seed INTEGER NOT NULL,"
+            "topology INTEGER NOT NULL,target_players INTEGER NOT NULL,"
             "virtual_port INTEGER NOT NULL,failure TEXT NOT NULL DEFAULT '',"
             "assignment BLOB,match_claim TEXT NOT NULL DEFAULT '',"
             "claim_expires INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,"
@@ -575,7 +588,8 @@ struct SqliteOnlineServices::Impl {
 
     bool loadLobby(LobbyId lobbyId, LobbyInfo& info) {
         Statement lobby(database,
-            "SELECT revision,owner_peer,name,region,build_id,capacity,state,session_id "
+            "SELECT revision,owner_peer,name,region,build_id,content_id,"
+            "content_version,content_seed,capacity,state,session_id "
             "FROM ay_online_lobbies WHERE lobby_id=?1");
         if (!lobby || !bindU64(lobby.get(), 1, lobbyId) ||
             sqlite3_step(lobby.get()) != SQLITE_ROW) return false;
@@ -586,11 +600,15 @@ struct SqliteOnlineServices::Impl {
         parsed.name = columnText(lobby.get(), 2);
         parsed.region = columnText(lobby.get(), 3);
         parsed.buildId = columnText(lobby.get(), 4);
-        parsed.capacity = static_cast<uint16_t>(sqlite3_column_int(lobby.get(), 5));
-        const int state = sqlite3_column_int(lobby.get(), 6);
+        parsed.content.contentId = columnText(lobby.get(), 5);
+        parsed.content.contentVersion = columnText(lobby.get(), 6);
+        parsed.content.contentSeed = static_cast<uint64_t>(
+            sqlite3_column_int64(lobby.get(), 7));
+        parsed.capacity = static_cast<uint16_t>(sqlite3_column_int(lobby.get(), 8));
+        const int state = sqlite3_column_int(lobby.get(), 9);
         if (state < 0 || state > static_cast<int>(LobbyState::Closed)) return false;
         parsed.state = static_cast<LobbyState>(state);
-        parsed.sessionId = static_cast<uint64_t>(sqlite3_column_int64(lobby.get(), 7));
+        parsed.sessionId = static_cast<uint64_t>(sqlite3_column_int64(lobby.get(), 10));
         Statement members(database,
             "SELECT peer_id FROM ay_online_lobby_members WHERE lobby_id=?1 "
             "ORDER BY ordinal");
@@ -642,26 +660,31 @@ struct SqliteOnlineServices::Impl {
 
     bool loadTicket(MatchTicketId ticketId, MatchTicketInfo& info) {
         Statement statement(database,
-            "SELECT state,queue_name,region,build_id,topology,target_players,"
-            "virtual_port,failure,assignment FROM ay_online_tickets WHERE ticket_id=?1");
+            "SELECT state,queue_name,region,build_id,content_id,content_version,"
+            "content_seed,topology,target_players,virtual_port,failure,assignment "
+            "FROM ay_online_tickets WHERE ticket_id=?1");
         if (!statement || !bindU64(statement.get(), 1, ticketId) ||
             sqlite3_step(statement.get()) != SQLITE_ROW) return false;
         MatchTicketInfo parsed;
         parsed.ticketId = ticketId;
         const int state = sqlite3_column_int(statement.get(), 0);
-        const int topology = sqlite3_column_int(statement.get(), 4);
+        const int topology = sqlite3_column_int(statement.get(), 7);
         if (state < 0 || state > static_cast<int>(MatchTicketState::Failed) ||
             topology < 0 || topology > static_cast<int>(MatchTopology::Any)) return false;
         parsed.state = static_cast<MatchTicketState>(state);
         parsed.request.queue = columnText(statement.get(), 1);
         parsed.request.region = columnText(statement.get(), 2);
         parsed.request.buildId = columnText(statement.get(), 3);
+        parsed.request.content.contentId = columnText(statement.get(), 4);
+        parsed.request.content.contentVersion = columnText(statement.get(), 5);
+        parsed.request.content.contentSeed = static_cast<uint64_t>(
+            sqlite3_column_int64(statement.get(), 6));
         parsed.request.topology = static_cast<MatchTopology>(topology);
         parsed.request.targetPlayers = static_cast<uint16_t>(
-            sqlite3_column_int(statement.get(), 5));
+            sqlite3_column_int(statement.get(), 8));
         parsed.request.virtualPort = static_cast<uint16_t>(
-            sqlite3_column_int(statement.get(), 6));
-        parsed.failure = columnText(statement.get(), 7);
+            sqlite3_column_int(statement.get(), 9));
+        parsed.failure = columnText(statement.get(), 10);
         Statement members(database,
             "SELECT peer_id FROM ay_online_ticket_members WHERE ticket_id=?1 "
             "ORDER BY ordinal");
@@ -671,11 +694,12 @@ struct SqliteOnlineServices::Impl {
         }
         if (!validParty(parsed.request.partyMembers, parsed.request.targetPlayers) ||
             !validKey(parsed.request.queue) || !validKey(parsed.request.region) ||
-            !validKey(parsed.request.buildId) || parsed.request.virtualPort == 0) {
+            !validKey(parsed.request.buildId) ||
+            !parsed.request.content.isValid() || parsed.request.virtualPort == 0) {
             return false;
         }
         if (parsed.state == MatchTicketState::Matched) {
-            const auto sealed = columnBlob(statement.get(), 8);
+            const auto sealed = columnBlob(statement.get(), 11);
             std::vector<uint8_t> plain;
             if (!openSecret(config.storageKey, secretContext("ticket", ticketId),
                             sealed, plain) ||
@@ -872,6 +896,7 @@ struct SqliteOnlineServices::Impl {
             if (failure == OnlineServiceError::None) {
                 MatchAssignment perTicket;
                 perTicket.topology = assignment.topology;
+                perTicket.content = assignment.content;
                 if (assignment.topology == MatchTopology::Dedicated) {
                     perTicket.dedicated = assignment.dedicated;
                 } else {
@@ -965,7 +990,8 @@ OnlineServiceResult<LobbyInfo> SqliteOnlineServices::createLobby(
     const CreateLobbyRequest& request) {
     if (!request.ownerPeerId.isValid() || request.name.empty() ||
         request.name.size() > kMaxNameBytes || !validKey(request.region) ||
-        !validKey(request.buildId) || request.capacity == 0 ||
+        !validKey(request.buildId) || !request.content.isValid() ||
+        request.capacity == 0 ||
         request.capacity > _impl->config.maxLobbyCapacity) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::InvalidRequest, "invalid durable lobby request");
@@ -989,7 +1015,8 @@ OnlineServiceResult<LobbyInfo> SqliteOnlineServices::createLobby(
         "ay_online_lobbies", "lobby_id");
     Statement insertLobby(_impl->database,
         "INSERT INTO ay_online_lobbies(lobby_id,revision,owner_peer,name,region,"
-        "build_id,capacity,state,session_id) VALUES(?1,1,?2,?3,?4,?5,?6,?7,0)");
+        "build_id,content_id,content_version,content_seed,capacity,state,session_id) "
+        "VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)");
     Statement insertMember(_impl->database,
         "INSERT INTO ay_online_lobby_members(lobby_id,ordinal,peer_id) "
         "VALUES(?1,0,?2)");
@@ -999,8 +1026,11 @@ OnlineServiceResult<LobbyInfo> SqliteOnlineServices::createLobby(
         bindText(insertLobby.get(), 3, request.name) &&
         bindText(insertLobby.get(), 4, request.region) &&
         bindText(insertLobby.get(), 5, request.buildId) &&
-        sqlite3_bind_int(insertLobby.get(), 6, request.capacity) == SQLITE_OK &&
-        sqlite3_bind_int(insertLobby.get(), 7,
+        bindText(insertLobby.get(), 6, request.content.contentId) &&
+        bindText(insertLobby.get(), 7, request.content.contentVersion) &&
+        bindU64(insertLobby.get(), 8, request.content.contentSeed) &&
+        sqlite3_bind_int(insertLobby.get(), 9, request.capacity) == SQLITE_OK &&
+        sqlite3_bind_int(insertLobby.get(), 10,
             static_cast<int>(LobbyState::Open)) == SQLITE_OK &&
         sqlite3_step(insertLobby.get()) == SQLITE_DONE &&
         bindU64(insertMember.get(), 1, id) &&
@@ -1894,7 +1924,8 @@ OnlineServiceResult<MatchTicketInfo> SqliteOnlineServices::enqueueMatch(
     const MatchmakingRequest& request) {
     if (!validParty(request.partyMembers, request.targetPlayers) ||
         !validKey(request.queue) || !validKey(request.region) ||
-        !validKey(request.buildId) || request.targetPlayers < 2 ||
+        !validKey(request.buildId) || !request.content.isValid() ||
+        request.targetPlayers < 2 ||
         request.targetPlayers > _impl->config.maxMatchPlayers ||
         request.virtualPort == 0 ||
         static_cast<uint8_t>(request.topology) >
@@ -1952,19 +1983,23 @@ OnlineServiceResult<MatchTicketInfo> SqliteOnlineServices::enqueueMatch(
         "ay_online_tickets", "ticket_id");
     Statement insert(_impl->database,
         "INSERT INTO ay_online_tickets(ticket_id,state,queue_name,region,build_id,"
-        "topology,target_players,virtual_port,created_at) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)");
+        "content_id,content_version,content_seed,topology,target_players,"
+        "virtual_port,created_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)");
     const bool inserted = id != 0 && insert && bindU64(insert.get(), 1, id) &&
         sqlite3_bind_int(insert.get(), 2,
             static_cast<int>(MatchTicketState::Queued)) == SQLITE_OK &&
         bindText(insert.get(), 3, request.queue) &&
         bindText(insert.get(), 4, request.region) &&
         bindText(insert.get(), 5, request.buildId) &&
-        sqlite3_bind_int(insert.get(), 6,
+        bindText(insert.get(), 6, request.content.contentId) &&
+        bindText(insert.get(), 7, request.content.contentVersion) &&
+        bindU64(insert.get(), 8, request.content.contentSeed) &&
+        sqlite3_bind_int(insert.get(), 9,
             static_cast<int>(request.topology)) == SQLITE_OK &&
-        sqlite3_bind_int(insert.get(), 7, request.targetPlayers) == SQLITE_OK &&
-        sqlite3_bind_int(insert.get(), 8, request.virtualPort) == SQLITE_OK &&
-        bindU64(insert.get(), 9, _impl->now()) &&
+        sqlite3_bind_int(insert.get(), 10, request.targetPlayers) == SQLITE_OK &&
+        sqlite3_bind_int(insert.get(), 11, request.virtualPort) == SQLITE_OK &&
+        bindU64(insert.get(), 12, _impl->now()) &&
         sqlite3_step(insert.get()) == SQLITE_DONE;
     if (!inserted) {
         _impl->rollback();
@@ -2103,6 +2138,7 @@ size_t SqliteOnlineServices::runMatchmaking(size_t maxMatches) {
         }
 
         MatchAssignment assignment;
+        assignment.content = request.content;
         OnlineServiceError failure = OnlineServiceError::None;
         std::string failureMessage;
         if (request.topology == MatchTopology::Dedicated ||

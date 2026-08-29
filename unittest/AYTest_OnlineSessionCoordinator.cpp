@@ -196,6 +196,7 @@ public:
         info.ticketId = ticketId;
         info.state = MatchTicketState::Matched;
         info.assignment.topology = MatchTopology::P2P;
+        info.assignment.content = {"maps/coordinator", "content-1", 7};
         return OnlineServiceResult<MatchTicketInfo>::success(std::move(info));
     }
     OnlineServiceResult<MatchTicketInfo> cancelMatch(
@@ -263,6 +264,7 @@ public:
         info.ticketId = ticketId;
         info.state = MatchTicketState::Matched;
         info.assignment.topology = MatchTopology::P2P;
+        info.assignment.content = {"maps/coordinator", "content-1", 7};
         info.assignment.p2pGrants.push_back(grant);
         return OnlineServiceResult<MatchTicketInfo>::success(std::move(info));
     }
@@ -338,6 +340,7 @@ CreateLobbyRequest lobbyRequest(const char* owner = "owner") {
     request.name = "Coordinator Lobby";
     request.region = "asia";
     request.buildId = "build-1";
+    request.content = {"maps/coordinator", "content-1", 7};
     request.capacity = 2;
     return request;
 }
@@ -348,6 +351,7 @@ MatchmakingRequest matchRequest(const char* peer, MatchTopology topology) {
     request.queue = "coordinator";
     request.region = "asia";
     request.buildId = "build-1";
+    request.content = {"maps/coordinator", "content-1", 7};
     request.topology = topology;
     request.targetPlayers = 2;
     request.virtualPort = 7350;

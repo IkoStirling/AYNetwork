@@ -33,6 +33,7 @@ bool samePublishedStatus(const OnlineFlowStatus& a,
            a.sessionError == b.sessionError &&
            a.serviceError == b.serviceError && a.p2pError == b.p2pError &&
            a.topology == b.topology &&
+           a.content == b.content &&
            a.loadingGeneration == b.loadingGeneration &&
            a.worldLoaded == b.worldLoaded && a.lobbyId == b.lobbyId &&
            a.matchTicketId == b.matchTicketId &&
@@ -86,6 +87,8 @@ struct OnlineFlowCoordinator::Impl {
         out.p2pError = session.p2pError != P2PSessionCoordinatorError::None
             ? session.p2pError : p2p.error;
         out.topology = session.topology;
+        out.content = session.assignment.content.isValid()
+            ? session.assignment.content : session.lobby.content;
         out.loadingGeneration = loadingGeneration;
         out.worldLoaded = worldLoaded;
         out.lobbyId = session.lobby.lobbyId;

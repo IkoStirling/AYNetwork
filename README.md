@@ -182,6 +182,14 @@ Lobby/Matchmaking → LoadingSession → InSession → MainMenu`。账号层把�
 generation 回调 `completeLoading()` 或 `failLoading()`。网络就绪与关卡加载必须同时完成
 才能进入游戏，退出/注销会按“活跃会话、票据、Lobby”的顺序清理并受独立超时保护。
 
+Lobby 与 Matchmaking 现在携带后端签发的逻辑内容身份（`contentId / contentVersion /
+contentSeed`），而不是客户端文件路径。匹配兼容性要求三者完全一致；assignment 和
+Lobby launch 会把同一身份交给所有成员。SQLite Online store schema 已升到 v2，旧的
+开发数据库会被启动门禁拒绝（当前无兼容项目，需删除旧库后重建）。可选目标
+`AYOnlineApplication` 提供本地内容目录解析、帧末原子 Scene 切换、加载 generation 回执与
+离开会话后的主菜单恢复；接入示例见
+[`AYApplication/docs/online-application.md`](../AYApplication/docs/online-application.md)。
+
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。
 

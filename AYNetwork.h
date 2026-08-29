@@ -5,5 +5,6 @@
 #include <AYNetwork/NetworkModule.h>
 #include <AYNetwork/Session/OnlineFlowCoordinator.h>
 #include <AYNetwork/Session/OnlineFlowEvents.h>
+#include <AYNetwork/Session/OnlineFlowSubSystem.h>
 #include <AYNetwork/Session/OnlineSessionEvents.h>
 #include <AYNetwork/Session/OnlineSubSystem.h>

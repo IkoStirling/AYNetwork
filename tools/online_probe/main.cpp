@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
     create.name = "E2E Lobby";
     create.region = "test-region";
     create.buildId = "test-build";
+    create.content = {"maps/e2e", "content-1", 123};
     create.capacity = 2;
     const auto lobby = owner.createLobby(create);
     if (!lobby) return 10;
@@ -87,6 +88,7 @@ int main(int argc, char** argv) {
     first.queue = "e2e";
     first.region = "test-region";
     first.buildId = "test-build";
+    first.content = {"maps/e2e", "content-1", 123};
     first.topology = ayt::net::MatchTopology::P2P;
     first.targetPlayers = 2;
     first.virtualPort = 7351;

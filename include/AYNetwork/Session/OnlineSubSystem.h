@@ -97,7 +97,8 @@ std::unique_ptr<IOnlineSubSystem> createOnlineSubSystem(
 // ensures the Network subsystem is registered and is idempotent by name.
 bool registerOnlineSubSystem(
     OnlineSubSystemConfig config,
-    OnlineSubSystemDependencies dependencies = {});
+    OnlineSubSystemDependencies dependencies = {},
+    ::ayt::event::EventBus* eventBus = nullptr);
 
 IOnlineSubSystem* findRegisteredOnlineSubSystem();
 

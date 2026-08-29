@@ -6,6 +6,7 @@
 #include <AYNetwork/SessionService.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -54,6 +55,23 @@ using LobbyId = uint64_t;
 
 enum class LobbyState : uint8_t { Open = 0, Launching, InSession, Closed };
 
+// Backend-issued logical content identity. contentId is resolved by the game
+// to a local asset; it is never interpreted as a client filesystem path.
+struct OnlineContentDescriptor {
+    std::string contentId;
+    std::string contentVersion;
+    uint64_t contentSeed = 0;
+
+    bool isValid() const {
+        return !contentId.empty() && contentId.size() <= 128 &&
+               !contentVersion.empty() && contentVersion.size() <= 64 &&
+               contentSeed <= static_cast<uint64_t>(
+                   (std::numeric_limits<int64_t>::max)());
+    }
+
+    bool operator==(const OnlineContentDescriptor&) const = default;
+};
+
 struct LobbyInfo {
     LobbyId lobbyId = 0;
     uint64_t revision = 0;
@@ -61,6 +79,7 @@ struct LobbyInfo {
     std::string name;
     std::string region;
     std::string buildId;
+    OnlineContentDescriptor content;
     uint16_t capacity = 0;
     LobbyState state = LobbyState::Closed;
     std::vector<PeerId> members;
@@ -74,6 +93,7 @@ struct CreateLobbyRequest {
     std::string name;
     std::string region;
     std::string buildId;
+    OnlineContentDescriptor content;
     uint16_t capacity = 8;
 };
 
@@ -215,6 +235,7 @@ struct MatchmakingRequest {
     std::string queue;
     std::string region;
     std::string buildId;
+    OnlineContentDescriptor content;
     MatchTopology topology = MatchTopology::Any;
     uint16_t targetPlayers = 2;
     uint16_t virtualPort = 7350;
@@ -222,6 +243,7 @@ struct MatchmakingRequest {
 
 struct MatchAssignment {
     MatchTopology topology = MatchTopology::P2P;
+    OnlineContentDescriptor content;
     std::vector<P2PSessionGrant> p2pGrants;
     DedicatedAllocation dedicated;
 };

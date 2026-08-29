@@ -44,6 +44,8 @@ struct OnlineFlowStatus {
     P2PSessionCoordinatorError p2pError =
         P2PSessionCoordinatorError::None;
     OnlineSessionTopology topology = OnlineSessionTopology::None;
+    // Pull-only because status events remain trivially copyable and secret-free.
+    OnlineContentDescriptor content;
 
     uint64_t loadingGeneration = 0;
     bool worldLoaded = false;

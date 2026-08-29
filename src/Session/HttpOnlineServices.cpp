@@ -228,12 +228,31 @@ bool grantFromJson(const json& value, P2PSessionGrant& out) {
     } catch (...) { out = {}; return false; }
 }
 
+json contentToJson(const OnlineContentDescriptor& value) {
+    return {{"content_id", value.contentId},
+            {"content_version", value.contentVersion},
+            {"content_seed", value.contentSeed}};
+}
+
+bool contentFromJson(const json& value, OnlineContentDescriptor& out) {
+    try {
+        OnlineContentDescriptor parsed;
+        parsed.contentId = value.at("content_id").get<std::string>();
+        parsed.contentVersion = value.at("content_version").get<std::string>();
+        if (!readUnsigned(value, "content_seed", parsed.contentSeed) ||
+            !parsed.isValid()) return false;
+        out = std::move(parsed);
+        return true;
+    } catch (...) { out = {}; return false; }
+}
+
 json lobbyToJson(const LobbyInfo& value) {
     json members = json::array();
     for (const PeerId& peer : value.members) members.push_back(peer.value);
     return {{"lobby_id", value.lobbyId}, {"revision", value.revision},
             {"owner_peer_id", value.ownerPeerId.value}, {"name", value.name},
             {"region", value.region}, {"build_id", value.buildId},
+            {"content", contentToJson(value.content)},
             {"capacity", value.capacity},
             {"state", static_cast<uint8_t>(value.state)},
             {"members", std::move(members)}, {"session_id", value.sessionId}};
@@ -252,6 +271,7 @@ bool lobbyFromJson(const json& value, LobbyInfo& out) {
         parsed.name = value.at("name").get<std::string>();
         parsed.region = value.at("region").get<std::string>();
         parsed.buildId = value.at("build_id").get<std::string>();
+        if (!contentFromJson(value.at("content"), parsed.content)) return false;
         parsed.state = static_cast<LobbyState>(state);
         for (const auto& peer : value.at("members")) {
             parsed.members.push_back(PeerId{peer.get<std::string>()});
@@ -322,6 +342,7 @@ json matchRequestToJson(const MatchmakingRequest& value) {
     for (const PeerId& peer : value.partyMembers) members.push_back(peer.value);
     return {{"party_members", std::move(members)}, {"queue", value.queue},
             {"region", value.region}, {"build_id", value.buildId},
+            {"content", contentToJson(value.content)},
             {"topology", static_cast<uint8_t>(value.topology)},
             {"target_players", value.targetPlayers},
             {"virtual_port", value.virtualPort}};
@@ -337,6 +358,7 @@ bool matchRequestFromJson(const json& value, MatchmakingRequest& out) {
         parsed.queue = value.at("queue").get<std::string>();
         parsed.region = value.at("region").get<std::string>();
         parsed.buildId = value.at("build_id").get<std::string>();
+        if (!contentFromJson(value.at("content"), parsed.content)) return false;
         parsed.topology = static_cast<MatchTopology>(topology);
         for (const auto& peer : value.at("party_members")) {
             parsed.partyMembers.push_back(PeerId{peer.get<std::string>()});
@@ -351,11 +373,14 @@ json matchTicketToJson(const MatchTicketInfo& value) {
     for (const auto& grant : value.assignment.p2pGrants) {
         grants.push_back(grantToJson(grant));
     }
+    const auto& assignmentContent = value.assignment.content.isValid()
+        ? value.assignment.content : value.request.content;
     return {{"ticket_id", value.ticketId},
             {"state", static_cast<uint8_t>(value.state)},
             {"request", matchRequestToJson(value.request)},
             {"assignment", {{"topology", static_cast<uint8_t>(
                                 value.assignment.topology)},
+                            {"content", contentToJson(assignmentContent)},
                             {"p2p_grants", std::move(grants)},
                             {"dedicated", allocationToJson(
                                 value.assignment.dedicated)}}},
@@ -374,6 +399,8 @@ bool matchTicketFromJson(const json& value, MatchTicketInfo& out) {
             topology > 2) return false;
         parsed.state = static_cast<MatchTicketState>(state);
         parsed.assignment.topology = static_cast<MatchTopology>(topology);
+        if (!contentFromJson(value.at("assignment").at("content"),
+                             parsed.assignment.content)) return false;
         parsed.failure = value.at("failure").get<std::string>();
         for (const auto& grant : value.at("assignment").at("p2p_grants")) {
             P2PSessionGrant parsedGrant;
@@ -513,7 +540,9 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::createLobby(
             OnlineServiceError::Unauthorized, "local lobby actor does not match token");
     }
     const json body{{"name", request.name}, {"region", request.region},
-                    {"build_id", request.buildId}, {"capacity", request.capacity}};
+                    {"build_id", request.buildId},
+                    {"content", contentToJson(request.content)},
+                    {"capacity", request.capacity}};
     const auto response = _impl->invoke([&](httplib::Client& client) {
         return client.Post("/v1/lobbies", _impl->playerHeaders(token), body.dump(),
                            "application/json");
@@ -909,6 +938,9 @@ void installHttpOnlineServicesRoutes(
                 input.region = body.at("region").get<std::string>();
                 input.buildId = body.at("build_id").get<std::string>();
             } catch (...) { badRequest(response, "invalid lobby body"); return; }
+            if (!contentFromJson(body.value("content", json{}), input.content)) {
+                badRequest(response, "invalid lobby content"); return;
+            }
             if (!readUnsigned(body, "capacity", input.capacity)) {
                 badRequest(response, "invalid lobby capacity"); return;
             }

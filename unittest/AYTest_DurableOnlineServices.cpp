@@ -85,6 +85,7 @@ CreateLobbyRequest durableLobbyRequest() {
     request.name = "Durable Lobby";
     request.region = "asia";
     request.buildId = "build-1";
+    request.content = {"maps/durable", "content-1", 99};
     request.capacity = 4;
     return request;
 }
@@ -95,6 +96,7 @@ MatchmakingRequest durableMatchRequest(const char* peer) {
     request.queue = "ranked";
     request.region = "asia";
     request.buildId = "build-1";
+    request.content = {"maps/durable", "content-1", 99};
     request.topology = MatchTopology::P2P;
     request.targetPlayers = 2;
     request.virtualPort = 7350;
@@ -158,6 +160,7 @@ TEST_CASE(RestartPreservesLobbyServerAllocationAndQueuedTicket) {
     CHECK(lobby);
     CHECK_INT_EQ(lobby.value.revision, joined.revision);
     CHECK(lobby.value.members == joined.members);
+    CHECK(lobby.value.content == durableLobbyRequest().content);
     CHECK(restarted.heartbeatServer(server.credential));
     CHECK(restarted.releaseAllocation(
         allocation.allocationId, allocation.reservationToken));
@@ -165,6 +168,8 @@ TEST_CASE(RestartPreservesLobbyServerAllocationAndQueuedTicket) {
         ticket.ticketId, PeerId{"durable-owner"});
     CHECK(observed);
     CHECK(observed.value.state == MatchTicketState::Queued);
+    CHECK(observed.value.request.content ==
+          durableMatchRequest("durable-owner").content);
 }
 
 TEST_CASE(MatchedAssignmentSurvivesRestartAndCredentialsStayEncrypted) {
@@ -196,6 +201,8 @@ TEST_CASE(MatchedAssignmentSurvivesRestartAndCredentialsStayEncrypted) {
         const auto secondMatch = service.getMatch(
             second.value.ticketId, PeerId{"durable-b"});
         CHECK(firstMatch && secondMatch);
+        CHECK(firstMatch.value.assignment.content ==
+              durableMatchRequest("durable-a").content);
         firstResult = firstMatch.value;
         secondResult = secondMatch.value;
         const auto registered = service.registerServer(durableServerRequest());

@@ -451,7 +451,8 @@ IOnlineSubSystem* findRegisteredOnlineSubSystem() {
 }
 
 bool registerOnlineSubSystem(OnlineSubSystemConfig config,
-                             OnlineSubSystemDependencies dependencies) {
+                             OnlineSubSystemDependencies dependencies,
+                             ::ayt::event::EventBus* eventBus) {
     if (findRegisteredOnlineSubSystem()) return true;
     const bool anyInjected = dependencies.hasAnyBackendService();
     if (!config.isValid() ||
@@ -463,7 +464,7 @@ bool registerOnlineSubSystem(OnlineSubSystemConfig config,
     INetworkSubSystem* network = findRegisteredNetworkSubSystem();
     if (!network) return false;
     auto system = createOnlineSubSystem(
-        *network, std::move(config), std::move(dependencies));
+        *network, std::move(config), std::move(dependencies), eventBus);
     ::ayt::game::IGameLoop::instance().registerSubSystem(system.release());
     return findRegisteredOnlineSubSystem() != nullptr;
 }
