@@ -616,7 +616,8 @@ public:
         return messageType == kMsgTypeDelta ||
                messageType == kMsgTypeReplication ||
                messageType == kMsgTypeEntitySpawn ||
-               messageType == kMsgTypeEntityDespawn;
+               messageType == kMsgTypeEntityDespawn ||
+               messageType == kMsgTypeEntityLifecycleBatch;
     }
 
     static uint64_t hashMigrationBytes(const uint8_t* data, size_t size) {
@@ -1718,6 +1719,7 @@ public:
             case kMsgTypeReplication:
             case kMsgTypeEntitySpawn:
             case kMsgTypeEntityDespawn:
+            case kMsgTypeEntityLifecycleBatch:
             case kMsgTypeClientInput:
                 if (_stagedIngress) {
                     queueSimulationInbound(header.msgType,
@@ -1860,6 +1862,7 @@ public:
         case kMsgTypeDelta:
         case kMsgTypeEntitySpawn:
         case kMsgTypeEntityDespawn:
+        case kMsgTypeEntityLifecycleBatch:
             (void)_replicationManager.onReceive(messageType, bodyStream, from);
             break;
         case kMsgTypeClientInput: {
@@ -3275,6 +3278,15 @@ public:
         _replicationManager.setProfilerSendHook(
             [this](uint32_t connNetId, uint16_t msgType, uint64_t bytes, uint32_t ghostNetId) {
                 _profiler.recordSend(connNetId, msgType, bytes, ghostNetId);
+            });
+        _replicationManager.setSendQueueBytesProvider(
+            [this](NetConnection* connection) -> uint32_t {
+                if (!connection) return 0;
+                ProfilerSnapshot snapshot;
+                if (!_profiler.snapshotFor(connection->getId(), snapshot)) {
+                    return 0;
+                }
+                return snapshot.live.sendQueueBytes;
             });
 
         // RpcHandler: (connNetId, msgType, bytes) — no ghost association.

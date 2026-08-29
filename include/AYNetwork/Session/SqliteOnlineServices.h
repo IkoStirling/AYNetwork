@@ -18,6 +18,8 @@ struct SqliteOnlineServicesConfig {
     uint32_t busyTimeoutMs = 5000;
     uint32_t operationClaimSeconds = 30;
     uint32_t matchTicketRetentionSeconds = 24u * 60u * 60u;
+    uint32_t lobbyInvitationMaxLifetimeSeconds = 24u * 60u * 60u;
+    uint32_t matchAcceptanceSeconds = 20;
 
     size_t maxLobbies = 4096;
     size_t maxMatchTickets = 65536;
@@ -57,11 +59,15 @@ public:
         const ListLobbiesRequest& request) override;
     OnlineServiceResult<LobbyInfo> joinLobby(
         LobbyId lobbyId, const PeerId& authenticatedPeer) override;
+    OnlineServiceResult<LobbyInfo> joinLobby(
+        const JoinLobbyRequest& request) override;
     OnlineServiceResult<LobbyInfo> leaveLobby(
         LobbyId lobbyId, const PeerId& authenticatedPeer) override;
     OnlineServiceResult<LobbyInfo> updateLobby(
         const UpdateLobbyRequest& request) override;
     OnlineServiceResult<LobbyInfo> getLobby(LobbyId lobbyId) override;
+    OnlineServiceResult<LobbyInvitation> createLobbyInvitation(
+        const CreateLobbyInvitationRequest& request) override;
     OnlineServiceResult<LobbyLaunchResult> launchLobbyP2P(
         const LaunchLobbyRequest& request) override;
 
@@ -71,6 +77,8 @@ public:
         MatchTicketId ticketId, const PeerId& authenticatedPeer) override;
     OnlineServiceResult<MatchTicketInfo> cancelMatch(
         MatchTicketId ticketId, const PeerId& authenticatedPeer) override;
+    OnlineServiceResult<MatchTicketInfo> respondToMatch(
+        const MatchAcceptanceRequest& request) override;
     size_t runMatchmaking(size_t maxMatches = 1) override;
 
     OnlineServiceResult<DedicatedServerGrant> registerServer(

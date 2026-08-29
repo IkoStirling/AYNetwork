@@ -104,6 +104,63 @@ TEST_CASE(LobbyOwnerTransfersAndFiltersAreDeterministic) {
     CHECK(online.listLobbies(filter).value.empty());
 }
 
+TEST_CASE(LobbyVisibilityMetadataPasswordsAndInvitationsAreEnforced) {
+    ayt::test::setCurrentCase(
+        "LobbyVisibilityMetadataPasswordsAndInvitationsAreEnforced");
+    uint64_t now = 1500;
+    InMemoryOnlineServicesConfig config;
+    config.nowUnixSeconds = [&now] { return now; };
+    InMemoryOnlineServices online(config);
+
+    auto hiddenRequest = lobbyRequest();
+    hiddenRequest.visibility = LobbyVisibility::Private;
+    hiddenRequest.metadata = {{"mode", "duo"}, {"ruleset", "ranked"}};
+    const auto hidden = online.createLobby(hiddenRequest);
+    CHECK(hidden);
+    CHECK(online.listLobbies({"asia", "build-1", 1, 10}).value.empty());
+    CHECK(online.joinLobby(hidden.value.lobbyId, PeerId{"guest"}).error ==
+          OnlineServiceError::Unauthorized);
+
+    const auto invitation = online.createLobbyInvitation({
+        hidden.value.lobbyId, PeerId{"owner"}, hidden.value.revision, 60, 1});
+    CHECK(invitation && invitation.value.isValid());
+    JoinLobbyRequest invited;
+    invited.lobbyId = hidden.value.lobbyId;
+    invited.authenticatedPeer = PeerId{"guest"};
+    invited.invitationToken = invitation.value.token;
+    CHECK(online.joinLobby(invited));
+    invited.authenticatedPeer = PeerId{"second-guest"};
+    CHECK(online.joinLobby(invited).error == OnlineServiceError::Unauthorized);
+
+    auto protectedRequest = lobbyRequest();
+    protectedRequest.name = "Protected";
+    protectedRequest.visibility = LobbyVisibility::Unlisted;
+    protectedRequest.password = "correct horse battery staple";
+    const auto protectedLobby = online.createLobby(protectedRequest);
+    CHECK(protectedLobby && protectedLobby.value.passwordProtected);
+    JoinLobbyRequest passwordJoin;
+    passwordJoin.lobbyId = protectedLobby.value.lobbyId;
+    passwordJoin.authenticatedPeer = PeerId{"password-guest"};
+    passwordJoin.password = "wrong";
+    CHECK(online.joinLobby(passwordJoin).error == OnlineServiceError::Unauthorized);
+    passwordJoin.password = protectedRequest.password;
+    CHECK(online.joinLobby(passwordJoin));
+
+    auto publicRequest = lobbyRequest();
+    publicRequest.name = "Filterable";
+    publicRequest.metadata = {{"mode", "duo"}, {"ruleset", "casual"}};
+    CHECK(online.createLobby(publicRequest));
+    ListLobbiesRequest filter;
+    filter.region = "asia";
+    filter.buildId = "build-1";
+    filter.contentId = "maps/test";
+    filter.metadata = {{"ruleset", "casual"}};
+    const auto listed = online.listLobbies(filter);
+    CHECK(listed);
+    CHECK_INT_EQ(listed.value.size(), 1);
+    CHECK(listed.value.front().name == "Filterable");
+}
+
 TEST_CASE(DedicatedServerLeaseDrainAndAllocationCapacity) {
     ayt::test::setCurrentCase("DedicatedServerLeaseDrainAndAllocationCapacity");
     uint64_t now = 2000;
@@ -175,6 +232,93 @@ TEST_CASE(MatchmakingGroupsFIFOAndReturnsOnlyPartyP2PGrants) {
           partyResult.value.assignment.p2pGrants[0].session.sessionId);
     CHECK(online.getMatch(solo.value.ticketId, PeerId{"stranger"}).error ==
           OnlineServiceError::Unauthorized);
+}
+
+TEST_CASE(LobbyPartyMatchRequiresLeaderAndAcceptanceBeforeTransport) {
+    ayt::test::setCurrentCase(
+        "LobbyPartyMatchRequiresLeaderAndAcceptanceBeforeTransport");
+    uint64_t now = 4020;
+    InMemoryOnlineServicesConfig config;
+    config.nowUnixSeconds = [&now] { return now; };
+    config.matchAcceptanceSeconds = 10;
+    InMemoryOnlineServices online(config, p2pBackend(now));
+    const auto lobby = online.createLobby(lobbyRequest());
+    CHECK(lobby);
+    const auto joined = online.joinLobby(
+        lobby.value.lobbyId, PeerId{"guest"});
+    CHECK(joined);
+
+    auto request = matchRequest({});
+    request.targetPlayers = 2;
+    request.sourceLobbyId = joined.value.lobbyId;
+    request.sourceLobbyRevision = joined.value.revision;
+    request.partyLeaderPeerId = PeerId{"guest"};
+    CHECK(online.enqueueMatch(request).error == OnlineServiceError::Unauthorized);
+
+    request.partyLeaderPeerId = PeerId{"owner"};
+    request.requireAcceptance = true;
+    const auto queued = online.enqueueMatch(request);
+    CHECK(queued);
+    CHECK(queued.value.request.partyMembers == joined.value.members);
+    CHECK_INT_EQ(online.runMatchmaking(1), 1);
+    auto awaiting = online.getMatch(queued.value.ticketId, PeerId{"owner"});
+    CHECK(awaiting);
+    CHECK(awaiting.value.state == MatchTicketState::AwaitingAcceptance);
+    CHECK(awaiting.value.assignment.p2pGrants.empty());
+    CHECK_INT_EQ(awaiting.value.assignment.placements.size(), 2);
+
+    CHECK(online.respondToMatch(
+        {queued.value.ticketId, PeerId{"owner"}, true}));
+    const auto accepted = online.respondToMatch(
+        {queued.value.ticketId, PeerId{"guest"}, true});
+    CHECK(accepted);
+    CHECK(accepted.value.state == MatchTicketState::Matching);
+    CHECK_INT_EQ(online.runMatchmaking(1), 1);
+    const auto matched = online.getMatch(
+        queued.value.ticketId, PeerId{"owner"});
+    CHECK(matched);
+    CHECK(matched.value.state == MatchTicketState::Matched);
+    CHECK_INT_EQ(matched.value.assignment.p2pGrants.size(), 2);
+    CHECK(matched.value.assignment.matchId != 0);
+}
+
+TEST_CASE(MatchAcceptanceDeclineRequeuesOtherTicketAndBackfillUsesMinimum) {
+    ayt::test::setCurrentCase(
+        "MatchAcceptanceDeclineRequeuesOtherTicketAndBackfillUsesMinimum");
+    uint64_t now = 4030;
+    InMemoryOnlineServices online({}, p2pBackend(now));
+    auto firstRequest = matchRequest({PeerId{"first"}});
+    firstRequest.targetPlayers = 2;
+    firstRequest.requireAcceptance = true;
+    auto secondRequest = firstRequest;
+    secondRequest.partyMembers = {PeerId{"second"}};
+    const auto first = online.enqueueMatch(firstRequest);
+    const auto second = online.enqueueMatch(secondRequest);
+    CHECK(first && second);
+    CHECK_INT_EQ(online.runMatchmaking(1), 1);
+    CHECK(online.respondToMatch(
+        {first.value.ticketId, PeerId{"first"}, true}));
+    CHECK(online.respondToMatch(
+        {second.value.ticketId, PeerId{"second"}, false}));
+    CHECK(online.getMatch(first.value.ticketId, PeerId{"first"}).value.state ==
+          MatchTicketState::Queued);
+    CHECK(online.getMatch(second.value.ticketId, PeerId{"second"}).value.state ==
+          MatchTicketState::Cancelled);
+
+    InMemoryOnlineServices backfill({}, p2pBackend(now));
+    auto lowPopulation = matchRequest({PeerId{"backfill-a"}});
+    lowPopulation.targetPlayers = 4;
+    lowPopulation.minimumPlayers = 2;
+    lowPopulation.allowBackfill = true;
+    auto lowPopulationPeer = lowPopulation;
+    lowPopulationPeer.partyMembers = {PeerId{"backfill-b"}};
+    const auto a = backfill.enqueueMatch(lowPopulation);
+    const auto b = backfill.enqueueMatch(lowPopulationPeer);
+    CHECK(a && b);
+    CHECK_INT_EQ(backfill.runMatchmaking(1), 1);
+    const auto result = backfill.getMatch(a.value.ticketId, PeerId{"backfill-a"});
+    CHECK(result.value.state == MatchTicketState::Matched);
+    CHECK_INT_EQ(result.value.assignment.placements.size(), 2);
 }
 
 TEST_CASE(MatchmakingDoesNotMixDifferentContentDescriptors) {
@@ -312,6 +456,27 @@ TEST_CASE(HttpOnlineServicesDerivesIdentityAndCoversAllRouteFamilies) {
         {PeerId{"owner"}, PeerId{"guest"}});
     forged.targetPlayers = 2;
     CHECK(owner->enqueueMatch(forged).error == OnlineServiceError::Unauthorized);
+
+    auto lobbyParty = matchRequest({});
+    lobbyParty.targetPlayers = 2;
+    lobbyParty.sourceLobbyId = joined.value.lobbyId;
+    lobbyParty.sourceLobbyRevision = joined.value.revision;
+    lobbyParty.partyLeaderPeerId = PeerId{"owner"};
+    lobbyParty.requireAcceptance = true;
+    const auto lobbyTicket = owner->enqueueMatch(lobbyParty);
+    CHECK(lobbyTicket);
+    CHECK_INT_EQ(owner->runMatchmaking(1), 1);
+    CHECK(owner->getMatch(
+        lobbyTicket.value.ticketId, PeerId{"owner"}).value.state ==
+        MatchTicketState::AwaitingAcceptance);
+    CHECK(owner->respondToMatch(
+        {lobbyTicket.value.ticketId, PeerId{"owner"}, true}));
+    CHECK(guest->respondToMatch(
+        {lobbyTicket.value.ticketId, PeerId{"guest"}, true}));
+    CHECK_INT_EQ(owner->runMatchmaking(1), 1);
+    CHECK(owner->getMatch(
+        lobbyTicket.value.ticketId, PeerId{"owner"}).value.state ==
+        MatchTicketState::Matched);
 
     LaunchLobbyRequest launch;
     launch.lobbyId = created.value.lobbyId;

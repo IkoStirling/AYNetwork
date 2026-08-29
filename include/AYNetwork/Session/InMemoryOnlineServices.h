@@ -18,6 +18,8 @@ struct InMemoryOnlineServicesConfig {
     uint16_t maxDedicatedServerCapacity = 4096;
     uint32_t dedicatedLeaseSeconds = 15;
     uint32_t allocationLifetimeSeconds = 60;
+    uint32_t lobbyInvitationMaxLifetimeSeconds = 24u * 60u * 60u;
+    uint32_t matchAcceptanceSeconds = 20;
     std::function<uint64_t()> nowUnixSeconds;
 };
 
@@ -39,11 +41,15 @@ public:
         const ListLobbiesRequest& request) override;
     OnlineServiceResult<LobbyInfo> joinLobby(
         LobbyId lobbyId, const PeerId& authenticatedPeer) override;
+    OnlineServiceResult<LobbyInfo> joinLobby(
+        const JoinLobbyRequest& request) override;
     OnlineServiceResult<LobbyInfo> leaveLobby(
         LobbyId lobbyId, const PeerId& authenticatedPeer) override;
     OnlineServiceResult<LobbyInfo> updateLobby(
         const UpdateLobbyRequest& request) override;
     OnlineServiceResult<LobbyInfo> getLobby(LobbyId lobbyId) override;
+    OnlineServiceResult<LobbyInvitation> createLobbyInvitation(
+        const CreateLobbyInvitationRequest& request) override;
     OnlineServiceResult<LobbyLaunchResult> launchLobbyP2P(
         const LaunchLobbyRequest& request) override;
 
@@ -53,6 +59,8 @@ public:
         MatchTicketId ticketId, const PeerId& authenticatedPeer) override;
     OnlineServiceResult<MatchTicketInfo> cancelMatch(
         MatchTicketId ticketId, const PeerId& authenticatedPeer) override;
+    OnlineServiceResult<MatchTicketInfo> respondToMatch(
+        const MatchAcceptanceRequest& request) override;
     size_t runMatchmaking(size_t maxMatches = 1) override;
 
     OnlineServiceResult<DedicatedServerGrant> registerServer(

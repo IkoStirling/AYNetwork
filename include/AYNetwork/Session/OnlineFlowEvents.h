@@ -18,6 +18,7 @@ enum class OnlineFlowState : uint8_t {
     JoiningLobby,
     InLobby,
     Matchmaking,
+    MatchAcceptance,
     StartingSession,
     LoadingSession,
     InSession,
@@ -61,6 +62,12 @@ struct OnlineFlowStatusChangedEvent {
     uint64_t loadingGeneration = 0;
     LobbyId lobbyId = 0;
     MatchTicketId matchTicketId = 0;
+    MatchTicketState matchTicketState = MatchTicketState::Queued;
+    uint16_t acceptedPartyMembers = 0;
+    uint16_t requiredPartyMembers = 0;
+    bool matchAcceptanceRequired = false;
+    bool localMatchAccepted = false;
+    uint64_t matchAcceptanceExpiresAtUnixSeconds = 0;
     uint64_t sessionId = 0;
     uint32_t sessionEpoch = 0;
     DedicatedAllocationId dedicatedAllocationId = 0;

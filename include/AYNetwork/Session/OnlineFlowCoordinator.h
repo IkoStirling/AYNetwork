@@ -51,6 +51,12 @@ struct OnlineFlowStatus {
     bool worldLoaded = false;
     LobbyId lobbyId = 0;
     MatchTicketId matchTicketId = 0;
+    MatchTicketState matchTicketState = MatchTicketState::Queued;
+    uint16_t acceptedPartyMembers = 0;
+    uint16_t requiredPartyMembers = 0;
+    bool matchAcceptanceRequired = false;
+    bool localMatchAccepted = false;
+    uint64_t matchAcceptanceExpiresAtUnixSeconds = 0;
     uint64_t sessionId = 0;
     uint32_t sessionEpoch = 0;
     DedicatedAllocationId dedicatedAllocationId = 0;
@@ -82,12 +88,18 @@ public:
     bool browseLobbies(ListLobbiesRequest request = {});
     bool createLobby(CreateLobbyRequest request);
     bool joinLobby(LobbyId lobbyId);
+    bool joinLobby(JoinLobbyRequest request);
     bool refreshLobby();
+    bool updateLobby(UpdateLobbyRequest request);
     bool updateLobbyName(std::string name);
+    bool createLobbyInvitation(uint32_t lifetimeSeconds = 600,
+                               uint16_t maxUses = 1);
+    LobbyInvitation takeLobbyInvitation();
     bool leaveLobby();
     bool startLobbySession(uint16_t virtualPort);
 
     bool startMatchmaking(MatchmakingRequest request);
+    bool respondToMatch(bool accept);
     bool cancelMatchmaking();
 
     // Loading and active-session teardown both return to MainMenu. signOut()

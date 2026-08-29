@@ -452,6 +452,27 @@ TEST_CASE(LobbyLaunchConsumesAssignedGrantWithoutSecondBackendJoin) {
     CHECK(waitForState(coordinator, OnlineSessionCoordinatorState::InLobby));
     CHECK(coordinator.getStatus().lobby.name == "Updated Lobby");
 
+    UpdateLobbyRequest update;
+    update.name = "Configured Lobby";
+    update.replaceMetadata = true;
+    update.metadata = {{"mode", "duo"}};
+    update.setVisibility = true;
+    update.visibility = LobbyVisibility::Private;
+    update.setPassword = true;
+    update.password = "lobby-secret";
+    CHECK(coordinator.updateLobby(std::move(update)));
+    CHECK(waitForState(coordinator, OnlineSessionCoordinatorState::InLobby));
+    CHECK(coordinator.getStatus().lobby.name == "Configured Lobby");
+    CHECK(coordinator.getStatus().lobby.metadata.at("mode") == "duo");
+    CHECK(coordinator.getStatus().lobby.passwordProtected);
+
+    CHECK(coordinator.createLobbyInvitation(60, 2));
+    CHECK(waitForState(coordinator, OnlineSessionCoordinatorState::InLobby));
+    const LobbyInvitation invitation = coordinator.takeLobbyInvitation();
+    CHECK(invitation.isValid());
+    CHECK_INT_EQ(invitation.remainingUses, 2u);
+    CHECK(!coordinator.takeLobbyInvitation().isValid());
+
     CHECK(coordinator.launchLobbyP2P(7350));
     CHECK(waitForState(coordinator, OnlineSessionCoordinatorState::InSession));
     const auto status = coordinator.getStatus();

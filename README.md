@@ -120,6 +120,12 @@ Prepare 开始时成员集会被冻结；期间新的 Join/Resume 返回 `Sessio
 诊断，`unbindP2PObjectOwner()` 恢复为 `SimulatedProxy`。游戏层不应长期保存旧
 connectionId 作为 ownership 身份。
 
+高实体数量场景可通过 `ReplicationObjectPolicy` 和 `ReplicationScalabilityConfig` 启用
+AOI/距离裁剪、对象优先级、按距离降低 Delta 频率、每连接每 tick 字节预算、可靠
+Spawn/Despawn 批处理，以及发送队列软/硬背压。完整快照不会被网络 LOD 延迟；硬背压可在
+持续指定 tick 后断开慢客户端。`getLastTickStats()` 暴露预算、LOD、背压延迟和实际发送统计，
+方便场景加载器与 profiler 调参。所有限额和批处理默认关闭，保持旧项目流量行为。
+
 迁移只能继承每个候选节点已收到的复制状态；仅存在旧 Host 内存中的未复制状态、
 未持久化 RPC 副作用和连接局部状态会丢失。该机制也不是分区共识：无法互通的网络
 分区可能各自选主，游戏/匹配服务仍需 epoch 仲裁或会话终止策略。
@@ -155,9 +161,11 @@ Host/Client 通过 `HttpP2PSessionService` 创建或加入会话，再用
 ### Lobby、Matchmaking 与 Dedicated Server
 
 `OnlineServices.h` 提供后端中立的 `ILobbyService`、`IMatchmakingService` 和
-`IDedicatedServerService`。`InMemoryOnlineServices` 是线程安全参考实现：Lobby 可按
-revision CAS 更新并直接启动 P2P session；匹配支持完整 party、P2P/Dedicated/Any
-拓扑和每个 ticket 的最小秘密暴露；Dedicated 目录支持注册凭证、租约、draining、容量
+`IDedicatedServerService`。`InMemoryOnlineServices` 是线程安全参考实现：Lobby 支持
+metadata 筛选、Public/Unlisted/Private 可见性、密码与限时邀请，并可按 revision CAS 更新
+和直接启动 P2P session；Lobby Owner 同时是 Party leader。匹配支持 Lobby-backed Party、
+区域/延迟/技能容差规则、整 Party 组队、队伍平衡、接受确认、欠员开局回填，以及
+P2P/Dedicated/Any 拓扑和每个 ticket 的最小秘密暴露；Dedicated 目录支持注册凭证、租约、draining、容量
 预留和过期 fencing。`SqliteOnlineServices` 提供 WAL、事务化容量预留、多进程 expiring
 claim、重启恢复和 XChaCha20-Poly1305 凭证静态加密。`HttpOnlineServices` 提供可信身份
 派生的远程客户端，路由可与 SessionServer 共用端口；生产参考进程使用账号服务签发的
@@ -167,7 +175,8 @@ claim、重启恢复和 XChaCha20-Poly1305 凭证静态加密。`HttpOnlineServi
 游戏侧可由 `OnlineSessionCoordinator` 非阻塞编排 Lobby 和匹配票据，并把 P2P assignment
 中的现成 grant 直接交给 `P2PSessionCoordinator`，避免重复 join；Dedicated assignment
 则通过可替换的 `IDedicatedSessionConnector` 安装 reservation token、连接并回报状态。
-统一状态覆盖 `Idle / InLobby / Queueing / Assigned / Connecting / InSession / Failed`，
+统一状态覆盖 `Idle / InLobby / Queueing / AwaitingMatchAcceptance / Assigned / Connecting /
+InSession / Failed`，
 取消竞争会以 canonical ticket 结果为准，不会静默丢弃已经提交的 assignment。
 
 引擎应用推荐注册 `IOnlineSubSystem`，由它在 GameLoop 的 `Ingress` 阶段、`Network`
@@ -177,14 +186,14 @@ claim、重启恢复和 XChaCha20-Poly1305 凭证静态加密。`HttpOnlineServi
 延迟发布，退出 Play Session 时会在有界时间内取消票据、离开会话和 Lobby。
 
 `OnlineFlowCoordinator` 再向上提供不绑定 UI/场景实现的应用流程：`SignedOut → MainMenu →
-Lobby/Matchmaking → LoadingSession → InSession → MainMenu`。账号层把签发结果交给
+Lobby/Matchmaking → MatchAcceptance → LoadingSession → InSession → MainMenu`。账号层把签发结果交给
 `signIn()`/`refreshCredentials()`；关卡层订阅 `OnlineFlowLoadRequestedEvent`，使用同一
 generation 回调 `completeLoading()` 或 `failLoading()`。网络就绪与关卡加载必须同时完成
 才能进入游戏，退出/注销会按“活跃会话、票据、Lobby”的顺序清理并受独立超时保护。
 
 Lobby 与 Matchmaking 现在携带后端签发的逻辑内容身份（`contentId / contentVersion /
 contentSeed`），而不是客户端文件路径。匹配兼容性要求三者完全一致；assignment 和
-Lobby launch 会把同一身份交给所有成员。SQLite Online store schema 已升到 v2，旧的
+Lobby launch 会把同一身份交给所有成员。SQLite Online store schema 已升到 v3，旧的
 开发数据库会被启动门禁拒绝（当前无兼容项目，需删除旧库后重建）。可选目标
 `AYOnlineApplication` 提供本地内容目录解析、帧末原子 Scene 切换、加载 generation 回执与
 离开会话后的主菜单恢复；接入示例见

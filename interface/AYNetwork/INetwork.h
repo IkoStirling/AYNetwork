@@ -183,6 +183,9 @@ constexpr uint16_t kMsgTypeEntityDespawn = 0x0003;  // server → clients: unreg
 // doesn't need to distinguish; deserialization uses the same path. The only
 // difference is which fields are included (only dirty ones, not all).
 constexpr uint16_t kMsgTypeDelta        = 0x0004;  // server → clients: dirty-fields-only delta update (R3.1)
+// Batched spawn/despawn announcements. Body layout is documented beside
+// ReplicationScalabilityConfig. Disabled by default for legacy traffic shape.
+constexpr uint16_t kMsgTypeEntityLifecycleBatch = 0x0005;
 
 // R4.1-B: minimal 3-vector for interest / distance culling. Stored on
 // NetConnection::setUserData (viewer) and via ReplicationManager::setObjectLocation.
@@ -192,11 +195,51 @@ struct NetVec3 {
     float z = 0.f;
 };
 
-// R4.0 (2026-07-29): RPC msgType namespace. 0x0005..0x000F reserved for
-// future R3.3 back-compat shadow; 0x0010..0x0012 carry the RPC
-// request / response / reject triplet. wire schemaVersion=1 unchanged
-// (R3.x receiver hits onPacketBody demux mismatch and silently drops
-// the frame — same drop semantics as R3.2 WireTypeId 12..15 nested).
+// Per-object scalability policy. Defaults preserve the original behavior:
+// global AOI radius, every-tick dirty checks, and neutral priority.
+struct ReplicationObjectPolicy {
+    float priority = 1.0f;
+    // > 0 overrides the manager-wide radius; 0 inherits it. alwaysRelevant
+    // bypasses distance culling while still honoring extension relevancy.
+    float interestRadius = 0.0f;
+    bool alwaysRelevant = false;
+
+    // Distance-based network LOD. Full snapshots are never delayed; these
+    // intervals apply only to initialized peers receiving delta updates.
+    float mediumDistance = 0.0f;
+    float farDistance = 0.0f;
+    uint16_t nearIntervalTicks = 1;
+    uint16_t mediumIntervalTicks = 2;
+    uint16_t farIntervalTicks = 6;
+};
+
+// Opt-in limits for high-entity-count worlds. Zero byte/queue limits mean
+// unlimited/disabled. Lifecycle batching uses one reliable packet containing:
+// [u16 count] then count * ([u8 op][u32 netId][u64 schemaHash when spawn]).
+struct ReplicationScalabilityConfig {
+    uint32_t maxBytesPerConnectionPerTick = 0;
+    uint32_t softSendQueueBytes = 0;
+    uint32_t hardSendQueueBytes = 0;
+    uint32_t disconnectAfterHardPressureTicks = 0;
+    uint16_t maxLifecycleEventsPerPacket = 128;
+    bool enableLifecycleBatching = false;
+};
+
+struct ReplicationTickStats {
+    uint64_t sentBytes = 0;
+    uint32_t sentFrames = 0;
+    uint32_t lifecycleEvents = 0;
+    uint32_t deferredByBudget = 0;
+    uint32_t deferredByLod = 0;
+    uint32_t deferredByBackpressure = 0;
+    uint32_t hardPressureConnections = 0;
+};
+
+// R4.0 (2026-07-29): RPC msgType namespace. 0x0005 is now used by batched
+// entity lifecycle announcements; 0x0006..0x000F remain reserved for future
+// replication extensions. 0x0010..0x0012 carry the RPC request / response /
+// reject triplet. The current PacketCodec schema version is declared below;
+// unknown message types are rejected by the dispatch layer.
 //
 // Direction in production:
 //   kMsgTypeRpcRequest  — caller → server (Server RPC) OR caller → 1 client (Client RPC) OR server → all clients (Multicast)
@@ -784,7 +827,8 @@ public:
 
     // ---- Receive path ----
     // Called by GnsConnection::onRawData when msgType ∈ {kMsgTypeReplication,
-    // kMsgTypeEntitySpawn, kMsgTypeEntityDespawn, kMsgTypeDelta}. Looks up
+    // kMsgTypeEntitySpawn, kMsgTypeEntityDespawn, kMsgTypeDelta,
+    // kMsgTypeEntityLifecycleBatch}. Looks up
     // the local type/object by netId and walks AYReflect to deserialize
     // field values back into memory. R3.1: kMsgTypeDelta uses the same
     // deserializeObject path as kMsgTypeReplication — wire format is
@@ -870,6 +914,24 @@ public:
     float getInterestRadius() const { return _interestRadius; }
     void setObjectLocation(uint32_t netId, NetVec3 location);
     bool getObjectLocation(uint32_t netId, NetVec3& out) const;
+    bool setObjectReplicationPolicy(uint32_t netId,
+                                    ReplicationObjectPolicy policy);
+    bool getObjectReplicationPolicy(uint32_t netId,
+                                    ReplicationObjectPolicy& out) const;
+
+    void setScalabilityConfig(ReplicationScalabilityConfig config);
+    ReplicationScalabilityConfig getScalabilityConfig() const {
+        return _scalability;
+    }
+    ReplicationTickStats getLastTickStats() const { return _lastTickStats; }
+
+    // The subsystem wires this to its live GNS profiler. Tests and alternate
+    // transports may provide their own queued-byte measurement.
+    using SendQueueBytesProvider =
+        std::function<uint32_t(NetConnection* connection)>;
+    void setSendQueueBytesProvider(SendQueueBytesProvider provider) {
+        _sendQueueBytesProvider = std::move(provider);
+    }
 
     // R5.1 (teleport): debug/test seam. Returns true if `netId` currently
     // has a pending teleport marker. Production code never calls this.
@@ -1045,6 +1107,10 @@ private:
     BroadcastSink  _broadcastSink = nullptr;
     float _interestRadius = 0.f;
     float _interestRadiusSq = 0.f;
+    ReplicationScalabilityConfig _scalability{};
+    ReplicationTickStats _lastTickStats{};
+    SendQueueBytesProvider _sendQueueBytesProvider;
+    std::unordered_map<uint32_t, uint32_t> _hardPressureTicks;
 
     // R5.0 server tick accounting. _serverTickAccumulatorUs carries the
     // sub-tick fractional time between calls so the tick count stays

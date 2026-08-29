@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ayt::event { class EventBus; }
@@ -69,11 +70,23 @@ public:
     virtual bool listLobbies(ListLobbiesRequest request = {}) = 0;
     virtual bool createLobby(CreateLobbyRequest request) = 0;
     virtual bool joinLobby(LobbyId lobbyId) = 0;
+    virtual bool joinLobby(JoinLobbyRequest request) {
+        return request.password.empty() && request.invitationToken.empty() &&
+               joinLobby(request.lobbyId);
+    }
     virtual bool refreshLobby() = 0;
+    virtual bool updateLobby(UpdateLobbyRequest request) {
+        if (request.replaceMetadata || request.setVisibility ||
+            request.setPassword) return false;
+        return updateLobbyName(std::move(request.name));
+    }
     virtual bool updateLobbyName(std::string name) = 0;
+    virtual bool createLobbyInvitation(uint32_t, uint16_t) { return false; }
+    virtual LobbyInvitation takeLobbyInvitation() { return {}; }
     virtual bool leaveLobby() = 0;
     virtual bool launchLobbyP2P(uint16_t virtualPort) = 0;
     virtual bool startMatchmaking(MatchmakingRequest request) = 0;
+    virtual bool respondToMatch(bool) { return false; }
     virtual bool cancelMatchmaking() = 0;
     virtual bool leaveSession() = 0;
     virtual bool reset() = 0;

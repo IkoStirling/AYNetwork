@@ -26,7 +26,8 @@ bool compatiblePeer(const PeerId& nested, const PeerId& canonical) {
 bool isLiveTicket(const MatchTicketInfo& ticket) {
     return ticket.ticketId != 0 &&
         (ticket.state == MatchTicketState::Queued ||
-         ticket.state == MatchTicketState::Matching);
+         ticket.state == MatchTicketState::Matching ||
+         ticket.state == MatchTicketState::AwaitingAcceptance);
 }
 
 bool hasLiveResources(const OnlineSessionCoordinatorStatus& online,
@@ -49,6 +50,12 @@ bool samePublishedStatus(const OnlineSessionCoordinatorStatus& a,
            a.lobby.members.size() == b.lobby.members.size() &&
            a.matchTicket.ticketId == b.matchTicket.ticketId &&
            a.matchTicket.state == b.matchTicket.state &&
+           a.matchTicket.assignment.matchId ==
+               b.matchTicket.assignment.matchId &&
+           a.matchTicket.acceptedMembers.size() ==
+               b.matchTicket.acceptedMembers.size() &&
+           a.matchTicket.acceptanceExpiresAtUnixSeconds ==
+               b.matchTicket.acceptanceExpiresAtUnixSeconds &&
            a.matchTicket.failure == b.matchTicket.failure &&
            pa.state == pb.state && pa.error == pb.error &&
            pa.serviceError == pb.serviceError && pa.message == pb.message &&
@@ -241,12 +248,28 @@ public:
     bool joinLobby(LobbyId lobbyId) override {
         return trackAccepted(_online && _online->joinLobby(lobbyId));
     }
+    bool joinLobby(JoinLobbyRequest request) override {
+        return trackAccepted(
+            _online && _online->joinLobby(std::move(request)));
+    }
     bool refreshLobby() override {
         return trackAccepted(_online && _online->refreshLobby());
+    }
+    bool updateLobby(UpdateLobbyRequest request) override {
+        return trackAccepted(
+            _online && _online->updateLobby(std::move(request)));
     }
     bool updateLobbyName(std::string name) override {
         return trackAccepted(
             _online && _online->updateLobbyName(std::move(name)));
+    }
+    bool createLobbyInvitation(uint32_t lifetimeSeconds,
+                               uint16_t maxUses) override {
+        return trackAccepted(_online && _online->createLobbyInvitation(
+            lifetimeSeconds, maxUses));
+    }
+    LobbyInvitation takeLobbyInvitation() override {
+        return _online ? _online->takeLobbyInvitation() : LobbyInvitation{};
     }
     bool leaveLobby() override {
         return trackAccepted(_online && _online->leaveLobby());
@@ -258,6 +281,9 @@ public:
     bool startMatchmaking(MatchmakingRequest request) override {
         return trackAccepted(
             _online && _online->startMatchmaking(std::move(request)));
+    }
+    bool respondToMatch(bool accept) override {
+        return trackAccepted(_online && _online->respondToMatch(accept));
     }
     bool cancelMatchmaking() override {
         return trackAccepted(_online && _online->cancelMatchmaking());

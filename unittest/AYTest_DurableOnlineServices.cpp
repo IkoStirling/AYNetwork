@@ -172,6 +172,98 @@ TEST_CASE(RestartPreservesLobbyServerAllocationAndQueuedTicket) {
           durableMatchRequest("durable-owner").content);
 }
 
+TEST_CASE(RestartPreservesLobbyCredentialsMetadataAndInvitationUse) {
+    ayt::test::setCurrentCase(
+        "RestartPreservesLobbyCredentialsMetadataAndInvitationUse");
+    DurableOnlineFixture fixture;
+    std::atomic<uint64_t> now{30500};
+    LobbyInfo privateLobby;
+    LobbyInvitation invitation;
+    std::string password = "durable test password";
+    {
+        SqliteOnlineServices service(fixture.config(now));
+        CHECK(service.isReady());
+        auto request = durableLobbyRequest();
+        request.visibility = LobbyVisibility::Private;
+        request.metadata = {{"mode", "duo"}, {"ruleset", "ranked"}};
+        request.password = password;
+        const auto created = service.createLobby(request);
+        CHECK(created);
+        privateLobby = created.value;
+        const auto issued = service.createLobbyInvitation({
+            created.value.lobbyId, created.value.ownerPeerId,
+            created.value.revision, 30, 1});
+        CHECK(issued);
+        invitation = issued.value;
+    }
+
+    now.store(30501);
+    SqliteOnlineServices restarted(fixture.config(now));
+    CHECK(restarted.isReady());
+    const auto observed = restarted.getLobby(privateLobby.lobbyId);
+    CHECK(observed);
+    CHECK(observed.value.visibility == LobbyVisibility::Private);
+    CHECK(observed.value.passwordProtected);
+    CHECK(observed.value.metadata == privateLobby.metadata);
+    JoinLobbyRequest join;
+    join.lobbyId = privateLobby.lobbyId;
+    join.authenticatedPeer = PeerId{"durable-guest"};
+    join.invitationToken = invitation.token;
+    CHECK(restarted.joinLobby(join));
+    join.authenticatedPeer = PeerId{"durable-second"};
+    CHECK(restarted.joinLobby(join).error == OnlineServiceError::Unauthorized);
+
+    const auto bytes = fixture.storedBytes();
+    CHECK(!containsText(bytes, invitation.token));
+    CHECK(!containsText(bytes, password));
+}
+
+TEST_CASE(MatchAcceptanceSurvivesRestartAndProvisionsOnlyAfterAllAccept) {
+    ayt::test::setCurrentCase(
+        "MatchAcceptanceSurvivesRestartAndProvisionsOnlyAfterAllAccept");
+    DurableOnlineFixture fixture;
+    std::atomic<uint64_t> now{30700};
+    const auto sessions = fixture.p2p(now);
+    MatchTicketInfo first;
+    MatchTicketInfo second;
+    {
+        SqliteOnlineServices service(fixture.config(now), sessions);
+        CHECK(service.isReady());
+        auto firstRequest = durableMatchRequest("durable-accept-a");
+        firstRequest.requireAcceptance = true;
+        auto secondRequest = durableMatchRequest("durable-accept-b");
+        secondRequest.requireAcceptance = true;
+        const auto queuedA = service.enqueueMatch(firstRequest);
+        const auto queuedB = service.enqueueMatch(secondRequest);
+        CHECK(queuedA && queuedB);
+        CHECK_INT_EQ(service.runMatchmaking(1), 1);
+        first = service.getMatch(
+            queuedA.value.ticketId, PeerId{"durable-accept-a"}).value;
+        second = service.getMatch(
+            queuedB.value.ticketId, PeerId{"durable-accept-b"}).value;
+        CHECK(first.state == MatchTicketState::AwaitingAcceptance);
+        CHECK(second.state == MatchTicketState::AwaitingAcceptance);
+        CHECK(first.assignment.p2pGrants.empty());
+    }
+
+    now.store(30701);
+    SqliteOnlineServices restarted(fixture.config(now), sessions);
+    CHECK(restarted.isReady());
+    CHECK(restarted.respondToMatch(
+        {first.ticketId, PeerId{"durable-accept-a"}, true}));
+    const auto ready = restarted.respondToMatch(
+        {second.ticketId, PeerId{"durable-accept-b"}, true});
+    CHECK(ready);
+    CHECK(ready.value.state == MatchTicketState::Matching);
+    CHECK_INT_EQ(restarted.runMatchmaking(1), 1);
+    const auto matched = restarted.getMatch(
+        first.ticketId, PeerId{"durable-accept-a"});
+    CHECK(matched);
+    CHECK(matched.value.state == MatchTicketState::Matched);
+    CHECK(matched.value.assignment.matchId != 0);
+    CHECK_INT_EQ(matched.value.assignment.placements.size(), 2);
+}
+
 TEST_CASE(MatchedAssignmentSurvivesRestartAndCredentialsStayEncrypted) {
     ayt::test::setCurrentCase(
         "MatchedAssignmentSurvivesRestartAndCredentialsStayEncrypted");

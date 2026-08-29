@@ -42,10 +42,12 @@ struct OnlineSessionCoordinator::Impl {
         JoinLobby,
         RefreshLobby,
         UpdateLobby,
+        CreateLobbyInvitation,
         LeaveLobby,
         LaunchLobby,
         EnqueueMatch,
         PollMatch,
+        RespondMatch,
         CancelMatch,
     };
 
@@ -55,6 +57,7 @@ struct OnlineSessionCoordinator::Impl {
         std::string message;
         LobbyInfo lobby;
         std::vector<LobbyInfo> lobbies;
+        LobbyInvitation invitation;
         LobbyLaunchResult launch;
         MatchTicketInfo ticket;
     };
@@ -96,7 +99,8 @@ struct OnlineSessionCoordinator::Impl {
     bool hasLiveMatchTicket() const {
         return status.matchTicket.ticketId != 0 &&
             (status.matchTicket.state == MatchTicketState::Queued ||
-             status.matchTicket.state == MatchTicketState::Matching);
+             status.matchTicket.state == MatchTicketState::Matching ||
+             status.matchTicket.state == MatchTicketState::AwaitingAcceptance);
     }
 
     bool operationRunning() const { return operation.valid(); }
@@ -177,6 +181,7 @@ struct OnlineSessionCoordinator::Impl {
     bool startCreate(CreateLobbyRequest request) {
         if (status.state != OnlineSessionCoordinatorState::Idle ||
             operationRunning()) return rejectBusy();
+        lastInvitation = {};
         request.ownerPeerId = config.localPeerId;
         const auto service = lobbies;
         return startOperation(OperationKind::CreateLobby,
@@ -197,22 +202,27 @@ struct OnlineSessionCoordinator::Impl {
     }
 
     bool startJoin(LobbyId lobbyId) {
+        return startJoin(JoinLobbyRequest{lobbyId, config.localPeerId});
+    }
+
+    bool startJoin(JoinLobbyRequest request) {
         if (status.state != OnlineSessionCoordinatorState::Idle ||
             operationRunning()) return rejectBusy();
-        if (lobbyId == 0) {
+        if (request.lobbyId == 0) {
             status.error = OnlineSessionCoordinatorError::InvalidConfiguration;
             status.message = "Lobby id must be non-zero";
             return false;
         }
+        lastInvitation = {};
+        request.authenticatedPeer = config.localPeerId;
         const auto service = lobbies;
-        const PeerId peer = config.localPeerId;
         return startOperation(OperationKind::JoinLobby,
             OnlineSessionCoordinatorState::JoiningLobby,
-            [service, lobbyId, peer] {
+            [service, request = std::move(request)]() mutable {
                 OperationResult result;
                 result.kind = OperationKind::JoinLobby;
                 try {
-                    auto value = service->joinLobby(lobbyId, peer);
+                    auto value = service->joinLobby(request);
                     result.error = value.error;
                     result.message = std::move(value.message);
                     if (value) result.lobby = std::move(value.value);
@@ -245,14 +255,12 @@ struct OnlineSessionCoordinator::Impl {
             });
     }
 
-    bool startUpdateLobby(std::string name) {
+    bool startUpdateLobby(UpdateLobbyRequest request) {
         if (status.state != OnlineSessionCoordinatorState::InLobby ||
             operationRunning() || !hasLobby()) return rejectBusy();
-        UpdateLobbyRequest request;
         request.lobbyId = status.lobby.lobbyId;
         request.actorPeerId = config.localPeerId;
         request.expectedRevision = status.lobby.revision;
-        request.name = std::move(name);
         const auto service = lobbies;
         return startOperation(OperationKind::UpdateLobby,
             OnlineSessionCoordinatorState::UpdatingLobby,
@@ -266,6 +274,48 @@ struct OnlineSessionCoordinator::Impl {
                     if (value) result.lobby = std::move(value.value);
                 } catch (...) {
                     return exceptionResult(OperationKind::UpdateLobby);
+                }
+                return result;
+            });
+    }
+
+    bool startUpdateLobby(std::string name) {
+        UpdateLobbyRequest request;
+        request.name = std::move(name);
+        return startUpdateLobby(std::move(request));
+    }
+
+    bool startCreateLobbyInvitation(uint32_t lifetimeSeconds,
+                                    uint16_t maxUses) {
+        if (status.state != OnlineSessionCoordinatorState::InLobby ||
+            operationRunning() || !hasLobby()) return rejectBusy();
+        if (status.lobby.ownerPeerId != config.localPeerId) {
+            status.error = OnlineSessionCoordinatorError::InvalidConfiguration;
+            status.message =
+                "only the Lobby owner may create an invitation";
+            return false;
+        }
+        CreateLobbyInvitationRequest request;
+        request.lobbyId = status.lobby.lobbyId;
+        request.actorPeerId = config.localPeerId;
+        request.expectedRevision = status.lobby.revision;
+        request.lifetimeSeconds = lifetimeSeconds;
+        request.maxUses = maxUses;
+        lastInvitation = {};
+        const auto service = lobbies;
+        return startOperation(OperationKind::CreateLobbyInvitation,
+            OnlineSessionCoordinatorState::CreatingLobbyInvitation,
+            [service, request] {
+                OperationResult result;
+                result.kind = OperationKind::CreateLobbyInvitation;
+                try {
+                    auto value = service->createLobbyInvitation(request);
+                    result.error = value.error;
+                    result.message = std::move(value.message);
+                    if (value) result.invitation = std::move(value.value);
+                } catch (...) {
+                    return exceptionResult(
+                        OperationKind::CreateLobbyInvitation);
                 }
                 return result;
             });
@@ -335,9 +385,25 @@ struct OnlineSessionCoordinator::Impl {
     }
 
     bool startEnqueue(MatchmakingRequest request) {
-        if (status.state != OnlineSessionCoordinatorState::Idle ||
-            operationRunning()) return rejectBusy();
-        if (request.partyMembers.empty()) {
+        const bool lobbyParty = request.sourceLobbyId != 0;
+        if (operationRunning() ||
+            (!lobbyParty &&
+             status.state != OnlineSessionCoordinatorState::Idle) ||
+            (lobbyParty &&
+             (status.state != OnlineSessionCoordinatorState::InLobby ||
+              !hasLobby() || request.sourceLobbyId != status.lobby.lobbyId))) {
+            return rejectBusy();
+        }
+        if (lobbyParty) {
+            if (status.lobby.ownerPeerId != config.localPeerId) {
+                status.error = OnlineSessionCoordinatorError::InvalidConfiguration;
+                status.message = "only the Lobby leader may queue the party";
+                return false;
+            }
+            request.sourceLobbyRevision = status.lobby.revision;
+            request.partyLeaderPeerId = config.localPeerId;
+            request.partyMembers = status.lobby.members;
+        } else if (request.partyMembers.empty()) {
             request.partyMembers.push_back(config.localPeerId);
         } else if (!containsPeer(request.partyMembers, config.localPeerId)) {
             status.error = OnlineSessionCoordinatorError::InvalidConfiguration;
@@ -370,9 +436,13 @@ struct OnlineSessionCoordinator::Impl {
         const auto service = matchmaking;
         const MatchTicketId ticketId = status.matchTicket.ticketId;
         const PeerId peer = config.localPeerId;
+        const auto pollingState = cancelRequested
+            ? OnlineSessionCoordinatorState::CancellingMatch
+            : (status.matchTicket.state == MatchTicketState::AwaitingAcceptance
+                ? OnlineSessionCoordinatorState::AwaitingMatchAcceptance
+                : OnlineSessionCoordinatorState::Queueing);
         return startOperation(OperationKind::PollMatch,
-            cancelRequested ? OnlineSessionCoordinatorState::CancellingMatch
-                            : OnlineSessionCoordinatorState::Queueing,
+            pollingState,
             [service, ticketId, peer] {
                 OperationResult result;
                 result.kind = OperationKind::PollMatch;
@@ -405,6 +475,34 @@ struct OnlineSessionCoordinator::Impl {
                     if (value) result.ticket = std::move(value.value);
                 } catch (...) {
                     return exceptionResult(OperationKind::CancelMatch);
+                }
+                return result;
+            });
+    }
+
+    bool startMatchResponse(bool accept) {
+        if (operationRunning() ||
+            status.state !=
+                OnlineSessionCoordinatorState::AwaitingMatchAcceptance ||
+            status.matchTicket.ticketId == 0) return rejectBusy(
+                "no match is awaiting acceptance");
+        MatchAcceptanceRequest request;
+        request.ticketId = status.matchTicket.ticketId;
+        request.authenticatedPeer = config.localPeerId;
+        request.accept = accept;
+        const auto service = matchmaking;
+        return startOperation(OperationKind::RespondMatch,
+            OnlineSessionCoordinatorState::AwaitingMatchAcceptance,
+            [service, request] {
+                OperationResult result;
+                result.kind = OperationKind::RespondMatch;
+                try {
+                    auto value = service->respondToMatch(request);
+                    result.error = value.error;
+                    result.message = std::move(value.message);
+                    if (value) result.ticket = std::move(value.value);
+                } catch (...) {
+                    return exceptionResult(OperationKind::RespondMatch);
                 }
                 return result;
             });
@@ -510,7 +608,19 @@ struct OnlineSessionCoordinator::Impl {
             status.matchTicket.state == MatchTicketState::Matching) {
             status.state = cancelRequested
                 ? OnlineSessionCoordinatorState::CancellingMatch
-                : OnlineSessionCoordinatorState::Queueing;
+                : (status.matchTicket.state ==
+                        MatchTicketState::AwaitingAcceptance
+                    ? OnlineSessionCoordinatorState::AwaitingMatchAcceptance
+                    : OnlineSessionCoordinatorState::Queueing);
+            reconcileCancellation = false;
+            nextPollAtMs = now() + config.matchmakingPollIntervalMs;
+            return;
+        }
+        if (status.matchTicket.state ==
+            MatchTicketState::AwaitingAcceptance) {
+            status.state = cancelRequested
+                ? OnlineSessionCoordinatorState::CancellingMatch
+                : OnlineSessionCoordinatorState::AwaitingMatchAcceptance;
             reconcileCancellation = false;
             nextPollAtMs = now() + config.matchmakingPollIntervalMs;
             return;
@@ -650,8 +760,20 @@ struct OnlineSessionCoordinator::Impl {
             status.lobby = std::move(result.lobby);
             status.state = OnlineSessionCoordinatorState::InLobby;
             break;
+        case OperationKind::CreateLobbyInvitation:
+            if (!result.invitation.isValid() ||
+                result.invitation.lobbyId != status.lobby.lobbyId) {
+                fail(OnlineSessionCoordinatorError::OnlineServiceRejected,
+                     OnlineServiceError::InternalError,
+                     "Lobby invitation response was invalid");
+                break;
+            }
+            lastInvitation = std::move(result.invitation);
+            status.state = OnlineSessionCoordinatorState::InLobby;
+            break;
         case OperationKind::LeaveLobby:
             status.lobby = {};
+            lastInvitation = {};
             clearMatchAndAssignment();
             status.state = OnlineSessionCoordinatorState::Idle;
             break;
@@ -673,6 +795,7 @@ struct OnlineSessionCoordinator::Impl {
         }
         case OperationKind::EnqueueMatch:
         case OperationKind::PollMatch:
+        case OperationKind::RespondMatch:
         case OperationKind::CancelMatch:
             consumeMatchTicket(std::move(result.ticket));
             break;
@@ -798,6 +921,7 @@ struct OnlineSessionCoordinator::Impl {
     OnlineSessionCoordinatorConfig config;
     OnlineSessionCoordinatorStatus status;
     std::vector<LobbyInfo> lobbyResults;
+    LobbyInvitation lastInvitation;
     std::future<OperationResult> operation;
     uint64_t nextPollAtMs = 0;
     uint32_t pollFailures = 0;
@@ -829,12 +953,25 @@ bool OnlineSessionCoordinator::joinLobby(LobbyId lobbyId) {
     return _impl->startJoin(lobbyId);
 }
 
+bool OnlineSessionCoordinator::joinLobby(JoinLobbyRequest request) {
+    return _impl->startJoin(std::move(request));
+}
+
 bool OnlineSessionCoordinator::refreshLobby() {
     return _impl->startRefresh();
 }
 
+bool OnlineSessionCoordinator::updateLobby(UpdateLobbyRequest request) {
+    return _impl->startUpdateLobby(std::move(request));
+}
+
 bool OnlineSessionCoordinator::updateLobbyName(std::string name) {
     return _impl->startUpdateLobby(std::move(name));
+}
+
+bool OnlineSessionCoordinator::createLobbyInvitation(
+    uint32_t lifetimeSeconds, uint16_t maxUses) {
+    return _impl->startCreateLobbyInvitation(lifetimeSeconds, maxUses);
 }
 
 bool OnlineSessionCoordinator::leaveLobby() {
@@ -849,11 +986,17 @@ bool OnlineSessionCoordinator::startMatchmaking(MatchmakingRequest request) {
     return _impl->startEnqueue(std::move(request));
 }
 
+bool OnlineSessionCoordinator::respondToMatch(bool accept) {
+    return _impl->startMatchResponse(accept);
+}
+
 bool OnlineSessionCoordinator::cancelMatchmaking() {
     const bool failedWithTicket =
         _impl->status.state == OnlineSessionCoordinatorState::Failed &&
         _impl->hasLiveMatchTicket();
     if (_impl->status.state != OnlineSessionCoordinatorState::Queueing &&
+        _impl->status.state !=
+            OnlineSessionCoordinatorState::AwaitingMatchAcceptance &&
         _impl->status.state != OnlineSessionCoordinatorState::CancellingMatch &&
         !failedWithTicket) {
         return _impl->rejectBusy("no active matchmaking ticket to cancel");
@@ -910,6 +1053,8 @@ void OnlineSessionCoordinator::update() {
     if (_impl->operationRunning()) return;
 
     if (_impl->status.state == OnlineSessionCoordinatorState::Queueing ||
+        _impl->status.state ==
+            OnlineSessionCoordinatorState::AwaitingMatchAcceptance ||
         _impl->status.state == OnlineSessionCoordinatorState::CancellingMatch) {
         _impl->updateMatchmaking();
     } else if (_impl->status.state == OnlineSessionCoordinatorState::Connecting ||
@@ -937,6 +1082,7 @@ bool OnlineSessionCoordinator::reset() {
         !_impl->p2p.reset()) return false;
     _impl->status = {};
     _impl->lobbyResults.clear();
+    _impl->lastInvitation = {};
     _impl->cancelRequested = false;
     _impl->reconcileCancellation = false;
     _impl->pollFailures = 0;
@@ -950,6 +1096,12 @@ OnlineSessionCoordinatorStatus OnlineSessionCoordinator::getStatus() const {
 
 std::vector<LobbyInfo> OnlineSessionCoordinator::getLobbyResults() const {
     return _impl->lobbyResults;
+}
+
+LobbyInvitation OnlineSessionCoordinator::takeLobbyInvitation() {
+    LobbyInvitation invitation = std::move(_impl->lastInvitation);
+    _impl->lastInvitation = {};
+    return invitation;
 }
 
 } // namespace ayt::net

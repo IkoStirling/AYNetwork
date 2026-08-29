@@ -1,4 +1,4 @@
-# AYNetwork Online Services v1
+# AYNetwork Online Services
 
 ## 定位
 
@@ -21,8 +21,10 @@ Lobby / Matchmaking / Dedicated Directory
 
 ## Lobby
 
-`ILobbyService` 支持创建、筛选、加入、离开、读取、按 revision CAS 更新，以及
-`launchLobbyP2P`。Owner 离开时所有权确定性转给成员列表中的下一人；最后一人离开删除
+`ILobbyService` 支持创建、metadata 精确筛选、凭据化加入、离开、读取、按 revision CAS
+更新、创建限时/限次邀请，以及 `launchLobbyP2P`。Public Lobby 可被列出，Unlisted 只能
+直接加入，Private 必须持邀请；密码使用 Argon2id verifier 保存，不保留明文。Owner 离开时
+所有权确定性转给成员列表中的下一人；最后一人离开删除
 Lobby，并向该次 leave 返回一个无成员的 `Closed` 墓碑，随后读取该 Lobby 得到 NotFound。
 启动过程先把状态从 `Open` CAS 到 `Launching`，在锁外创建 P2P session 并为每个
 成员签发 grant，成功后进入 `InSession`；失败会关闭已创建的 Host session 并重新开放
@@ -30,9 +32,11 @@ Lobby。启动期间不允许成员变化。
 
 ## Matchmaking
 
-`IMatchmakingService` 接受单人或 party ticket，按 queue、region、build、topology、目标
-人数和 virtual port 精确分组。参考实现保持入队顺序，以完整 party 为最小单位填满一局，
-不会拆 party。匹配 worker 通过显式 `runMatchmaking()` 驱动：
+`IMatchmakingService` 接受单人、直接 Party 或 Lobby-backed Party ticket。Lobby-backed 请求会
+在服务端重新读取 Lobby、校验 Owner/revision，并以规范成员表覆盖客户端输入；只有 Owner
+可以代表 Party 入队。兼容性按 queue、region、build/content、topology、目标/最小人数、
+virtual port、互相可接受的 ping 上限和技能容差计算。参考实现保持优先级/FIFO 顺序，不拆
+Party，并以 Party 为单位做贪心队伍平衡。匹配 worker 通过显式 `runMatchmaking()` 驱动：
 
 - `P2P`：最早 ticket 的首位玩家成为初始 Host，后端创建会话并给每个 ticket 只返回其
   party 成员自己的 grant。
@@ -41,7 +45,10 @@ Lobby。启动期间不允许成员变化。
 - `Any`：优先 Dedicated，无可用容量时回退 P2P。
 
 Ticket 在 `Matching` 状态不可取消，避免分配与取消竞态；只有 ticket party 成员可以读取
-结果。
+结果。启用 `requireAcceptance` 后，全部玩家确认前状态停在 `AwaitingAcceptance`，不会创建
+P2P 会话或占用 Dedicated 容量；拒绝者被取消，其余票据重新排队，超时则整组重新排队。
+`allowBackfill + minimumPlayers` 当前表示“达到最小人数后允许欠员开局”，尚不表示向已运行
+比赛补入新玩家。
 
 ## Dedicated Server
 
@@ -97,6 +104,14 @@ AYNetwork 不把某一种游戏服认证协议硬编码进通用 `connect()`。c
 的 assignment 不会被静默丢弃。连续临时轮询错误按配置重试，终止后仍可调用
 `cancelMatchmaking()` 清理活 ticket。`leaveSession()` 会先离开 P2P 或断开 Dedicated，
 Lobby 启动的会话随后再撤销 Lobby membership。
+
+Lobby-backed 匹配只能从 `InLobby` 由当前 Owner 发起。需要确认时状态进入
+`AwaitingMatchAcceptance`，应用调用 `respondToMatch(true/false)`；接受人数、Party 人数、
+本地接受状态和截止时间都可从协调器状态读取。
+
+完整 Lobby 更新通过 `updateLobby()` 提交，协调器会覆盖 actor、Lobby ID 和 revision，避免
+UI 伪造上下文。Owner 可异步调用 `createLobbyInvitation()`；成功 token 不进入状态事件，必须
+用一次性的 `takeLobbyInvitation()` 显式取走并交给受邀玩家。
 
 ## 引擎级 OnlineSubSystem
 
@@ -170,6 +185,9 @@ generation，不携带 bearer、信令 token 或 Dedicated reservation token。�
 网络完成，流程继续停留在 `LoadingSession`；若网络先完成，也会等待场景确认。旧回调的
 generation 不匹配时会被拒绝，避免取消后重匹配时误进入旧世界。
 
+匹配确认期间流程状态为 `MatchAcceptance`。UI 可直接读取 ticket 状态、已接受/所需 Party
+人数、本地是否已接受和过期时间，并调用 `respondToMatch()`；确认完成后才发布加载请求。
+
 `leaveLobby()`、`cancelMatchmaking()`、`leaveSession()` 和 `returnToMainMenu()` 都进入统一
 清理路径；已提交 assignment/活跃传输优先于可能残留的 queued ticket。`signOut()` 在资源
 清理完成后才清空凭据。连接/加载和清理分别由 `loadingTimeoutMs`、`cleanupTimeoutMs` 限时；
@@ -181,8 +199,9 @@ generation 不匹配时会被拒绝，避免取消后重匹配时误进入旧世
 `HttpOnlineServices` 实现三个客户端接口；同一组路由可选挂载到
 `HttpP2PSessionServer`，因此 authority session 与在线 API 可以共享 TCP 端口、请求大小
 限制、来源限流和无秘密审计。玩家请求只发送 bearer，服务端通过
-`playerAuthenticator` 派生可信 `PeerId`，不会读取 body 中的 actor。Party 请求还必须通过
-`partyAuthorizer`；未安装 party 认证器时只允许单人 ticket，防止客户端冒充队友。
+`playerAuthenticator` 派生可信 `PeerId`，不会读取 body 中的 actor。直接提交成员列表的
+Party 请求还必须通过 `partyAuthorizer`；Lobby-backed Party 则由服务端重新读取成员并校验
+Owner/revision，不能由客户端伪造成员。
 
 主要路由：
 
@@ -191,8 +210,9 @@ generation 不匹配时会被拒绝，避免取消后重匹配时误进入旧世
 | POST/GET | `/v1/lobbies` | Player Bearer |
 | GET | `/v1/lobbies/{id}` | Player Bearer |
 | POST | `/v1/lobbies/{id}/join|leave|update|launch-p2p` | Player Bearer |
+| POST | `/v1/lobbies/{id}/invitations` | Player Bearer (Owner) |
 | POST/GET | `/v1/matches`、`/v1/matches/{id}` | Player Bearer |
-| POST | `/v1/matches/{id}/cancel` | Player Bearer |
+| POST | `/v1/matches/{id}/cancel|respond` | Player Bearer |
 | POST | `/v1/matches/run` | Fleet control token |
 | POST/GET | `/v1/dedicated/servers` | Fleet control token |
 | POST | `/v1/dedicated/servers/{id}/heartbeat|drain|unregister` | Server Bearer |
@@ -212,8 +232,9 @@ $env:AY_ONLINE_SERVER_TOKEN = "<至少 32 字符的 fleet/orchestrator token>"
 `issuePlayerAccessToken()` 签发短期 bearer，SessionServer 通过 `AY_ONLINE_AUTH_KEY` 验证并
 取得可信 `PeerId`。它不依赖 Steam 或其他平台账号；平台登录、封禁和 refresh token 仍由
 应用账号服务负责。`AY_ONLINE_SERVER_TOKEN` 只用于受信 fleet 操作，Dedicated 实例注册
-后会获得自己的 server bearer。HTTP party ticket 还需要应用安装 `partyAuthorizer`；参考
-SessionServer 的安全默认值只允许单人 ticket，避免客户端伪造队友。
+后会获得自己的 server bearer。直接提交 Party 成员的 HTTP ticket 还需要应用安装
+`partyAuthorizer`；参考 SessionServer 的安全默认值只允许单人或经 Lobby 后端验证的 Party，
+避免客户端伪造队友。
 
 ## SQLite 持久化实现
 
@@ -225,6 +246,8 @@ session backend。默认最多 64 人 Lobby/Match、4096 容量 Dedicated Server
 
 - Lobby、成员、匹配 ticket/party、Dedicated server 和 allocation 使用规范化表；写操作
   运行在 `BEGIN IMMEDIATE` 事务中，容量预留不会超卖。
+- schema v3 持久化 Lobby metadata/可见性/密码 verifier、邀请 token 摘要，以及匹配规则、
+  接受状态、match ID 和队伍 placement；邀请和密码明文不会写入数据库。
 - WAL、`synchronous=FULL` 和 schema version 门禁保证重启恢复并拒绝未知格式；数据库必须
   位于本地磁盘，不能放 SMB/NFS 共享目录。
 - Lobby launch 与 matchmaking 使用带过期时间的持久 claim，多进程 worker 只会有一个
@@ -265,4 +288,5 @@ HTTP server 只依赖 `ILobbyService`、`IMatchmakingService`、
 `IDedicatedServerService`，没有依赖 SQLite，这就是应用后端替换边界。参考 SessionServer
 在生产模式下默认要求持久 online state 和签名玩家凭证；
 `AY_ONLINE_ALLOW_EPHEMERAL=1`、`AY_ONLINE_ALLOW_STATIC_CREDENTIALS=1` 仅用于 staging。
-尚未内置玩家技能评分、跨区延迟测量、party 邀请/隐私、Dedicated 进程拉起或云厂商 API。
+尚未内置外部技能评分源、真实跨区延迟探测、运行中比赛回填、Dedicated 进程拉起或云厂商
+API。第一版技能和 ping 数值由可信应用后端提供；公网客户端自报数据不能直接用于生产匹配。

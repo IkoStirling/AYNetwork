@@ -60,7 +60,10 @@ public:
         sendCount.fetch_add(1);
         const DecodedPacket decoded = PacketCodec::decode(
             static_cast<const uint8_t*>(data), size);
-        if (decoded.ok) messageTypes.push_back(decoded.header.msgType);
+        if (decoded.ok) {
+            messageTypes.push_back(decoded.header.msgType);
+            packets.push_back(decoded);
+        }
     }
     void disconnect(const char*) override {}
     void setUserData(void* data) override { _viewerPos = static_cast<NetVec3*>(data); }
@@ -68,10 +71,17 @@ public:
 
     std::atomic<int> sendCount{0};
     std::vector<uint16_t> messageTypes;
+    std::vector<DecodedPacket> packets;
 
     size_t countMessage(uint16_t messageType) const {
         return static_cast<size_t>(std::count(
             messageTypes.begin(), messageTypes.end(), messageType));
+    }
+
+    void clearMessages() {
+        sendCount.store(0);
+        messageTypes.clear();
+        packets.clear();
     }
 
 private:
@@ -290,6 +300,181 @@ TEST_CASE(InterestTransitionsSendSpawnFullDeltaAndDespawnPerPeer) {
     CHECK_INT_EQ(second->countMessage(kMsgTypeEntitySpawn), 1u);
     CHECK_INT_EQ(second->countMessage(kMsgTypeReplication), 1u);
     CHECK_INT_EQ(second->countMessage(kMsgTypeDelta), 0u);
+}
+
+TEST_CASE(ObjectPolicyOverridesAoiAndDistanceLod) {
+    ayt::test::setCurrentCase("ObjectPolicyOverridesAoiAndDistanceLod");
+    InterestTestNetwork net;
+    NetVec3 viewer{0.f, 0.f, 0.f};
+    MockNetConnection* connection = net.addConnection(1, &viewer);
+    ReplicationManager manager(&net);
+    manager.setInterestRadius(10.f);
+
+    InterestReplObj object;
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType(
+        "InterestReplObj");
+    manager.registerObject(&object, type, 200);
+    manager.setObjectLocation(200, {100.f, 0.f, 0.f});
+
+    ReplicationObjectPolicy policy;
+    policy.interestRadius = 150.f;
+    policy.mediumDistance = 25.f;
+    policy.farDistance = 50.f;
+    policy.farIntervalTicks = 3;
+    CHECK(manager.setObjectReplicationPolicy(200, policy));
+
+    manager.tick(0.016f);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeEntitySpawn), 1u);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeReplication), 1u);
+    connection->clearMessages();
+
+    object.score = 1;
+    manager.tick(0.016f);
+    manager.tick(0.016f);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeDelta), 0u);
+    CHECK(manager.getLastTickStats().deferredByLod != 0);
+    manager.tick(0.016f);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeDelta), 1u);
+}
+
+TEST_CASE(PriorityBudgetDefersLowerPriorityEntity) {
+    ayt::test::setCurrentCase("PriorityBudgetDefersLowerPriorityEntity");
+    InterestTestNetwork net;
+    MockNetConnection* connection = net.addConnection(1, nullptr);
+    ReplicationManager manager(&net);
+    InterestReplObj low;
+    InterestReplObj high;
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType(
+        "InterestReplObj");
+    manager.registerObject(&low, type, 10);
+    manager.registerObject(&high, type, 20);
+    ReplicationObjectPolicy lowPolicy;
+    lowPolicy.priority = 0.1f;
+    ReplicationObjectPolicy highPolicy;
+    highPolicy.priority = 10.f;
+    CHECK(manager.setObjectReplicationPolicy(10, lowPolicy));
+    CHECK(manager.setObjectReplicationPolicy(20, highPolicy));
+    manager.tick(0.016f);
+    connection->clearMessages();
+
+    ReplicationScalabilityConfig config;
+    config.maxBytesPerConnectionPerTick = 64;
+    manager.setScalabilityConfig(config);
+    low.score = 1;
+    high.score = 2;
+    manager.tick(0.016f);
+
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeDelta), 1u);
+    uint32_t replicatedNetId = 0;
+    for (DecodedPacket& packet : connection->packets) {
+        if (packet.header.msgType != kMsgTypeDelta) continue;
+        BitStream body(packet.body.data(), packet.body.size());
+        uint32_t serverTick = 0;
+        ReflectSerializer::FrameHeader header;
+        CHECK(ReflectSerializer::readServerTick(body, serverTick));
+        CHECK(ReflectSerializer::readReplicationFrameHeader(body, header));
+        replicatedNetId = header.netId;
+    }
+    CHECK_INT_EQ(replicatedNetId, 20u);
+    CHECK_INT_EQ(manager.getLastTickStats().deferredByBudget, 1u);
+}
+
+TEST_CASE(BackpressurePausesDeltaAndRecoversWithoutLosingDirtyState) {
+    ayt::test::setCurrentCase(
+        "BackpressurePausesDeltaAndRecoversWithoutLosingDirtyState");
+    InterestTestNetwork net;
+    MockNetConnection* connection = net.addConnection(1, nullptr);
+    ReplicationManager manager(&net);
+    InterestReplObj object;
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType(
+        "InterestReplObj");
+    manager.registerObject(&object, type, 30);
+    manager.tick(0.016f);
+    connection->clearMessages();
+
+    uint32_t queuedBytes = 4096;
+    manager.setSendQueueBytesProvider(
+        [&queuedBytes](NetConnection*) { return queuedBytes; });
+    ReplicationScalabilityConfig config;
+    config.softSendQueueBytes = 1024;
+    config.hardSendQueueBytes = 2048;
+    manager.setScalabilityConfig(config);
+    object.score = 9;
+    manager.tick(0.016f);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeDelta), 0u);
+    CHECK_INT_EQ(manager.getLastTickStats().hardPressureConnections, 1u);
+    CHECK(manager.getLastTickStats().deferredByBackpressure != 0);
+
+    queuedBytes = 0;
+    manager.tick(0.016f);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeDelta), 1u);
+}
+
+TEST_CASE(LifecycleBatchCombinesSpawnAndDespawnAnnouncements) {
+    ayt::test::setCurrentCase(
+        "LifecycleBatchCombinesSpawnAndDespawnAnnouncements");
+    InterestTestNetwork net;
+    NetVec3 viewer{0.f, 0.f, 0.f};
+    MockNetConnection* connection = net.addConnection(1, &viewer);
+    ReplicationManager authority(&net);
+    authority.setInterestRadius(20.f);
+    ReplicationScalabilityConfig config;
+    config.enableLifecycleBatching = true;
+    config.maxLifecycleEventsPerPacket = 64;
+    authority.setScalabilityConfig(config);
+
+    InterestReplObj objects[3];
+    auto* type = ayt::reflect::TypeRegistryImpl::instance().findType(
+        "InterestReplObj");
+    for (uint32_t i = 0; i < 3; ++i) {
+        authority.registerObject(&objects[i], type, 100 + i);
+        authority.setObjectLocation(100 + i, {0.f, 0.f, 0.f});
+    }
+    authority.tick(0.016f);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeEntityLifecycleBatch), 1u);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeEntitySpawn), 0u);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeReplication), 0u);
+    CHECK_INT_EQ(authority.getLastTickStats().lifecycleEvents, 3u);
+
+    ReplicationManager client(nullptr);
+    for (DecodedPacket& packet : connection->packets) {
+        if (packet.header.msgType != kMsgTypeEntityLifecycleBatch) continue;
+        BitStream body(packet.body.data(), packet.body.size());
+        CHECK(client.onReceive(packet.header.msgType, body, nullptr));
+    }
+    CHECK_INT_EQ(client.spawnAnnouncementCount(), 3u);
+
+    connection->clearMessages();
+    authority.tick(0.016f);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeReplication), 3u);
+    viewer = {100.f, 0.f, 0.f};
+    connection->clearMessages();
+    authority.tick(0.016f);
+    CHECK_INT_EQ(connection->countMessage(kMsgTypeEntityLifecycleBatch), 1u);
+    for (DecodedPacket& packet : connection->packets) {
+        if (packet.header.msgType != kMsgTypeEntityLifecycleBatch) continue;
+        BitStream body(packet.body.data(), packet.body.size());
+        CHECK(client.onReceive(packet.header.msgType, body, nullptr));
+    }
+    CHECK_INT_EQ(client.spawnAnnouncementCount(), 0u);
+}
+
+TEST_CASE(SingleDespawnClearsPendingSpawnAnnouncement) {
+    ayt::test::setCurrentCase(
+        "SingleDespawnClearsPendingSpawnAnnouncement");
+    ReplicationManager client(nullptr);
+
+    BitStream spawn;
+    ReflectSerializer::writeEntitySpawn(spawn, 700, 0x1234u);
+    spawn.resetForRead();
+    CHECK(client.onReceive(kMsgTypeEntitySpawn, spawn, nullptr));
+    CHECK_INT_EQ(client.spawnAnnouncementCount(), 1u);
+
+    BitStream despawn;
+    ReflectSerializer::writeEntityDespawn(despawn, 700);
+    despawn.resetForRead();
+    CHECK(client.onReceive(kMsgTypeEntityDespawn, despawn, nullptr));
+    CHECK_INT_EQ(client.spawnAnnouncementCount(), 0u);
 }
 
 TEST_SUITE_END

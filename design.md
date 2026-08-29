@@ -54,7 +54,7 @@ Foundation Layers
 | 状态同步 | ✅ R3 Full/Delta + Subsystem demux (R4.1-A) | ✅ | ✅ | ✅ | P0 |
 | RPC 调用 | ✅ R4.0 Handler + Subsystem sendTo (R4.1-A) | ✅ | ✅ | ✅ | P0 |
 | 增量同步 | ✅ R3.1 Delta (CRC32C dirty) | ✅ | ⚠️ | ✅ | P2 done |
-| Interest Management | ⚠ R4.1-B 进行中 | ✅ | ⚠️ | ✅ | P3 |
+| Interest Management | ✅ AOI + priority/budget + distance LOD + lifecycle batching/backpressure | ✅ | ✅ | ✅ | P3 done |
 | Authority 模型 | ✅ Server/ListenServer gate + Subsystem 接线 (R4.1-A) | ✅ | ✅ | ✅ | P0 |
 | 加密（DTLS/AES） | ✅ 由 GNS 提供（应用层不重复） | ✅ | ✅ | ✅ | P0 |
 

@@ -3,6 +3,7 @@
 #include <sodium.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 #include <mutex>
@@ -16,6 +17,9 @@ namespace
 
 constexpr size_t kMaxNameBytes = 128;
 constexpr size_t kMaxKeyBytes = 64;
+constexpr size_t kMaxMetadataEntries = 32;
+constexpr size_t kMaxMetadataValueBytes = 256;
+constexpr size_t kMaxPasswordBytes = 128;
 constexpr char kHex[] = "0123456789abcdef";
 
 uint64_t systemNow() {
@@ -48,6 +52,47 @@ bool tokenEqual(const std::string& left, const std::string& right) {
 
 bool validKey(const std::string& value) {
     return !value.empty() && value.size() <= kMaxKeyBytes;
+}
+
+bool validMetadata(const OnlineMetadata& metadata) {
+    if (metadata.size() > kMaxMetadataEntries) return false;
+    for (const auto& [key, value] : metadata) {
+        if (!validKey(key) || value.size() > kMaxMetadataValueBytes) return false;
+    }
+    return true;
+}
+
+bool metadataContains(const OnlineMetadata& available,
+                      const OnlineMetadata& required) {
+    for (const auto& [key, value] : required) {
+        const auto found = available.find(key);
+        if (found == available.end() || found->second != value) return false;
+    }
+    return true;
+}
+
+bool passwordHash(std::string_view password, std::string& encoded) {
+    if (!sodiumReady() || password.empty() ||
+        password.size() > kMaxPasswordBytes) return false;
+    std::array<char, crypto_pwhash_STRBYTES> buffer{};
+    if (crypto_pwhash_str_alg(
+            buffer.data(), password.data(),
+            static_cast<unsigned long long>(password.size()),
+            crypto_pwhash_OPSLIMIT_INTERACTIVE,
+            crypto_pwhash_MEMLIMIT_INTERACTIVE,
+            crypto_pwhash_ALG_ARGON2ID13) != 0) return false;
+    encoded.assign(buffer.data());
+    sodium_memzero(buffer.data(), buffer.size());
+    return true;
+}
+
+bool passwordVerify(std::string_view password, const std::string& encoded) {
+    return sodiumReady() && !password.empty() &&
+        password.size() <= kMaxPasswordBytes &&
+        encoded.size() < crypto_pwhash_STRBYTES &&
+        crypto_pwhash_str_verify(
+            encoded.c_str(), password.data(),
+            static_cast<unsigned long long>(password.size())) == 0;
 }
 
 bool containsPeer(const std::vector<PeerId>& peers, const PeerId& peer) {
@@ -86,7 +131,10 @@ OnlineServiceError mapSessionError(SessionServiceError error) {
 bool LobbyInfo::isValid() const {
     if (lobbyId == 0 || revision == 0 || !ownerPeerId.isValid() ||
         name.empty() || !validKey(region) || !validKey(buildId) ||
-        !content.isValid() || capacity == 0 || members.size() > capacity) {
+        !content.isValid() || !validMetadata(metadata) || capacity == 0 ||
+        members.size() > capacity ||
+        static_cast<uint8_t>(visibility) >
+            static_cast<uint8_t>(LobbyVisibility::Private)) {
         return false;
     }
     // The final member leaving returns a closed tombstone so remote clients
@@ -100,13 +148,26 @@ bool LobbyInfo::isValid() const {
 }
 
 struct InMemoryOnlineServices::Impl {
-    struct LobbyRecord { LobbyInfo info; };
+    struct InvitationRecord {
+        uint64_t expiresAt = 0;
+        uint16_t remainingUses = 0;
+    };
+    struct LobbyRecord {
+        LobbyInfo info;
+        std::string passwordVerifier;
+        std::unordered_map<std::string, InvitationRecord> invitations;
+    };
     struct ServerRecord {
         DedicatedServerInfo info;
         std::string token;
     };
     struct AllocationRecord { DedicatedAllocation allocation; };
     struct TicketRecord { MatchTicketInfo info; };
+    struct ReadyMatch {
+        uint64_t matchId = 0;
+        std::vector<MatchTicketId> tickets;
+        MatchmakingRequest request;
+    };
 
     Impl(InMemoryOnlineServicesConfig input,
          std::shared_ptr<IP2PSessionService> sessions)
@@ -160,19 +221,56 @@ struct InMemoryOnlineServices::Impl {
 
     bool matchCompatible(const MatchmakingRequest& left,
                          const MatchmakingRequest& right) const {
+        const uint32_t skillDistance = left.skillRating > right.skillRating
+            ? left.skillRating - right.skillRating
+            : right.skillRating - left.skillRating;
+        const bool pingCompatible =
+            (left.maxPingMs == 0 || right.estimatedPingMs <= left.maxPingMs) &&
+            (right.maxPingMs == 0 || left.estimatedPingMs <= right.maxPingMs);
         return left.queue == right.queue && left.region == right.region &&
                left.buildId == right.buildId &&
                left.content == right.content &&
                left.topology == right.topology &&
                left.targetPlayers == right.targetPlayers &&
-               left.virtualPort == right.virtualPort;
+               left.minimumPlayers == right.minimumPlayers &&
+               left.virtualPort == right.virtualPort &&
+               left.teamCount == right.teamCount &&
+               left.allowBackfill == right.allowBackfill &&
+               left.requireAcceptance == right.requireAcceptance &&
+               pingCompatible && skillDistance <= left.skillTolerance &&
+               skillDistance <= right.skillTolerance;
+    }
+
+    void expireMatchAcceptanceLocked() {
+        const uint64_t current = now();
+        std::unordered_set<uint64_t> expired;
+        for (const auto& [id, record] : tickets) {
+            (void)id;
+            const auto& info = record.info;
+            if (info.state == MatchTicketState::AwaitingAcceptance &&
+                info.assignment.matchId != 0 &&
+                current >= info.acceptanceExpiresAtUnixSeconds) {
+                expired.insert(info.assignment.matchId);
+            }
+        }
+        for (auto& [id, record] : tickets) {
+            (void)id;
+            MatchTicketInfo& info = record.info;
+            if (!expired.contains(info.assignment.matchId)) continue;
+            info.state = MatchTicketState::Queued;
+            info.assignment = {};
+            info.acceptedMembers.clear();
+            info.acceptanceExpiresAtUnixSeconds = 0;
+            info.failure = "match acceptance timed out; ticket requeued";
+        }
     }
 
     bool peerHasActiveTicketLocked(const PeerId& peer) const {
         for (const auto& [id, record] : tickets) {
             (void)id;
             if ((record.info.state == MatchTicketState::Queued ||
-                 record.info.state == MatchTicketState::Matching) &&
+                 record.info.state == MatchTicketState::Matching ||
+                 record.info.state == MatchTicketState::AwaitingAcceptance) &&
                 containsPeer(record.info.request.partyMembers, peer)) return true;
         }
         return false;
@@ -186,6 +284,7 @@ struct InMemoryOnlineServices::Impl {
     std::unordered_map<DedicatedAllocationId, AllocationRecord> allocations;
     std::unordered_map<MatchTicketId, TicketRecord> tickets;
     std::vector<MatchTicketId> ticketOrder;
+    std::vector<ReadyMatch> readyMatches;
 };
 
 InMemoryOnlineServices::InMemoryOnlineServices(
@@ -200,10 +299,20 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::createLobby(
     if (!request.ownerPeerId.isValid() || request.name.empty() ||
         request.name.size() > kMaxNameBytes || !validKey(request.region) ||
         !validKey(request.buildId) || !request.content.isValid() ||
-        request.capacity == 0 ||
-        request.capacity > _impl->config.maxLobbyCapacity) {
+        !validMetadata(request.metadata) ||
+        request.password.size() > kMaxPasswordBytes || request.capacity == 0 ||
+        request.capacity > _impl->config.maxLobbyCapacity ||
+        static_cast<uint8_t>(request.visibility) >
+            static_cast<uint8_t>(LobbyVisibility::Private)) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::InvalidRequest, "invalid lobby request");
+    }
+    std::string passwordVerifier;
+    if (!request.password.empty() &&
+        !passwordHash(request.password, passwordVerifier)) {
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::InternalError,
+            "failed to protect lobby password");
     }
     std::lock_guard<std::mutex> lock(_impl->mutex);
     if (_impl->lobbies.size() >= _impl->config.maxLobbies) {
@@ -225,8 +334,14 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::createLobby(
     info.content = request.content;
     info.capacity = request.capacity;
     info.state = LobbyState::Open;
+    info.visibility = request.visibility;
+    info.metadata = request.metadata;
+    info.passwordProtected = !request.password.empty();
     info.members.push_back(request.ownerPeerId);
-    _impl->lobbies.emplace(id, Impl::LobbyRecord{info});
+    Impl::LobbyRecord record;
+    record.info = info;
+    record.passwordVerifier = std::move(passwordVerifier);
+    _impl->lobbies.emplace(id, std::move(record));
     return OnlineServiceResult<LobbyInfo>::success(std::move(info));
 }
 
@@ -234,7 +349,8 @@ OnlineServiceResult<std::vector<LobbyInfo>>
 InMemoryOnlineServices::listLobbies(const ListLobbiesRequest& request) {
     if (request.limit == 0 || request.limit > 1000 ||
         request.region.size() > kMaxKeyBytes ||
-        request.buildId.size() > kMaxKeyBytes) {
+        request.buildId.size() > kMaxKeyBytes ||
+        request.contentId.size() > 128 || !validMetadata(request.metadata)) {
         return OnlineServiceResult<std::vector<LobbyInfo>>::failure(
             OnlineServiceError::InvalidRequest, "invalid lobby filter");
     }
@@ -244,8 +360,12 @@ InMemoryOnlineServices::listLobbies(const ListLobbiesRequest& request) {
         (void)id;
         const LobbyInfo& info = record.info;
         if (info.state != LobbyState::Open ||
+            info.visibility != LobbyVisibility::Public ||
             (!request.region.empty() && info.region != request.region) ||
             (!request.buildId.empty() && info.buildId != request.buildId) ||
+            (!request.contentId.empty() &&
+             info.content.contentId != request.contentId) ||
+            !metadataContains(info.metadata, request.metadata) ||
             info.capacity - info.members.size() < request.minimumOpenSlots) {
             continue;
         }
@@ -260,18 +380,27 @@ InMemoryOnlineServices::listLobbies(const ListLobbiesRequest& request) {
 
 OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::joinLobby(
     LobbyId lobbyId, const PeerId& authenticatedPeer) {
-    if (lobbyId == 0 || !authenticatedPeer.isValid()) {
+    return joinLobby(JoinLobbyRequest{lobbyId, authenticatedPeer});
+}
+
+OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::joinLobby(
+    const JoinLobbyRequest& request) {
+    if (request.lobbyId == 0 || !request.authenticatedPeer.isValid() ||
+        request.password.size() > kMaxPasswordBytes ||
+        (!request.invitationToken.empty() &&
+         request.invitationToken.size() != 64)) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::InvalidRequest, "invalid lobby join");
     }
     std::lock_guard<std::mutex> lock(_impl->mutex);
-    auto found = _impl->lobbies.find(lobbyId);
+    auto found = _impl->lobbies.find(request.lobbyId);
     if (found == _impl->lobbies.end()) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::NotFound, "lobby not found");
     }
-    LobbyInfo& info = found->second.info;
-    if (containsPeer(info.members, authenticatedPeer)) {
+    Impl::LobbyRecord& record = found->second;
+    LobbyInfo& info = record.info;
+    if (containsPeer(info.members, request.authenticatedPeer)) {
         return OnlineServiceResult<LobbyInfo>::success(info);
     }
     if (info.state != LobbyState::Open) {
@@ -282,7 +411,29 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::joinLobby(
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::Full, "lobby is full");
     }
-    info.members.push_back(authenticatedPeer);
+    bool invited = false;
+    if (!request.invitationToken.empty()) {
+        auto invitation = record.invitations.find(request.invitationToken);
+        if (invitation != record.invitations.end() &&
+            invitation->second.remainingUses != 0 &&
+            _impl->now() < invitation->second.expiresAt) {
+            invited = true;
+            if (--invitation->second.remainingUses == 0) {
+                record.invitations.erase(invitation);
+            }
+        }
+    }
+    bool passwordAccepted = !info.passwordProtected;
+    if (info.passwordProtected && !request.password.empty()) {
+        passwordAccepted = passwordVerify(
+            request.password, record.passwordVerifier);
+    }
+    if ((info.visibility == LobbyVisibility::Private && !invited) ||
+        (!invited && !passwordAccepted)) {
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::Unauthorized, "lobby credentials were rejected");
+    }
+    info.members.push_back(request.authenticatedPeer);
     ++info.revision;
     return OnlineServiceResult<LobbyInfo>::success(info);
 }
@@ -327,9 +478,21 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::updateLobby(
     const UpdateLobbyRequest& request) {
     if (request.lobbyId == 0 || !request.actorPeerId.isValid() ||
         request.expectedRevision == 0 || request.name.empty() ||
-        request.name.size() > kMaxNameBytes) {
+        request.name.size() > kMaxNameBytes ||
+        (request.replaceMetadata && !validMetadata(request.metadata)) ||
+        request.password.size() > kMaxPasswordBytes ||
+        (request.setVisibility &&
+         static_cast<uint8_t>(request.visibility) >
+             static_cast<uint8_t>(LobbyVisibility::Private))) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::InvalidRequest, "invalid lobby update");
+    }
+    std::string passwordVerifier;
+    if (request.setPassword && !request.password.empty() &&
+        !passwordHash(request.password, passwordVerifier)) {
+        return OnlineServiceResult<LobbyInfo>::failure(
+            OnlineServiceError::InternalError,
+            "failed to protect lobby password");
     }
     std::lock_guard<std::mutex> lock(_impl->mutex);
     auto found = _impl->lobbies.find(request.lobbyId);
@@ -337,7 +500,8 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::updateLobby(
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::NotFound, "lobby not found");
     }
-    LobbyInfo& info = found->second.info;
+    Impl::LobbyRecord& record = found->second;
+    LobbyInfo& info = record.info;
     if (info.ownerPeerId != request.actorPeerId) {
         return OnlineServiceResult<LobbyInfo>::failure(
             OnlineServiceError::Unauthorized, "only the lobby owner may update it");
@@ -351,6 +515,12 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::updateLobby(
             OnlineServiceError::Closed, "lobby is not open");
     }
     info.name = request.name;
+    if (request.replaceMetadata) info.metadata = request.metadata;
+    if (request.setVisibility) info.visibility = request.visibility;
+    if (request.setPassword) {
+        info.passwordProtected = !request.password.empty();
+        record.passwordVerifier = std::move(passwordVerifier);
+    }
     ++info.revision;
     return OnlineServiceResult<LobbyInfo>::success(info);
 }
@@ -363,6 +533,55 @@ OnlineServiceResult<LobbyInfo> InMemoryOnlineServices::getLobby(LobbyId lobbyId)
             OnlineServiceError::NotFound, "lobby not found");
     }
     return OnlineServiceResult<LobbyInfo>::success(found->second.info);
+}
+
+OnlineServiceResult<LobbyInvitation>
+InMemoryOnlineServices::createLobbyInvitation(
+    const CreateLobbyInvitationRequest& request) {
+    if (request.lobbyId == 0 || !request.actorPeerId.isValid() ||
+        request.expectedRevision == 0 || request.lifetimeSeconds == 0 ||
+        request.lifetimeSeconds >
+            _impl->config.lobbyInvitationMaxLifetimeSeconds ||
+        request.maxUses == 0) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            OnlineServiceError::InvalidRequest, "invalid lobby invitation");
+    }
+    std::lock_guard<std::mutex> lock(_impl->mutex);
+    auto found = _impl->lobbies.find(request.lobbyId);
+    if (found == _impl->lobbies.end()) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            OnlineServiceError::NotFound, "lobby not found");
+    }
+    const LobbyInfo& info = found->second.info;
+    if (info.ownerPeerId != request.actorPeerId) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            OnlineServiceError::Unauthorized,
+            "only the lobby owner may create invitations");
+    }
+    if (info.revision != request.expectedRevision) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            OnlineServiceError::Conflict, "lobby revision changed");
+    }
+    if (info.state != LobbyState::Open) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            OnlineServiceError::Closed, "lobby is not open");
+    }
+    const std::string token = randomToken();
+    if (token.empty()) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            OnlineServiceError::InternalError,
+            "failed to create invitation token");
+    }
+    LobbyInvitation invitation;
+    invitation.lobbyId = request.lobbyId;
+    invitation.token = token;
+    invitation.expiresAtUnixSeconds = _impl->now() + request.lifetimeSeconds;
+    invitation.remainingUses = request.maxUses;
+    found->second.invitations.emplace(
+        token, Impl::InvitationRecord{invitation.expiresAtUnixSeconds,
+                                      invitation.remainingUses});
+    return OnlineServiceResult<LobbyInvitation>::success(
+        std::move(invitation));
 }
 
 OnlineServiceResult<LobbyLaunchResult> InMemoryOnlineServices::launchLobbyP2P(
@@ -677,21 +896,69 @@ InMemoryOnlineServices::listServers() {
 
 OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::enqueueMatch(
     const MatchmakingRequest& request) {
-    if (!validParty(request.partyMembers, request.targetPlayers) ||
-        !validKey(request.queue) || !validKey(request.region) ||
-        !validKey(request.buildId) || !request.content.isValid() ||
-        request.targetPlayers < 2 ||
-        request.virtualPort == 0 ||
-        request.targetPlayers > _impl->config.maxMatchPlayers) {
+    MatchmakingRequest normalized = request;
+    if (normalized.minimumPlayers == 0) {
+        normalized.minimumPlayers = normalized.targetPlayers;
+    }
+    if (!normalized.allowBackfill) {
+        normalized.minimumPlayers = normalized.targetPlayers;
+    }
+    if (!validKey(normalized.queue) || !validKey(normalized.region) ||
+        !validKey(normalized.buildId) || !normalized.content.isValid() ||
+        normalized.targetPlayers < 2 || normalized.minimumPlayers < 2 ||
+        normalized.minimumPlayers > normalized.targetPlayers ||
+        normalized.virtualPort == 0 || normalized.teamCount == 0 ||
+        normalized.teamCount > normalized.targetPlayers ||
+        normalized.targetPlayers > _impl->config.maxMatchPlayers ||
+        static_cast<uint8_t>(normalized.topology) >
+            static_cast<uint8_t>(MatchTopology::Any) ||
+        (normalized.maxPingMs != 0 &&
+         normalized.estimatedPingMs > normalized.maxPingMs) ||
+        (normalized.sourceLobbyId == 0 &&
+         !validParty(normalized.partyMembers, normalized.targetPlayers)) ||
+        (normalized.sourceLobbyId != 0 &&
+         (normalized.sourceLobbyRevision == 0 ||
+          !normalized.partyLeaderPeerId.isValid()))) {
         return OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::InvalidRequest, "invalid matchmaking request");
     }
     std::lock_guard<std::mutex> lock(_impl->mutex);
+    _impl->expireMatchAcceptanceLocked();
+    if (normalized.sourceLobbyId != 0) {
+        const auto lobby = _impl->lobbies.find(normalized.sourceLobbyId);
+        if (lobby == _impl->lobbies.end()) {
+            return OnlineServiceResult<MatchTicketInfo>::failure(
+                OnlineServiceError::NotFound, "matchmaking lobby not found");
+        }
+        const LobbyInfo& party = lobby->second.info;
+        if (party.ownerPeerId != normalized.partyLeaderPeerId) {
+            return OnlineServiceResult<MatchTicketInfo>::failure(
+                OnlineServiceError::Unauthorized,
+                "only the lobby leader may queue the party");
+        }
+        if (party.revision != normalized.sourceLobbyRevision) {
+            return OnlineServiceResult<MatchTicketInfo>::failure(
+                OnlineServiceError::Conflict, "lobby revision changed");
+        }
+        if (party.state != LobbyState::Open) {
+            return OnlineServiceResult<MatchTicketInfo>::failure(
+                OnlineServiceError::Closed, "lobby is not open");
+        }
+        normalized.partyMembers = party.members;
+        normalized.region = party.region;
+        normalized.buildId = party.buildId;
+        normalized.content = party.content;
+        if (!validParty(normalized.partyMembers, normalized.targetPlayers)) {
+            return OnlineServiceResult<MatchTicketInfo>::failure(
+                OnlineServiceError::InvalidRequest,
+                "lobby party exceeds the requested match size");
+        }
+    }
     if (_impl->tickets.size() >= _impl->config.maxMatchTickets) {
         return OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::Full, "matchmaking queue is full");
     }
-    for (const PeerId& peer : request.partyMembers) {
+    for (const PeerId& peer : normalized.partyMembers) {
         if (_impl->peerHasActiveTicketLocked(peer)) {
             return OnlineServiceResult<MatchTicketInfo>::failure(
                 OnlineServiceError::Conflict,
@@ -705,7 +972,7 @@ OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::enqueueMatch(
     }
     MatchTicketInfo info;
     info.ticketId = id;
-    info.request = request;
+    info.request = std::move(normalized);
     _impl->tickets.emplace(id, Impl::TicketRecord{info});
     _impl->ticketOrder.push_back(id);
     return OnlineServiceResult<MatchTicketInfo>::success(std::move(info));
@@ -718,6 +985,7 @@ OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::getMatch(
             OnlineServiceError::InvalidRequest, "invalid match query");
     }
     std::lock_guard<std::mutex> lock(_impl->mutex);
+    _impl->expireMatchAcceptanceLocked();
     auto found = _impl->tickets.find(ticketId);
     if (found == _impl->tickets.end()) {
         return OnlineServiceResult<MatchTicketInfo>::failure(
@@ -739,11 +1007,30 @@ OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::cancelMatch(
         return OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::NotFound, "match ticket not found");
     }
+    _impl->expireMatchAcceptanceLocked();
     if (!authenticatedPeer.isValid() ||
         !containsPeer(found->second.info.request.partyMembers,
                       authenticatedPeer)) {
         return OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::Unauthorized, "peer does not own this ticket");
+    }
+    if (found->second.info.state == MatchTicketState::AwaitingAcceptance) {
+        const uint64_t matchId = found->second.info.assignment.matchId;
+        for (auto& [id, record] : _impl->tickets) {
+            (void)id;
+            if (record.info.assignment.matchId != matchId) continue;
+            if (record.info.ticketId == ticketId) {
+                record.info.state = MatchTicketState::Cancelled;
+                record.info.failure = "match acceptance cancelled";
+            } else {
+                record.info.state = MatchTicketState::Queued;
+                record.info.failure = "another party cancelled; ticket requeued";
+            }
+            record.info.assignment = {};
+            record.info.acceptedMembers.clear();
+            record.info.acceptanceExpiresAtUnixSeconds = 0;
+        }
+        return OnlineServiceResult<MatchTicketInfo>::success(found->second.info);
     }
     if (found->second.info.state != MatchTicketState::Queued) {
         return OnlineServiceResult<MatchTicketInfo>::failure(
@@ -753,42 +1040,182 @@ OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::cancelMatch(
     return OnlineServiceResult<MatchTicketInfo>::success(found->second.info);
 }
 
+OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::respondToMatch(
+    const MatchAcceptanceRequest& request) {
+    if (request.ticketId == 0 || !request.authenticatedPeer.isValid()) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::InvalidRequest, "invalid match response");
+    }
+    std::lock_guard<std::mutex> lock(_impl->mutex);
+    _impl->expireMatchAcceptanceLocked();
+    auto found = _impl->tickets.find(request.ticketId);
+    if (found == _impl->tickets.end()) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::NotFound, "match ticket not found");
+    }
+    MatchTicketInfo& responding = found->second.info;
+    if (!containsPeer(responding.request.partyMembers,
+                      request.authenticatedPeer)) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::Unauthorized, "peer does not own this ticket");
+    }
+    if (responding.state != MatchTicketState::AwaitingAcceptance ||
+        responding.assignment.matchId == 0) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::Conflict,
+            "match ticket is not awaiting acceptance");
+    }
+
+    const uint64_t matchId = responding.assignment.matchId;
+    if (!request.accept) {
+        for (auto& [id, record] : _impl->tickets) {
+            (void)id;
+            MatchTicketInfo& info = record.info;
+            if (info.assignment.matchId != matchId) continue;
+            if (info.ticketId == request.ticketId) {
+                info.state = MatchTicketState::Cancelled;
+                info.failure = "a party member declined the match";
+            } else {
+                info.state = MatchTicketState::Queued;
+                info.failure = "another party declined; ticket requeued";
+            }
+            info.assignment = {};
+            info.acceptedMembers.clear();
+            info.acceptanceExpiresAtUnixSeconds = 0;
+        }
+        return OnlineServiceResult<MatchTicketInfo>::success(responding);
+    }
+
+    if (!containsPeer(responding.acceptedMembers,
+                      request.authenticatedPeer)) {
+        responding.acceptedMembers.push_back(request.authenticatedPeer);
+    }
+    bool allAccepted = true;
+    std::vector<MatchTicketId> batch;
+    MatchmakingRequest matchRequest;
+    for (const auto& [id, record] : _impl->tickets) {
+        const MatchTicketInfo& info = record.info;
+        if (info.assignment.matchId != matchId) continue;
+        batch.push_back(id);
+        matchRequest = info.request;
+        for (const PeerId& peer : info.request.partyMembers) {
+            if (!containsPeer(info.acceptedMembers, peer)) {
+                allAccepted = false;
+            }
+        }
+    }
+    if (allAccepted && !batch.empty()) {
+        for (MatchTicketId id : batch) {
+            MatchTicketInfo& info = _impl->tickets.at(id).info;
+            info.state = MatchTicketState::Matching;
+            info.acceptanceExpiresAtUnixSeconds = 0;
+            info.failure.clear();
+        }
+        _impl->readyMatches.push_back(
+            Impl::ReadyMatch{matchId, std::move(batch), std::move(matchRequest)});
+    }
+    return OnlineServiceResult<MatchTicketInfo>::success(responding);
+}
+
 size_t InMemoryOnlineServices::runMatchmaking(size_t maxMatches) {
     size_t processed = 0;
     while (processed < maxMatches) {
         std::vector<MatchTicketId> batch;
         MatchmakingRequest matchRequest;
+        MatchAssignment assignment;
+        bool awaitingAcceptance = false;
         {
             std::lock_guard<std::mutex> lock(_impl->mutex);
-            for (MatchTicketId seedId : _impl->ticketOrder) {
-                auto seed = _impl->tickets.find(seedId);
-                if (seed == _impl->tickets.end() ||
-                    seed->second.info.state != MatchTicketState::Queued) continue;
-                std::vector<MatchTicketId> candidate{seedId};
-                size_t players = seed->second.info.request.partyMembers.size();
-                for (MatchTicketId candidateId : _impl->ticketOrder) {
-                    if (candidateId == seedId) continue;
-                    auto entry = _impl->tickets.find(candidateId);
-                    if (entry == _impl->tickets.end() ||
-                        entry->second.info.state != MatchTicketState::Queued ||
-                        !_impl->matchCompatible(seed->second.info.request,
-                                                entry->second.info.request)) continue;
-                    const size_t party = entry->second.info.request.partyMembers.size();
-                    if (players + party > seed->second.info.request.targetPlayers) continue;
-                    candidate.push_back(candidateId);
-                    players += party;
-                    if (players == seed->second.info.request.targetPlayers) break;
+            _impl->expireMatchAcceptanceLocked();
+            if (!_impl->readyMatches.empty()) {
+                auto ready = std::move(_impl->readyMatches.front());
+                _impl->readyMatches.erase(_impl->readyMatches.begin());
+                batch = std::move(ready.tickets);
+                matchRequest = std::move(ready.request);
+                assignment.matchId = ready.matchId;
+                if (!batch.empty()) {
+                    assignment.placements =
+                        _impl->tickets.at(batch.front()).info.assignment.placements;
                 }
-                if (players != seed->second.info.request.targetPlayers) continue;
-                batch = std::move(candidate);
-                matchRequest = seed->second.info.request;
-                for (MatchTicketId id : batch) {
-                    _impl->tickets.at(id).info.state = MatchTicketState::Matching;
+            } else {
+                for (MatchTicketId seedId : _impl->ticketOrder) {
+                    auto seed = _impl->tickets.find(seedId);
+                    if (seed == _impl->tickets.end() ||
+                        seed->second.info.state != MatchTicketState::Queued) continue;
+                    std::vector<MatchTicketId> candidate{seedId};
+                    size_t players = seed->second.info.request.partyMembers.size();
+                    for (MatchTicketId candidateId : _impl->ticketOrder) {
+                        if (candidateId == seedId) continue;
+                        auto entry = _impl->tickets.find(candidateId);
+                        if (entry == _impl->tickets.end() ||
+                            entry->second.info.state != MatchTicketState::Queued ||
+                            !_impl->matchCompatible(seed->second.info.request,
+                                                    entry->second.info.request)) continue;
+                        const size_t party =
+                            entry->second.info.request.partyMembers.size();
+                        if (players + party >
+                            seed->second.info.request.targetPlayers) continue;
+                        candidate.push_back(candidateId);
+                        players += party;
+                        if (players ==
+                            seed->second.info.request.targetPlayers) break;
+                    }
+                    const size_t required = seed->second.info.request.allowBackfill
+                        ? seed->second.info.request.minimumPlayers
+                        : seed->second.info.request.targetPlayers;
+                    if (players < required) continue;
+                    batch = std::move(candidate);
+                    matchRequest = seed->second.info.request;
+                    for (unsigned attempt = 0;
+                         attempt < 8 && assignment.matchId == 0; ++attempt) {
+                        randombytes_buf(&assignment.matchId,
+                                        sizeof(assignment.matchId));
+                    }
+                    if (assignment.matchId == 0) {
+                        batch.clear();
+                        break;
+                    }
+
+                    std::vector<size_t> teamSizes(matchRequest.teamCount, 0);
+                    for (MatchTicketId id : batch) {
+                        const auto& party =
+                            _impl->tickets.at(id).info.request.partyMembers;
+                        const auto smallest = std::min_element(
+                            teamSizes.begin(), teamSizes.end());
+                        const uint8_t team = static_cast<uint8_t>(
+                            std::distance(teamSizes.begin(), smallest));
+                        *smallest += party.size();
+                        for (const PeerId& peer : party) {
+                            assignment.placements.push_back({peer, team});
+                        }
+                    }
+
+                    awaitingAcceptance = matchRequest.requireAcceptance;
+                    const uint64_t deadline = _impl->now() +
+                        std::max<uint32_t>(1,
+                            _impl->config.matchAcceptanceSeconds);
+                    for (MatchTicketId id : batch) {
+                        MatchTicketInfo& info = _impl->tickets.at(id).info;
+                        info.state = awaitingAcceptance
+                            ? MatchTicketState::AwaitingAcceptance
+                            : MatchTicketState::Matching;
+                        info.assignment.matchId = assignment.matchId;
+                        info.assignment.content = matchRequest.content;
+                        info.assignment.placements = assignment.placements;
+                        info.acceptedMembers.clear();
+                        info.acceptanceExpiresAtUnixSeconds =
+                            awaitingAcceptance ? deadline : 0;
+                        info.failure.clear();
+                    }
+                    break;
                 }
-                break;
             }
         }
         if (batch.empty()) break;
+        if (awaitingAcceptance) {
+            ++processed;
+            continue;
+        }
 
         std::vector<PeerId> peers;
         {
@@ -799,7 +1226,6 @@ size_t InMemoryOnlineServices::runMatchmaking(size_t maxMatches) {
             }
         }
 
-        MatchAssignment assignment;
         assignment.content = matchRequest.content;
         OnlineServiceError failure = OnlineServiceError::None;
         std::string failureMessage;
@@ -870,8 +1296,10 @@ size_t InMemoryOnlineServices::runMatchmaking(size_t maxMatches) {
                 continue;
             }
             info.state = MatchTicketState::Matched;
+            info.assignment.matchId = assignment.matchId;
             info.assignment.topology = assignment.topology;
             info.assignment.content = assignment.content;
+            info.assignment.placements = assignment.placements;
             if (assignment.topology == MatchTopology::Dedicated) {
                 info.assignment.dedicated = assignment.dedicated;
             } else {

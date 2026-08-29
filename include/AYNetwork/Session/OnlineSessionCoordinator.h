@@ -49,9 +49,11 @@ enum class OnlineSessionCoordinatorState : uint8_t {
     InLobby,
     RefreshingLobby,
     UpdatingLobby,
+    CreatingLobbyInvitation,
     LeavingLobby,
     LaunchingLobby,
     Queueing,
+    AwaitingMatchAcceptance,
     CancellingMatch,
     Assigned,
     Connecting,
@@ -129,8 +131,12 @@ public:
     bool listLobbies(ListLobbiesRequest request = {});
     bool createLobby(CreateLobbyRequest request);
     bool joinLobby(LobbyId lobbyId);
+    bool joinLobby(JoinLobbyRequest request);
     bool refreshLobby();
+    bool updateLobby(UpdateLobbyRequest request);
     bool updateLobbyName(std::string name);
+    bool createLobbyInvitation(uint32_t lifetimeSeconds = 600,
+                               uint16_t maxUses = 1);
     bool leaveLobby();
     bool launchLobbyP2P(uint16_t virtualPort);
 
@@ -138,6 +144,7 @@ public:
     // localPeerId; authorization of the remaining party is still a backend
     // responsibility.
     bool startMatchmaking(MatchmakingRequest request);
+    bool respondToMatch(bool accept);
     bool cancelMatchmaking();
 
     // Leaves the active transport/backend membership. A Lobby-launched session
@@ -152,6 +159,9 @@ public:
 
     OnlineSessionCoordinatorStatus getStatus() const;
     std::vector<LobbyInfo> getLobbyResults() const;
+    // Invitation tokens are secret and are never copied into status/events.
+    // Successful retrieval consumes the locally cached result.
+    LobbyInvitation takeLobbyInvitation();
 
 private:
     struct Impl;

@@ -246,6 +246,25 @@ bool contentFromJson(const json& value, OnlineContentDescriptor& out) {
     } catch (...) { out = {}; return false; }
 }
 
+json metadataToJson(const OnlineMetadata& metadata) {
+    json value = json::object();
+    for (const auto& [key, entry] : metadata) value[key] = entry;
+    return value;
+}
+
+bool metadataFromJson(const json& value, OnlineMetadata& out) {
+    if (!value.is_object()) return false;
+    OnlineMetadata parsed;
+    try {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (!it.value().is_string()) return false;
+            parsed.emplace(it.key(), it.value().get<std::string>());
+        }
+    } catch (...) { return false; }
+    out = std::move(parsed);
+    return true;
+}
+
 json lobbyToJson(const LobbyInfo& value) {
     json members = json::array();
     for (const PeerId& peer : value.members) members.push_back(peer.value);
@@ -255,6 +274,9 @@ json lobbyToJson(const LobbyInfo& value) {
             {"content", contentToJson(value.content)},
             {"capacity", value.capacity},
             {"state", static_cast<uint8_t>(value.state)},
+            {"visibility", static_cast<uint8_t>(value.visibility)},
+            {"metadata", metadataToJson(value.metadata)},
+            {"password_protected", value.passwordProtected},
             {"members", std::move(members)}, {"session_id", value.sessionId}};
 }
 
@@ -262,17 +284,23 @@ bool lobbyFromJson(const json& value, LobbyInfo& out) {
     try {
         LobbyInfo parsed;
         uint8_t state = 0;
+        uint8_t visibility = 0;
         if (!readUnsigned(value, "lobby_id", parsed.lobbyId) ||
             !readUnsigned(value, "revision", parsed.revision) ||
             !readUnsigned(value, "capacity", parsed.capacity) ||
             !readUnsigned(value, "state", state) || state > 3 ||
-            !readUnsigned(value, "session_id", parsed.sessionId)) return false;
+            !readUnsigned(value, "session_id", parsed.sessionId) ||
+            !readUnsigned(value, "visibility", visibility) || visibility > 2 ||
+            !value.at("password_protected").is_boolean()) return false;
         parsed.ownerPeerId = PeerId{value.at("owner_peer_id").get<std::string>()};
         parsed.name = value.at("name").get<std::string>();
         parsed.region = value.at("region").get<std::string>();
         parsed.buildId = value.at("build_id").get<std::string>();
         if (!contentFromJson(value.at("content"), parsed.content)) return false;
         parsed.state = static_cast<LobbyState>(state);
+        parsed.visibility = static_cast<LobbyVisibility>(visibility);
+        parsed.passwordProtected = value.at("password_protected").get<bool>();
+        if (!metadataFromJson(value.at("metadata"), parsed.metadata)) return false;
         for (const auto& peer : value.at("members")) {
             parsed.members.push_back(PeerId{peer.get<std::string>()});
         }
@@ -340,12 +368,24 @@ bool allocationFromJson(const json& value, DedicatedAllocation& out) {
 json matchRequestToJson(const MatchmakingRequest& value) {
     json members = json::array();
     for (const PeerId& peer : value.partyMembers) members.push_back(peer.value);
-    return {{"party_members", std::move(members)}, {"queue", value.queue},
+    return {{"party_members", std::move(members)},
+            {"source_lobby_id", value.sourceLobbyId},
+            {"source_lobby_revision", value.sourceLobbyRevision},
+            {"party_leader_peer_id", value.partyLeaderPeerId.value},
+            {"queue", value.queue},
             {"region", value.region}, {"build_id", value.buildId},
             {"content", contentToJson(value.content)},
             {"topology", static_cast<uint8_t>(value.topology)},
             {"target_players", value.targetPlayers},
-            {"virtual_port", value.virtualPort}};
+            {"minimum_players", value.minimumPlayers},
+            {"virtual_port", value.virtualPort},
+            {"estimated_ping_ms", value.estimatedPingMs},
+            {"max_ping_ms", value.maxPingMs},
+            {"skill_rating", value.skillRating},
+            {"skill_tolerance", value.skillTolerance},
+            {"team_count", value.teamCount},
+            {"allow_backfill", value.allowBackfill},
+            {"require_acceptance", value.requireAcceptance}};
 }
 
 bool matchRequestFromJson(const json& value, MatchmakingRequest& out) {
@@ -353,13 +393,28 @@ bool matchRequestFromJson(const json& value, MatchmakingRequest& out) {
         MatchmakingRequest parsed;
         uint8_t topology = 0;
         if (!readUnsigned(value, "topology", topology) || topology > 2 ||
+            !readUnsigned(value, "source_lobby_id", parsed.sourceLobbyId) ||
+            !readUnsigned(value, "source_lobby_revision",
+                          parsed.sourceLobbyRevision) ||
             !readUnsigned(value, "target_players", parsed.targetPlayers) ||
-            !readUnsigned(value, "virtual_port", parsed.virtualPort)) return false;
+            !readUnsigned(value, "minimum_players", parsed.minimumPlayers) ||
+            !readUnsigned(value, "virtual_port", parsed.virtualPort) ||
+            !readUnsigned(value, "estimated_ping_ms", parsed.estimatedPingMs) ||
+            !readUnsigned(value, "max_ping_ms", parsed.maxPingMs) ||
+            !readUnsigned(value, "skill_rating", parsed.skillRating) ||
+            !readUnsigned(value, "skill_tolerance", parsed.skillTolerance) ||
+            !readUnsigned(value, "team_count", parsed.teamCount) ||
+            !value.at("allow_backfill").is_boolean() ||
+            !value.at("require_acceptance").is_boolean()) return false;
+        parsed.partyLeaderPeerId = PeerId{
+            value.at("party_leader_peer_id").get<std::string>()};
         parsed.queue = value.at("queue").get<std::string>();
         parsed.region = value.at("region").get<std::string>();
         parsed.buildId = value.at("build_id").get<std::string>();
         if (!contentFromJson(value.at("content"), parsed.content)) return false;
         parsed.topology = static_cast<MatchTopology>(topology);
+        parsed.allowBackfill = value.at("allow_backfill").get<bool>();
+        parsed.requireAcceptance = value.at("require_acceptance").get<bool>();
         for (const auto& peer : value.at("party_members")) {
             parsed.partyMembers.push_back(PeerId{peer.get<std::string>()});
         }
@@ -373,17 +428,30 @@ json matchTicketToJson(const MatchTicketInfo& value) {
     for (const auto& grant : value.assignment.p2pGrants) {
         grants.push_back(grantToJson(grant));
     }
+    json placements = json::array();
+    for (const auto& placement : value.assignment.placements) {
+        placements.push_back({{"peer_id", placement.peerId.value},
+                              {"team_index", placement.teamIndex}});
+    }
+    json accepted = json::array();
+    for (const auto& peer : value.acceptedMembers) {
+        accepted.push_back(peer.value);
+    }
     const auto& assignmentContent = value.assignment.content.isValid()
         ? value.assignment.content : value.request.content;
     return {{"ticket_id", value.ticketId},
             {"state", static_cast<uint8_t>(value.state)},
             {"request", matchRequestToJson(value.request)},
-            {"assignment", {{"topology", static_cast<uint8_t>(
+            {"assignment", {{"match_id", value.assignment.matchId},
+                            {"topology", static_cast<uint8_t>(
                                 value.assignment.topology)},
                             {"content", contentToJson(assignmentContent)},
+                            {"placements", std::move(placements)},
                             {"p2p_grants", std::move(grants)},
                             {"dedicated", allocationToJson(
                                 value.assignment.dedicated)}}},
+            {"accepted_members", std::move(accepted)},
+            {"acceptance_expires_at", value.acceptanceExpiresAtUnixSeconds},
             {"failure", value.failure}};
 }
 
@@ -393,10 +461,14 @@ bool matchTicketFromJson(const json& value, MatchTicketInfo& out) {
         uint8_t state = 0;
         uint8_t topology = 0;
         if (!readUnsigned(value, "ticket_id", parsed.ticketId) ||
-            !readUnsigned(value, "state", state) || state > 4 ||
+            !readUnsigned(value, "state", state) || state > 5 ||
             !matchRequestFromJson(value.at("request"), parsed.request) ||
+            !readUnsigned(value.at("assignment"), "match_id",
+                          parsed.assignment.matchId) ||
             !readUnsigned(value.at("assignment"), "topology", topology) ||
-            topology > 2) return false;
+            topology > 2 ||
+            !readUnsigned(value, "acceptance_expires_at",
+                          parsed.acceptanceExpiresAtUnixSeconds)) return false;
         parsed.state = static_cast<MatchTicketState>(state);
         parsed.assignment.topology = static_cast<MatchTopology>(topology);
         if (!contentFromJson(value.at("assignment").at("content"),
@@ -406,6 +478,21 @@ bool matchTicketFromJson(const json& value, MatchTicketInfo& out) {
             P2PSessionGrant parsedGrant;
             if (!grantFromJson(grant, parsedGrant)) return false;
             parsed.assignment.p2pGrants.push_back(std::move(parsedGrant));
+        }
+        for (const auto& placement :
+             value.at("assignment").at("placements")) {
+            MatchPlayerPlacement parsedPlacement;
+            parsedPlacement.peerId = PeerId{
+                placement.at("peer_id").get<std::string>()};
+            if (!readUnsigned(placement, "team_index",
+                              parsedPlacement.teamIndex) ||
+                !parsedPlacement.peerId.isValid()) return false;
+            parsed.assignment.placements.push_back(
+                std::move(parsedPlacement));
+        }
+        for (const auto& peer : value.at("accepted_members")) {
+            parsed.acceptedMembers.push_back(
+                PeerId{peer.get<std::string>()});
         }
         const json& dedicated = value.at("assignment").at("dedicated");
         if (dedicated.value("allocation_id", uint64_t{0}) != 0 &&
@@ -542,7 +629,10 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::createLobby(
     const json body{{"name", request.name}, {"region", request.region},
                     {"build_id", request.buildId},
                     {"content", contentToJson(request.content)},
-                    {"capacity", request.capacity}};
+                    {"capacity", request.capacity},
+                    {"visibility", static_cast<uint8_t>(request.visibility)},
+                    {"metadata", metadataToJson(request.metadata)},
+                    {"password", request.password}};
     const auto response = _impl->invoke([&](httplib::Client& client) {
         return client.Post("/v1/lobbies", _impl->playerHeaders(token), body.dump(),
                            "application/json");
@@ -568,6 +658,8 @@ OnlineServiceResult<std::vector<LobbyInfo>> HttpOnlineServices::listLobbies(
     }
     const std::string path = "/v1/lobbies?region=" + urlEncode(request.region) +
         "&build_id=" + urlEncode(request.buildId) +
+        "&content_id=" + urlEncode(request.contentId) +
+        "&metadata=" + urlEncode(metadataToJson(request.metadata).dump()) +
         "&minimum_open_slots=" + std::to_string(request.minimumOpenSlots) +
         "&limit=" + std::to_string(request.limit);
     const auto response = _impl->invoke([&](httplib::Client& client) {
@@ -593,12 +685,22 @@ OnlineServiceResult<std::vector<LobbyInfo>> HttpOnlineServices::listLobbies(
 
 OnlineServiceResult<LobbyInfo> HttpOnlineServices::joinLobby(
     LobbyId lobbyId, const PeerId& actor) {
+    return joinLobby(JoinLobbyRequest{lobbyId, actor});
+}
+
+OnlineServiceResult<LobbyInfo> HttpOnlineServices::joinLobby(
+    const JoinLobbyRequest& request) {
     const std::string token = _impl->playerToken();
-    if (!_impl->actorMatches(actor, token)) return OnlineServiceResult<LobbyInfo>::failure(
+    if (!_impl->actorMatches(request.authenticatedPeer, token)) return
+        OnlineServiceResult<LobbyInfo>::failure(
         OnlineServiceError::Unauthorized, "local lobby actor does not match token");
-    const std::string path = "/v1/lobbies/" + std::to_string(lobbyId) + "/join";
+    const std::string path = "/v1/lobbies/" +
+        std::to_string(request.lobbyId) + "/join";
+    const json body{{"password", request.password},
+                    {"invitation_token", request.invitationToken}};
     const auto response = _impl->invoke([&](httplib::Client& client) {
-        return client.Post(path, _impl->playerHeaders(token), "{}", "application/json");
+        return client.Post(path, _impl->playerHeaders(token), body.dump(),
+                           "application/json");
     });
     if (response.error != OnlineServiceError::None) return
         OnlineServiceResult<LobbyInfo>::failure(response.error, response.message);
@@ -634,7 +736,13 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::updateLobby(
         OnlineServiceResult<LobbyInfo>::failure(OnlineServiceError::Unauthorized,
             "local lobby actor does not match token");
     const json body{{"expected_revision", request.expectedRevision},
-                    {"name", request.name}};
+                    {"name", request.name},
+                    {"replace_metadata", request.replaceMetadata},
+                    {"metadata", metadataToJson(request.metadata)},
+                    {"set_visibility", request.setVisibility},
+                    {"visibility", static_cast<uint8_t>(request.visibility)},
+                    {"set_password", request.setPassword},
+                    {"password", request.password}};
     const std::string path = "/v1/lobbies/" + std::to_string(request.lobbyId) +
         "/update";
     const auto response = _impl->invoke([&](httplib::Client& client) {
@@ -669,6 +777,48 @@ OnlineServiceResult<LobbyInfo> HttpOnlineServices::getLobby(LobbyId lobbyId) {
     return OnlineServiceResult<LobbyInfo>::success(std::move(info));
 }
 
+OnlineServiceResult<LobbyInvitation>
+HttpOnlineServices::createLobbyInvitation(
+    const CreateLobbyInvitationRequest& request) {
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(request.actorPeerId, token)) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            OnlineServiceError::Unauthorized,
+            "local lobby actor does not match token");
+    }
+    const json body{{"expected_revision", request.expectedRevision},
+                    {"lifetime_seconds", request.lifetimeSeconds},
+                    {"max_uses", request.maxUses}};
+    const std::string path = "/v1/lobbies/" +
+        std::to_string(request.lobbyId) + "/invitations";
+    const auto response = _impl->invoke([&](httplib::Client& client) {
+        return client.Post(path, _impl->playerHeaders(token), body.dump(),
+                           "application/json");
+    });
+    if (response.error != OnlineServiceError::None) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            response.error, response.message);
+    }
+    try {
+        LobbyInvitation invitation;
+        if (!readUnsigned(response.value, "lobby_id", invitation.lobbyId) ||
+            !readUnsigned(response.value, "expires_at",
+                          invitation.expiresAtUnixSeconds) ||
+            !readUnsigned(response.value, "remaining_uses",
+                          invitation.remainingUses)) {
+            throw std::runtime_error("invalid");
+        }
+        invitation.token = response.value.at("token").get<std::string>();
+        if (!invitation.isValid()) throw std::runtime_error("invalid");
+        return OnlineServiceResult<LobbyInvitation>::success(
+            std::move(invitation));
+    } catch (...) {
+        return OnlineServiceResult<LobbyInvitation>::failure(
+            OnlineServiceError::InternalError,
+            "invalid lobby-invitation response");
+    }
+}
+
 OnlineServiceResult<LobbyLaunchResult> HttpOnlineServices::launchLobbyP2P(
     const LaunchLobbyRequest& request) {
     const std::string token = _impl->playerToken();
@@ -699,7 +849,10 @@ OnlineServiceResult<MatchTicketInfo> HttpOnlineServices::enqueueMatch(
     const std::string token = _impl->playerToken();
     if (!_impl->config.localPeerId.isValid() ||
         token.empty() ||
-        !containsPeer(request.partyMembers, _impl->config.localPeerId)) return
+        (request.sourceLobbyId == 0 &&
+         !containsPeer(request.partyMembers, _impl->config.localPeerId)) ||
+        (request.sourceLobbyId != 0 &&
+         request.partyLeaderPeerId != _impl->config.localPeerId)) return
         OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::Unauthorized, "local peer is not in match party");
     const auto response = _impl->invoke([&](httplib::Client& client) {
@@ -751,6 +904,33 @@ OnlineServiceResult<MatchTicketInfo> HttpOnlineServices::cancelMatch(
     if (!matchTicketFromJson(response.value, info)) return
         OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::InternalError, "invalid match response");
+    return OnlineServiceResult<MatchTicketInfo>::success(std::move(info));
+}
+
+OnlineServiceResult<MatchTicketInfo> HttpOnlineServices::respondToMatch(
+    const MatchAcceptanceRequest& request) {
+    const std::string token = _impl->playerToken();
+    if (!_impl->actorMatches(request.authenticatedPeer, token)) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::Unauthorized,
+            "local match actor does not match token");
+    }
+    const std::string path = "/v1/matches/" +
+        std::to_string(request.ticketId) + "/respond";
+    const json body{{"accept", request.accept}};
+    const auto response = _impl->invoke([&](httplib::Client& client) {
+        return client.Post(path, _impl->playerHeaders(token), body.dump(),
+                           "application/json");
+    });
+    if (response.error != OnlineServiceError::None) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            response.error, response.message);
+    }
+    MatchTicketInfo info;
+    if (!matchTicketFromJson(response.value, info)) {
+        return OnlineServiceResult<MatchTicketInfo>::failure(
+            OnlineServiceError::InternalError, "invalid match response");
+    }
     return OnlineServiceResult<MatchTicketInfo>::success(std::move(info));
 }
 
@@ -932,18 +1112,25 @@ void installHttpOnlineServicesRoutes(
             if (!player(request, response, actor)) return;
             const json body = parseBody(request);
             CreateLobbyRequest input;
+            uint8_t visibility = 0;
             input.ownerPeerId = actor;
             try {
                 input.name = body.at("name").get<std::string>();
                 input.region = body.at("region").get<std::string>();
                 input.buildId = body.at("build_id").get<std::string>();
+                input.password = body.at("password").get<std::string>();
             } catch (...) { badRequest(response, "invalid lobby body"); return; }
             if (!contentFromJson(body.value("content", json{}), input.content)) {
                 badRequest(response, "invalid lobby content"); return;
             }
-            if (!readUnsigned(body, "capacity", input.capacity)) {
+            if (!readUnsigned(body, "capacity", input.capacity) ||
+                !readUnsigned(body, "visibility", visibility) ||
+                visibility > 2 ||
+                !metadataFromJson(body.value("metadata", json{}),
+                                  input.metadata)) {
                 badRequest(response, "invalid lobby capacity"); return;
             }
+            input.visibility = static_cast<LobbyVisibility>(visibility);
             const auto result = config.lobbies->createLobby(input);
             if (!result) writeFailure(response, result);
             else writeSuccess(response, lobbyToJson(result.value));
@@ -958,6 +1145,12 @@ void installHttpOnlineServicesRoutes(
             ListLobbiesRequest input;
             input.region = request.get_param_value("region");
             input.buildId = request.get_param_value("build_id");
+            input.contentId = request.get_param_value("content_id");
+            const json metadata = json::parse(
+                request.get_param_value("metadata"), nullptr, false);
+            if (!metadataFromJson(metadata, input.metadata)) {
+                badRequest(response, "invalid lobby metadata filter"); return;
+            }
             auto parseParam = [&](const char* key, auto& value) {
                 const std::string text = request.get_param_value(key);
                 if (text.empty()) return true;
@@ -998,9 +1191,24 @@ void installHttpOnlineServicesRoutes(
                 uint64_t id = 0;
                 if (!player(request, response, actor)) return;
                 if (!parseId(request, 1, id)) { badRequest(response, "invalid lobby id"); return; }
-                const auto result = joining
-                    ? config.lobbies->joinLobby(id, actor)
-                    : config.lobbies->leaveLobby(id, actor);
+                OnlineServiceResult<LobbyInfo> result;
+                if (joining) {
+                    const json body = parseBody(request);
+                    JoinLobbyRequest input;
+                    input.lobbyId = id;
+                    input.authenticatedPeer = actor;
+                    try {
+                        input.password = body.at("password").get<std::string>();
+                        input.invitationToken =
+                            body.at("invitation_token").get<std::string>();
+                    } catch (...) {
+                        badRequest(response, "invalid lobby credentials");
+                        return;
+                    }
+                    result = config.lobbies->joinLobby(input);
+                } else {
+                    result = config.lobbies->leaveLobby(id, actor);
+                }
                 if (!result) writeFailure(response, result);
                 else writeSuccess(response, lobbyToJson(result.value));
             });
@@ -1012,17 +1220,51 @@ void installHttpOnlineServicesRoutes(
             const httplib::Request& request, httplib::Response& response) {
             if (!permit(request, response)) return;
             UpdateLobbyRequest input;
+            uint8_t visibility = 0;
             if (!player(request, response, input.actorPeerId)) return;
             const json body = parseBody(request);
-            try { input.name = body.at("name").get<std::string>(); }
+            try {
+                input.name = body.at("name").get<std::string>();
+                input.replaceMetadata =
+                    body.at("replace_metadata").get<bool>();
+                input.setVisibility = body.at("set_visibility").get<bool>();
+                input.setPassword = body.at("set_password").get<bool>();
+                input.password = body.at("password").get<std::string>();
+            }
             catch (...) { badRequest(response, "invalid lobby update"); return; }
             if (!parseId(request, 1, input.lobbyId) ||
-                !readUnsigned(body, "expected_revision", input.expectedRevision)) {
+                !readUnsigned(body, "expected_revision", input.expectedRevision) ||
+                !readUnsigned(body, "visibility", visibility) || visibility > 2 ||
+                !metadataFromJson(body.value("metadata", json{}),
+                                  input.metadata)) {
                 badRequest(response, "invalid lobby update"); return;
             }
+            input.visibility = static_cast<LobbyVisibility>(visibility);
             const auto result = config.lobbies->updateLobby(input);
             if (!result) writeFailure(response, result);
             else writeSuccess(response, lobbyToJson(result.value));
+        });
+
+        server.Post(R"(/v1/lobbies/(\d+)/invitations)",
+            [config, permit, player](const httplib::Request& request,
+                                     httplib::Response& response) {
+            if (!permit(request, response)) return;
+            CreateLobbyInvitationRequest input;
+            if (!player(request, response, input.actorPeerId)) return;
+            const json body = parseBody(request);
+            if (!parseId(request, 1, input.lobbyId) ||
+                !readUnsigned(body, "expected_revision", input.expectedRevision) ||
+                !readUnsigned(body, "lifetime_seconds", input.lifetimeSeconds) ||
+                !readUnsigned(body, "max_uses", input.maxUses)) {
+                badRequest(response, "invalid lobby invitation"); return;
+            }
+            const auto result = config.lobbies->createLobbyInvitation(input);
+            if (!result) { writeFailure(response, result); return; }
+            writeSuccess(response,
+                json{{"lobby_id", result.value.lobbyId},
+                     {"token", result.value.token},
+                     {"expires_at", result.value.expiresAtUnixSeconds},
+                     {"remaining_uses", result.value.remainingUses}});
         });
 
         server.Post(R"(/v1/lobbies/(\d+)/launch-p2p)",
@@ -1050,12 +1292,28 @@ void installHttpOnlineServicesRoutes(
             PeerId actor;
             if (!player(request, response, actor)) return;
             MatchmakingRequest input;
-            if (!matchRequestFromJson(parseBody(request), input) ||
-                !containsPeer(input.partyMembers, actor) ||
-                (config.partyAuthorizer
-                    ? !config.partyAuthorizer(actor, input.partyMembers)
-                    : (input.partyMembers.size() != 1 ||
-                       input.partyMembers.front() != actor))) {
+            if (!matchRequestFromJson(parseBody(request), input)) {
+                badRequest(response, "invalid matchmaking request");
+                return;
+            }
+            bool authorized = false;
+            if (input.sourceLobbyId != 0 && config.lobbies) {
+                const auto lobby = config.lobbies->getLobby(input.sourceLobbyId);
+                authorized = lobby && lobby.value.ownerPeerId == actor &&
+                    lobby.value.revision == input.sourceLobbyRevision &&
+                    lobby.value.state == LobbyState::Open;
+                if (authorized) {
+                    input.partyLeaderPeerId = actor;
+                    input.partyMembers = lobby.value.members;
+                }
+            } else if (input.sourceLobbyId == 0 &&
+                       containsPeer(input.partyMembers, actor)) {
+                authorized = config.partyAuthorizer
+                    ? config.partyAuthorizer(actor, input.partyMembers)
+                    : (input.partyMembers.size() == 1 &&
+                       input.partyMembers.front() == actor);
+            }
+            if (!authorized) {
                 writeFailure(response,
                     OnlineServiceResult<SessionServiceEmpty>::failure(
                         OnlineServiceError::Unauthorized,
@@ -1087,6 +1345,22 @@ void installHttpOnlineServicesRoutes(
             if (!player(request, response, actor)) return;
             if (!parseId(request, 1, id)) { badRequest(response, "invalid match id"); return; }
             const auto result = config.matchmaking->cancelMatch(id, actor);
+            if (!result) writeFailure(response, result);
+            else writeSuccess(response, matchTicketToJson(result.value));
+        });
+
+        server.Post(R"(/v1/matches/(\d+)/respond)", [config, permit, player](
+            const httplib::Request& request, httplib::Response& response) {
+            if (!permit(request, response)) return;
+            MatchAcceptanceRequest input;
+            if (!player(request, response, input.authenticatedPeer)) return;
+            const json body = parseBody(request);
+            if (!parseId(request, 1, input.ticketId) ||
+                !body.contains("accept") || !body.at("accept").is_boolean()) {
+                badRequest(response, "invalid match response"); return;
+            }
+            input.accept = body.at("accept").get<bool>();
+            const auto result = config.matchmaking->respondToMatch(input);
             if (!result) writeFailure(response, result);
             else writeSuccess(response, matchTicketToJson(result.value));
         });

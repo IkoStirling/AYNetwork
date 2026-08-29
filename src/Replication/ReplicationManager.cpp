@@ -4,6 +4,8 @@
 
 #include <AYNetwork/Replication/ReflectSerializer.h>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <AYNetwork/Snapshot/SnapshotInterpolator.h>
 #include <AYNetwork/Protocol/PacketCodec.h>
@@ -46,6 +48,7 @@ struct ReplicationManager::ReflectedEntry {
         std::vector<uint32_t> fieldHashes;
         bool visible = false;
         bool initialized = false;
+        uint32_t lastSentTick = 0;
     };
 
     // ---- per-connection dirty tracking ----
@@ -55,6 +58,7 @@ struct ReplicationManager::ReflectedEntry {
     // ---- R4.1-B interest ----
     NetVec3 _location{};
     bool    _hasLocation = false;
+    ReplicationObjectPolicy _policy{};
 };
 
 // =============================================================================
@@ -106,6 +110,79 @@ float distanceSq(const NetVec3& a, const NetVec3& b) {
     return dx * dx + dy * dy + dz * dz;
 }
 
+bool validPolicy(const ReplicationObjectPolicy& policy) {
+    return std::isfinite(policy.priority) && policy.priority >= 0.0f &&
+           std::isfinite(policy.interestRadius) &&
+           policy.interestRadius >= 0.0f &&
+           std::isfinite(policy.mediumDistance) &&
+           std::isfinite(policy.farDistance) &&
+           policy.mediumDistance >= 0.0f &&
+           policy.farDistance >= policy.mediumDistance &&
+           policy.nearIntervalTicks != 0 &&
+           policy.mediumIntervalTicks != 0 &&
+           policy.farIntervalTicks != 0;
+}
+
+enum class LifecycleOp : uint8_t { Spawn = 1, Despawn = 2 };
+
+struct LifecycleEvent {
+    LifecycleOp op = LifecycleOp::Despawn;
+    uint32_t netId = 0;
+    uint64_t schemaHash = 0;
+};
+
+struct LifecycleBatch {
+    NetConnection* target = nullptr;
+    std::vector<LifecycleEvent> events;
+};
+
+bool writeLifecycleBatch(BitStream& stream,
+                         const std::vector<LifecycleEvent>& events,
+                         size_t first, size_t count) {
+    if (count == 0 || count > (std::numeric_limits<uint16_t>::max)() ||
+        first > events.size() || count > events.size() - first) return false;
+    stream.writeUInt16(static_cast<uint16_t>(count));
+    for (size_t i = 0; i < count; ++i) {
+        const LifecycleEvent& event = events[first + i];
+        stream.writeUInt8(static_cast<uint8_t>(event.op));
+        stream.writeUInt32(event.netId);
+        if (event.op == LifecycleOp::Spawn) {
+            stream.writeUInt64(event.schemaHash);
+        }
+    }
+    return true;
+}
+
+bool readLifecycleBatch(BitStream& stream,
+                        std::vector<LifecycleEvent>& events) {
+    constexpr uint16_t kMaximumLifecycleEvents = 4096;
+    const size_t availableBits = stream.getBitCount() - stream.getBitPosition();
+    if (availableBits < 16) return false;
+    const uint16_t count = stream.readUInt16();
+    if (count == 0 || count > kMaximumLifecycleEvents) return false;
+    events.clear();
+    events.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        if (stream.getBitCount() - stream.getBitPosition() < 40) return false;
+        LifecycleEvent event;
+        const uint8_t rawOp = stream.readUInt8();
+        event.netId = stream.readUInt32();
+        if (event.netId == 0) return false;
+        if (rawOp == static_cast<uint8_t>(LifecycleOp::Spawn)) {
+            if (stream.getBitCount() - stream.getBitPosition() < 64) return false;
+            event.op = LifecycleOp::Spawn;
+            event.schemaHash = stream.readUInt64();
+            if (event.schemaHash == 0) return false;
+        } else if (rawOp == static_cast<uint8_t>(LifecycleOp::Despawn)) {
+            event.op = LifecycleOp::Despawn;
+        } else {
+            return false;
+        }
+        events.push_back(event);
+    }
+    return stream.getBitPosition() == stream.getBitCount();
+}
+
 } // anonymous namespace
 
 void ReplicationManager::setInterestRadius(float interestRadius) {
@@ -125,6 +202,36 @@ bool ReplicationManager::getObjectLocation(uint32_t netId, NetVec3& out) const {
     if (it == _objects.end() || !it->second._hasLocation) return false;
     out = it->second._location;
     return true;
+}
+
+bool ReplicationManager::setObjectReplicationPolicy(
+    uint32_t netId, ReplicationObjectPolicy policy) {
+    if (!validPolicy(policy)) return false;
+    auto it = _objects.find(netId);
+    if (it == _objects.end()) return false;
+    it->second._policy = policy;
+    return true;
+}
+
+bool ReplicationManager::getObjectReplicationPolicy(
+    uint32_t netId, ReplicationObjectPolicy& out) const {
+    auto it = _objects.find(netId);
+    if (it == _objects.end()) return false;
+    out = it->second._policy;
+    return true;
+}
+
+void ReplicationManager::setScalabilityConfig(
+    ReplicationScalabilityConfig config) {
+    if (config.hardSendQueueBytes != 0 &&
+        config.softSendQueueBytes > config.hardSendQueueBytes) {
+        config.softSendQueueBytes = config.hardSendQueueBytes;
+    }
+    if (config.maxLifecycleEventsPerPacket == 0) {
+        config.maxLifecycleEventsPerPacket = 1;
+    }
+    _scalability = config;
+    _hardPressureTicks.clear();
 }
 
 namespace {
@@ -214,7 +321,14 @@ std::vector<NetConnection*> ReplicationManager::buildInterestTargets(
     std::vector<NetConnection*> targets = collectConnectedTargets(_network);
     if (targets.empty()) return targets;
 
-    if (_interestRadiusSq > 0.f && hasObjLoc) {
+    ReplicationObjectPolicy policy;
+    auto object = _objects.find(netId);
+    if (object != _objects.end()) policy = object->second._policy;
+    const float radius = policy.interestRadius > 0.0f
+        ? policy.interestRadius : _interestRadius;
+    const float radiusSq = radius > 0.0f ? radius * radius : 0.0f;
+
+    if (!policy.alwaysRelevant && radiusSq > 0.f && hasObjLoc) {
         std::vector<NetConnection*> inRange;
         inRange.reserve(targets.size());
         for (NetConnection* conn : targets) {
@@ -223,7 +337,7 @@ std::vector<NetConnection*> ReplicationManager::buildInterestTargets(
                 inRange.push_back(conn);
                 continue;
             }
-            if (distanceSq(*viewerPos, objLoc) <= _interestRadiusSq) {
+            if (distanceSq(*viewerPos, objLoc) <= radiusSq) {
                 inRange.push_back(conn);
             }
         }
@@ -425,113 +539,201 @@ IReplicable* ReplicationManager::findIReplicable(uint32_t netId) const {
 //        exit. Steady state with zero changes emits no frame.
 // =============================================================================
 void ReplicationManager::tick(float /*deltaTime*/) {
-    if (!_network && !_broadcastSink) return;
+    _lastTickStats = {};
+    if ((!_network && !_broadcastSink) || !isAuthority()) return;
 
-    // Authority gate: only the server emits frames. Clients do nothing on
-    // tick — they only deserialize frames received via onReceive.
-    // R4.1: gate accepts Server (dedicated) AND ListenServer (host) via
-    // isAuthority() helper.
-    if (!isAuthority()) return;
-
-    // R5.0: bump serverTick once per emitted tick so the wire body can be
-    // stamped with a monotonic counter. The default rate is 30 Hz; production
-    // code is expected to drive advanceServerTick() once per frame instead
-    // of relying on the rate here — see AYNetworkSubSystem::update wiring.
     advanceServerTick(1.0 / (_serverTickRate > 0.0 ? _serverTickRate : 30.0));
 
-    // Snapshot keys so callbacks may register/unregister without invalidating
-    // this traversal.
+    std::map<uint32_t, NetConnection*> connected;
+    for (NetConnection* connection : collectConnectedTargets(_network)) {
+        connected[connection->getId()] = connection;
+    }
+    if (connected.empty() && _broadcastSink) connected.emplace(0u, nullptr);
+
+    std::unordered_set<uint32_t> hardPressure;
+    std::unordered_set<uint32_t> softPressure;
+    for (const auto& [connectionId, connection] : connected) {
+        const uint32_t queued = _sendQueueBytesProvider
+            ? _sendQueueBytesProvider(connection) : 0u;
+        if (_scalability.hardSendQueueBytes != 0 &&
+            queued >= _scalability.hardSendQueueBytes) {
+            hardPressure.insert(connectionId);
+            ++_lastTickStats.hardPressureConnections;
+            uint32_t& pressureTicks = _hardPressureTicks[connectionId];
+            if (pressureTicks != (std::numeric_limits<uint32_t>::max)()) {
+                ++pressureTicks;
+            }
+            if (_network && connection &&
+                _scalability.disconnectAfterHardPressureTicks != 0 &&
+                pressureTicks == _scalability.disconnectAfterHardPressureTicks) {
+                _network->kickConnection(connection,
+                    "replication send queue remained above hard limit");
+            }
+        } else {
+            _hardPressureTicks.erase(connectionId);
+            if (_scalability.softSendQueueBytes != 0 &&
+                queued >= _scalability.softSendQueueBytes) {
+                softPressure.insert(connectionId);
+            }
+        }
+    }
+    for (auto it = _hardPressureTicks.begin(); it != _hardPressureTicks.end();) {
+        if (!connected.contains(it->first)) it = _hardPressureTicks.erase(it);
+        else ++it;
+    }
+
+    std::map<uint32_t, uint64_t> sentByConnection;
+    auto accountSend = [&](uint32_t connectionId, size_t bytes) {
+        sentByConnection[connectionId] += bytes;
+        _lastTickStats.sentBytes += bytes;
+        ++_lastTickStats.sentFrames;
+    };
+    auto admitDataFrame = [&](uint32_t connectionId, size_t bytes,
+                              bool initialSnapshot) {
+        if (hardPressure.contains(connectionId)) {
+            ++_lastTickStats.deferredByBackpressure;
+            return false;
+        }
+        // Under soft pressure, preserve reliable initialization/repair but
+        // stop adding best-effort deltas until the transport drains.
+        if (!initialSnapshot && softPressure.contains(connectionId)) {
+            ++_lastTickStats.deferredByBackpressure;
+            return false;
+        }
+        if (_scalability.maxBytesPerConnectionPerTick != 0 &&
+            sentByConnection[connectionId] + bytes >
+                _scalability.maxBytesPerConnectionPerTick) {
+            ++_lastTickStats.deferredByBudget;
+            return false;
+        }
+        return true;
+    };
+
     std::vector<uint32_t> netIds;
     netIds.reserve(_objects.size());
-    for (const auto& kv : _objects) netIds.push_back(kv.first);
+    for (const auto& [netId, entry] : _objects) {
+        (void)entry;
+        netIds.push_back(netId);
+    }
+    std::sort(netIds.begin(), netIds.end(), [this](uint32_t left,
+                                                   uint32_t right) {
+        const float leftPriority = _objects.at(left)._policy.priority;
+        const float rightPriority = _objects.at(right)._policy.priority;
+        if (leftPriority != rightPriority) return leftPriority > rightPriority;
+        return left < right;
+    });
+
+    std::map<uint32_t, LifecycleBatch> lifecycleBatches;
+    auto queueLifecycle = [&](uint32_t connectionId, NetConnection* target,
+                              LifecycleEvent event) {
+        LifecycleBatch& batch = lifecycleBatches[connectionId];
+        batch.target = target;
+        batch.events.push_back(event);
+    };
 
     for (uint32_t netId : netIds) {
         auto it = _objects.find(netId);
         if (it == _objects.end()) continue;
-        ReflectedEntry& e = it->second;
+        ReflectedEntry& entry = it->second;
+        if (!entry.type) continue;
 
-        // Legacy entries have no reflected payload.
-        if (!e.type) continue;
-
-        // Compute current field hashes once; each peer compares them against
-        // its own acknowledged/sent baseline.
-        const uint32_t nFields = static_cast<uint32_t>(e._netFieldSparseIndex.size());
-        std::vector<uint32_t> currentHashes(nFields);
-        for (uint32_t k = 0; k < nFields; ++k) {
-            const auto* field = e.type->getField(e._netFieldSparseIndex[k]);
+        const uint32_t fieldCount =
+            static_cast<uint32_t>(entry._netFieldSparseIndex.size());
+        std::vector<uint32_t> currentHashes(fieldCount);
+        for (uint32_t fieldIndex = 0; fieldIndex < fieldCount; ++fieldIndex) {
+            const auto* field = entry.type->getField(
+                entry._netFieldSparseIndex[fieldIndex]);
             if (!field) continue;
-            WireTypeId wid;
-            if (!ReflectSerializer::resolveWireTypeId(field->getType(), wid)) continue;
-            currentHashes[k] = ReflectSerializer::hashFieldValueEx(wid, field->getType(), field->get(e.obj));
+            WireTypeId wireType;
+            if (!ReflectSerializer::resolveWireTypeId(field->getType(), wireType)) {
+                continue;
+            }
+            currentHashes[fieldIndex] = ReflectSerializer::hashFieldValueEx(
+                wireType, field->getType(), field->get(entry.obj));
         }
 
         std::vector<NetConnection*> targets = buildInterestTargets(
-            e.obj, e.type, netId, e._location, e._hasLocation);
-        if (_extension) _extension->onPreReplicate(e.obj, e.type, netId, targets);
-
-        std::map<uint32_t, NetConnection*> targetById;  // R6 C2: sorted iteration
-        for (NetConnection* target : targets) {
-            if (target && target->isConnected()) targetById[target->getId()] = target;
+            entry.obj, entry.type, netId, entry._location, entry._hasLocation);
+        if (_extension) {
+            _extension->onPreReplicate(entry.obj, entry.type, netId, targets);
         }
-        if (targetById.empty() && _broadcastSink) targetById.emplace(0u, nullptr);
+        std::map<uint32_t, NetConnection*> targetById;
+        for (NetConnection* target : targets) {
+            if (target && target->isConnected()) {
+                targetById[target->getId()] = target;
+            }
+        }
+        if (targetById.empty() && _broadcastSink) {
+            targetById.emplace(0u, nullptr);
+        }
 
-        // Interest/relevancy exit: a peer that previously saw the object gets
-        // a targeted Despawn. Disconnected peers are simply forgotten.
-        for (auto peerIt = e._peers.begin(); peerIt != e._peers.end();) {
-            if (targetById.contains(peerIt->first)) {
-                ++peerIt;
+        for (auto peer = entry._peers.begin(); peer != entry._peers.end();) {
+            if (targetById.contains(peer->first)) {
+                ++peer;
                 continue;
             }
-            NetConnection* previousTarget = findConnectedTarget(peerIt->first);
-            if (peerIt->second.visible && (peerIt->first == 0 || previousTarget)) {
-                BitStream despawnBody;
-                ReflectSerializer::writeEntityDespawn(despawnBody, netId);
-                auto wire = PacketCodec::encode(
-                    static_cast<const uint8_t*>(despawnBody.getData()), despawnBody.getSize(),
-                    kMsgTypeEntityDespawn, kSchemaVersion, CHANNEL_RELIABLE,
-                    0, 0, false);
-                sendSealedToConnection(previousTarget, CHANNEL_RELIABLE, wire.data(), wire.size());
-                // R5.3 (2026-08-24) Replay wire-tap: capture Despawn for
-                // the previous peer that lost visibility.
-                recordDespawn(_replay, peerIt->first, _serverTick, netId);
-                // R5.5 (2026-08-25) profiler hook — interest-exit Despawn.
-                if (_profilerHook) {
-                    _profilerHook(peerIt->first, kMsgTypeEntityDespawn,
-                                  static_cast<uint64_t>(wire.size()), netId);
+            NetConnection* previousTarget = findConnectedTarget(peer->first);
+            if (peer->second.visible && (peer->first == 0 || previousTarget)) {
+                if (_scalability.enableLifecycleBatching) {
+                    queueLifecycle(peer->first, previousTarget,
+                        {LifecycleOp::Despawn, netId, 0});
+                } else {
+                    BitStream body;
+                    ReflectSerializer::writeEntityDespawn(body, netId);
+                    auto wire = PacketCodec::encode(
+                        static_cast<const uint8_t*>(body.getData()), body.getSize(),
+                        kMsgTypeEntityDespawn, kSchemaVersion, CHANNEL_RELIABLE,
+                        0, 0, false);
+                    if (sendSealedToConnection(previousTarget, CHANNEL_RELIABLE,
+                                               wire.data(), wire.size())) {
+                        accountSend(peer->first, wire.size());
+                        ++_lastTickStats.lifecycleEvents;
+                        recordDespawn(_replay, peer->first, _serverTick, netId);
+                        if (_profilerHook) {
+                            _profilerHook(peer->first, kMsgTypeEntityDespawn,
+                                          static_cast<uint64_t>(wire.size()), netId);
+                        }
+                    }
                 }
             }
-            peerIt = e._peers.erase(peerIt);
+            peer = entry._peers.erase(peer);
         }
 
         bool replicatedToAny = false;
-        // R5.1: teleport marker drains after we emit the Full Snapshot for
-        // this netId. Compute once before the peer loop so every peer sees
-        // the same flag set in this tick's frame; clear after the loop.
-        const bool teleport = (_teleportPending.count(netId) > 0);
+        const bool teleport = _teleportPending.contains(netId);
         const uint8_t frameFlags = teleport ? kFlagTeleport : 0;
+        const uint64_t schemaHash = ReflectSerializer::hashTypeSchema(entry.type);
 
         for (const auto& [connectionId, target] : targetById) {
-            ReflectedEntry::PeerState& peer = e._peers[connectionId];
-
+            ReflectedEntry::PeerState& peer = entry._peers[connectionId];
             if (!peer.visible) {
+                if (_scalability.enableLifecycleBatching) {
+                    queueLifecycle(connectionId, target,
+                        {LifecycleOp::Spawn, netId, schemaHash});
+                    peer.visible = true;
+                    peer.initialized = false;
+                    peer.fieldHashes.clear();
+                    // The reliable batch is emitted at the end of this tick;
+                    // the Full snapshot follows on the next tick.
+                    continue;
+                }
                 BitStream spawnBody;
                 ReflectSerializer::writeEntitySpawn(
-                    spawnBody, netId, ReflectSerializer::hashTypeSchema(e.type));
+                    spawnBody, netId, schemaHash);
                 auto spawnWire = PacketCodec::encode(
-                    static_cast<const uint8_t*>(spawnBody.getData()), spawnBody.getSize(),
-                    kMsgTypeEntitySpawn, kSchemaVersion, CHANNEL_RELIABLE,
-                    0, 0, false);
+                    static_cast<const uint8_t*>(spawnBody.getData()),
+                    spawnBody.getSize(), kMsgTypeEntitySpawn, kSchemaVersion,
+                    CHANNEL_RELIABLE, 0, 0, false);
                 if (!sendSealedToConnection(target, CHANNEL_RELIABLE,
                                             spawnWire.data(), spawnWire.size())) {
                     continue;
                 }
-                // R5.3 (2026-08-24) Replay wire-tap: per-peer first-tick
-                // EntitySpawn. connectionId is per-peer (not 0).
-                recordSpawn(_replay, connectionId, _serverTick,
-                            netId, ReflectSerializer::hashTypeSchema(e.type),
+                accountSend(connectionId, spawnWire.size());
+                ++_lastTickStats.lifecycleEvents;
+                recordSpawn(_replay, connectionId, _serverTick, netId,
+                            schemaHash,
                             static_cast<const uint8_t*>(spawnBody.getData()),
                             spawnBody.getSize());
-                // R5.5 (2026-08-25) profiler hook — EntitySpawn bytes.
                 if (_profilerHook) {
                     _profilerHook(connectionId, kMsgTypeEntitySpawn,
                                   static_cast<uint64_t>(spawnWire.size()), netId);
@@ -543,99 +745,163 @@ void ReplicationManager::tick(float /*deltaTime*/) {
 
             if (!peer.initialized) {
                 BitStream fullBody;
-                if (!ReflectSerializer::serializeObject(e.type, e.obj, netId, fullBody,
-                                                        _serverTick, frameFlags)) continue;
-                // R5.2 (2026-08-24): optional ack tail for connections that
-                // own an AutonomousProxy ghost. Defaults to no-tail so the
-                // R5.0/R5.1 byte layout is preserved for SimulatedProxy-only
-                // destinations. The build helper enforces the gate.
-                const AckTailInfo info = buildAckTailForConnection(
-                    connectionId, /*serverCommandAge=*/ _serverTick);
-                ReflectSerializer::AckTail wireTail;
-                wireTail.lastAckedInputTick = info.lastAckedInputTick;
-                wireTail.serverCommandAge   = info.serverCommandAge;
-                wireTail.present            = info.present;
-                ReflectSerializer::writeAckTail(fullBody, wireTail);
-                auto fullWire = PacketCodec::encode(
-                    static_cast<const uint8_t*>(fullBody.getData()), fullBody.getSize(),
-                    kMsgTypeReplication, kSchemaVersion, CHANNEL_RELIABLE,
-                    0, 0, false);
+                if (!ReflectSerializer::serializeObject(
+                        entry.type, entry.obj, netId, fullBody,
+                        _serverTick, frameFlags)) continue;
+                const AckTailInfo ack = buildAckTailForConnection(
+                    connectionId, _serverTick);
+                ReflectSerializer::AckTail tail;
+                tail.lastAckedInputTick = ack.lastAckedInputTick;
+                tail.serverCommandAge = ack.serverCommandAge;
+                tail.present = ack.present;
+                ReflectSerializer::writeAckTail(fullBody, tail);
+                auto wire = PacketCodec::encode(
+                    static_cast<const uint8_t*>(fullBody.getData()),
+                    fullBody.getSize(), kMsgTypeReplication, kSchemaVersion,
+                    CHANNEL_RELIABLE, 0, 0, false);
+                if (!admitDataFrame(connectionId, wire.size(), true)) continue;
                 if (sendSealedToConnection(target, CHANNEL_RELIABLE,
-                                           fullWire.data(), fullWire.size())) {
+                                           wire.data(), wire.size())) {
+                    accountSend(connectionId, wire.size());
                     peer.initialized = true;
                     peer.fieldHashes = currentHashes;
+                    peer.lastSentTick = _serverTick;
                     replicatedToAny = true;
-                    // R5.3 (2026-08-24) Replay wire-tap: capture the
-                    // authoritative Full Snapshot. The same `frameFlags`
-                    // used by the receiver's interpolator (teleport vs
-                    // normal) is preserved for v2 playback.
-                    recordFullSnapshot(_replay, connectionId, _serverTick,
-                                       frameFlags,
-                                       static_cast<const uint8_t*>(fullBody.getData()),
-                                       fullBody.getSize());
-                    // R5.5 (2026-08-25) profiler hook — Full Snapshot.
+                    recordFullSnapshot(
+                        _replay, connectionId, _serverTick, frameFlags,
+                        static_cast<const uint8_t*>(fullBody.getData()),
+                        fullBody.getSize());
                     if (_profilerHook) {
                         _profilerHook(connectionId, kMsgTypeReplication,
-                                      static_cast<uint64_t>(fullWire.size()), netId);
+                                      static_cast<uint64_t>(wire.size()), netId);
                     }
                 }
                 continue;
             }
 
-            std::vector<uint32_t> dirtyIndices;
-            dirtyIndices.reserve(nFields);
+            uint16_t interval = entry._policy.nearIntervalTicks;
+            if (entry._hasLocation && target && target->getUserData()) {
+                const auto* viewer =
+                    static_cast<const NetVec3*>(target->getUserData());
+                const float distanceSquared = distanceSq(*viewer, entry._location);
+                if (entry._policy.farDistance > 0.0f &&
+                    distanceSquared >= entry._policy.farDistance *
+                        entry._policy.farDistance) {
+                    interval = entry._policy.farIntervalTicks;
+                } else if (entry._policy.mediumDistance > 0.0f &&
+                           distanceSquared >= entry._policy.mediumDistance *
+                               entry._policy.mediumDistance) {
+                    interval = entry._policy.mediumIntervalTicks;
+                }
+            }
+            if (static_cast<uint32_t>(_serverTick - peer.lastSentTick) < interval) {
+                ++_lastTickStats.deferredByLod;
+                continue;
+            }
+
             if (peer.fieldHashes.size() != currentHashes.size()) {
                 peer.initialized = false;
                 continue;
             }
-            for (uint32_t k = 0; k < nFields; ++k) {
-                if (currentHashes[k] != peer.fieldHashes[k]) dirtyIndices.push_back(k);
+            std::vector<uint32_t> dirtyIndices;
+            dirtyIndices.reserve(fieldCount);
+            for (uint32_t fieldIndex = 0; fieldIndex < fieldCount; ++fieldIndex) {
+                if (currentHashes[fieldIndex] != peer.fieldHashes[fieldIndex]) {
+                    dirtyIndices.push_back(fieldIndex);
+                }
             }
             if (dirtyIndices.empty()) continue;
 
             BitStream deltaBody;
             if (!ReflectSerializer::serializeDirtyFields(
-                    e.type, e.obj, netId, dirtyIndices, deltaBody, _serverTick)) continue;
-            auto deltaWire = PacketCodec::encode(
-                static_cast<const uint8_t*>(deltaBody.getData()), deltaBody.getSize(),
-                kMsgTypeDelta, kSchemaVersion, CHANNEL_UNRELIABLE,
-                0, 0, false);
+                    entry.type, entry.obj, netId, dirtyIndices, deltaBody,
+                    _serverTick)) continue;
+            auto wire = PacketCodec::encode(
+                static_cast<const uint8_t*>(deltaBody.getData()),
+                deltaBody.getSize(), kMsgTypeDelta, kSchemaVersion,
+                CHANNEL_UNRELIABLE, 0, 0, false);
+            if (!admitDataFrame(connectionId, wire.size(), false)) continue;
             if (sendSealedToConnection(target, CHANNEL_UNRELIABLE,
-                                       deltaWire.data(), deltaWire.size())) {
-                for (uint32_t k : dirtyIndices) peer.fieldHashes[k] = currentHashes[k];
+                                       wire.data(), wire.size())) {
+                accountSend(connectionId, wire.size());
+                for (uint32_t fieldIndex : dirtyIndices) {
+                    peer.fieldHashes[fieldIndex] = currentHashes[fieldIndex];
+                }
+                peer.lastSentTick = _serverTick;
                 replicatedToAny = true;
-                // R5.3 (2026-08-24) Replay wire-tap: capture Delta frame.
-                recordDeltaSnapshot(_replay, connectionId, _serverTick,
-                                    /*frameFlags=*/ 0,
-                                    static_cast<const uint8_t*>(deltaBody.getData()),
-                                    deltaBody.getSize());
-                // R5.5 (2026-08-25) profiler hook — Delta frame.
+                recordDeltaSnapshot(
+                    _replay, connectionId, _serverTick, 0,
+                    static_cast<const uint8_t*>(deltaBody.getData()),
+                    deltaBody.getSize());
                 if (_profilerHook) {
                     _profilerHook(connectionId, kMsgTypeDelta,
-                                  static_cast<uint64_t>(deltaWire.size()), netId);
+                                  static_cast<uint64_t>(wire.size()), netId);
                 }
             }
         }
 
         if (replicatedToAny && _extension) {
-            _extension->onPostReplicate(e.obj, e.type, netId);
+            _extension->onPostReplicate(entry.obj, entry.type, netId);
         }
+        if (teleport && replicatedToAny) _teleportPending.erase(netId);
+    }
 
-        // R5.1: drain the teleport marker AFTER a successful emission so
-        // the next tick returns to normal dirty tracking. We only drain
-        // when at least one peer actually received the teleport frame —
-        // otherwise (e.g. nobody is in range this tick) the marker
-        // persists and the next tick with a visible peer still fires the
-        // teleport. markTeleported() is idempotent so callers that
-        // re-mark every tick are unaffected.
-        if (teleport && replicatedToAny) {
-            _teleportPending.erase(netId);
+    if (_scalability.enableLifecycleBatching) {
+        const size_t maximumPerPacket =
+            std::max<size_t>(1, _scalability.maxLifecycleEventsPerPacket);
+        for (auto& [connectionId, batch] : lifecycleBatches) {
+            for (size_t first = 0; first < batch.events.size();
+                 first += maximumPerPacket) {
+                const size_t count = std::min(
+                    maximumPerPacket, batch.events.size() - first);
+                BitStream body;
+                if (!writeLifecycleBatch(body, batch.events, first, count)) continue;
+                auto wire = PacketCodec::encode(
+                    static_cast<const uint8_t*>(body.getData()), body.getSize(),
+                    kMsgTypeEntityLifecycleBatch, kSchemaVersion,
+                    CHANNEL_RELIABLE, 0, 0, false);
+                const bool sent = sendSealedToConnection(
+                    batch.target, CHANNEL_RELIABLE, wire.data(), wire.size());
+                if (sent) {
+                    accountSend(connectionId, wire.size());
+                    _lastTickStats.lifecycleEvents += static_cast<uint32_t>(count);
+                    if (_profilerHook) {
+                        _profilerHook(connectionId,
+                            kMsgTypeEntityLifecycleBatch,
+                            static_cast<uint64_t>(wire.size()), 0);
+                    }
+                }
+                for (size_t offset = 0; offset < count; ++offset) {
+                    const LifecycleEvent& event = batch.events[first + offset];
+                    if (!sent && event.op == LifecycleOp::Spawn) {
+                        auto object = _objects.find(event.netId);
+                        if (object != _objects.end()) {
+                            auto peer = object->second._peers.find(connectionId);
+                            if (peer != object->second._peers.end()) {
+                                peer->second.visible = false;
+                            }
+                        }
+                        continue;
+                    }
+                    if (!sent) continue;
+                    if (event.op == LifecycleOp::Spawn) {
+                        BitStream spawnBody;
+                        ReflectSerializer::writeEntitySpawn(
+                            spawnBody, event.netId, event.schemaHash);
+                        recordSpawn(
+                            _replay, connectionId, _serverTick, event.netId,
+                            event.schemaHash,
+                            static_cast<const uint8_t*>(spawnBody.getData()),
+                            spawnBody.getSize());
+                    } else {
+                        recordDespawn(
+                            _replay, connectionId, _serverTick, event.netId);
+                    }
+                }
+            }
         }
     }
 
-    // R5.3 (2026-08-24) Replay: end-of-tick flush ensures any wire-tap
-    // recordEvent calls made above hit the .ayrp file before the next
-    // tick begins. Idempotent on a null recorder.
     if (_replay) _replay->flush();
 }
 
@@ -823,10 +1089,31 @@ bool ReplicationManager::onReceive(uint16_t messageType, BitStream& stream, NetC
         case kMsgTypeEntityDespawn: {
             uint32_t netId;
             if (!ReflectSerializer::readEntityDespawn(stream, netId)) return false;
+            if (isAuthority()) return false;
             // Drop the local registration if present.
             _objects.erase(netId);
+            _spawnAnnouncements.erase(netId);
             // R5.0: tell the interpolator to forget about this ghost too.
             if (_snapshotInterpolator) _snapshotInterpolator->unregisterGhost(netId);
+            return true;
+        }
+        case kMsgTypeEntityLifecycleBatch: {
+            if (isAuthority()) return false;
+            std::vector<LifecycleEvent> events;
+            if (!readLifecycleBatch(stream, events)) return false;
+            // Validate the entire packet before mutating local state so a
+            // truncated tail cannot apply a partial lifecycle transition.
+            for (const LifecycleEvent& event : events) {
+                if (event.op == LifecycleOp::Spawn) {
+                    _spawnAnnouncements[event.netId] = event.schemaHash;
+                } else {
+                    _objects.erase(event.netId);
+                    _spawnAnnouncements.erase(event.netId);
+                    if (_snapshotInterpolator) {
+                        _snapshotInterpolator->unregisterGhost(event.netId);
+                    }
+                }
+            }
             return true;
         }
         default:

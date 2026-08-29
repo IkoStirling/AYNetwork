@@ -2,6 +2,7 @@
 
 #include <AYEventSystem/EventBus.h>
 
+#include <algorithm>
 #include <chrono>
 #include <initializer_list>
 #include <utility>
@@ -23,7 +24,12 @@ uint64_t steadyMilliseconds() {
 bool isLiveTicket(const MatchTicketInfo& ticket) {
     return ticket.ticketId != 0 &&
         (ticket.state == MatchTicketState::Queued ||
-         ticket.state == MatchTicketState::Matching);
+         ticket.state == MatchTicketState::Matching ||
+         ticket.state == MatchTicketState::AwaitingAcceptance);
+}
+
+bool containsPeer(const std::vector<PeerId>& peers, const PeerId& peer) {
+    return std::find(peers.begin(), peers.end(), peer) != peers.end();
 }
 
 bool samePublishedStatus(const OnlineFlowStatus& a,
@@ -37,6 +43,13 @@ bool samePublishedStatus(const OnlineFlowStatus& a,
            a.loadingGeneration == b.loadingGeneration &&
            a.worldLoaded == b.worldLoaded && a.lobbyId == b.lobbyId &&
            a.matchTicketId == b.matchTicketId &&
+           a.matchTicketState == b.matchTicketState &&
+           a.acceptedPartyMembers == b.acceptedPartyMembers &&
+           a.requiredPartyMembers == b.requiredPartyMembers &&
+           a.matchAcceptanceRequired == b.matchAcceptanceRequired &&
+           a.localMatchAccepted == b.localMatchAccepted &&
+           a.matchAcceptanceExpiresAtUnixSeconds ==
+               b.matchAcceptanceExpiresAtUnixSeconds &&
            a.sessionId == b.sessionId && a.sessionEpoch == b.sessionEpoch &&
            a.dedicatedAllocationId == b.dedicatedAllocationId &&
            a.message == b.message;
@@ -93,6 +106,17 @@ struct OnlineFlowCoordinator::Impl {
         out.worldLoaded = worldLoaded;
         out.lobbyId = session.lobby.lobbyId;
         out.matchTicketId = session.matchTicket.ticketId;
+        out.matchTicketState = session.matchTicket.state;
+        out.acceptedPartyMembers = static_cast<uint16_t>(
+            session.matchTicket.acceptedMembers.size());
+        out.requiredPartyMembers = static_cast<uint16_t>(
+            session.matchTicket.request.partyMembers.size());
+        out.matchAcceptanceRequired = session.matchTicket.state ==
+            MatchTicketState::AwaitingAcceptance;
+        out.localMatchAccepted = containsPeer(
+            session.matchTicket.acceptedMembers, online.getLocalPeerId());
+        out.matchAcceptanceExpiresAtUnixSeconds =
+            session.matchTicket.acceptanceExpiresAtUnixSeconds;
         out.sessionId = p2p.backendSession.sessionId != 0
             ? p2p.backendSession.sessionId : session.lobby.sessionId;
         out.sessionEpoch = p2p.backendSession.epoch;
@@ -116,6 +140,13 @@ struct OnlineFlowCoordinator::Impl {
         event.loadingGeneration = current.loadingGeneration;
         event.lobbyId = current.lobbyId;
         event.matchTicketId = current.matchTicketId;
+        event.matchTicketState = current.matchTicketState;
+        event.acceptedPartyMembers = current.acceptedPartyMembers;
+        event.requiredPartyMembers = current.requiredPartyMembers;
+        event.matchAcceptanceRequired = current.matchAcceptanceRequired;
+        event.localMatchAccepted = current.localMatchAccepted;
+        event.matchAcceptanceExpiresAtUnixSeconds =
+            current.matchAcceptanceExpiresAtUnixSeconds;
         event.sessionId = current.sessionId;
         event.sessionEpoch = current.sessionEpoch;
         event.dedicatedAllocationId = current.dedicatedAllocationId;
@@ -264,6 +295,8 @@ struct OnlineFlowCoordinator::Impl {
         }
         if (isLiveTicket(status.matchTicket) ||
             status.state == OnlineSessionCoordinatorState::Queueing ||
+            status.state ==
+                OnlineSessionCoordinatorState::AwaitingMatchAcceptance ||
             status.state == OnlineSessionCoordinatorState::CancellingMatch) {
             if (status.state != OnlineSessionCoordinatorState::CancellingMatch) {
                 (void)online.cancelMatchmaking();
@@ -340,6 +373,7 @@ struct OnlineFlowCoordinator::Impl {
         case OnlineSessionCoordinatorState::InLobby:
         case OnlineSessionCoordinatorState::RefreshingLobby:
         case OnlineSessionCoordinatorState::UpdatingLobby:
+        case OnlineSessionCoordinatorState::CreatingLobbyInvitation:
             setState(OnlineFlowState::InLobby);
             break;
         case OnlineSessionCoordinatorState::LaunchingLobby:
@@ -349,6 +383,9 @@ struct OnlineFlowCoordinator::Impl {
         case OnlineSessionCoordinatorState::Queueing:
         case OnlineSessionCoordinatorState::CancellingMatch:
             setState(OnlineFlowState::Matchmaking);
+            break;
+        case OnlineSessionCoordinatorState::AwaitingMatchAcceptance:
+            setState(OnlineFlowState::MatchAcceptance);
             break;
         case OnlineSessionCoordinatorState::Connecting:
         case OnlineSessionCoordinatorState::InSession:
@@ -504,16 +541,41 @@ bool OnlineFlowCoordinator::joinLobby(LobbyId lobbyId) {
         [&] { return _impl->online.joinLobby(lobbyId); });
 }
 
+bool OnlineFlowCoordinator::joinLobby(JoinLobbyRequest request) {
+    return _impl->issue(
+        {OnlineFlowState::MainMenu, OnlineFlowState::BrowsingLobbies},
+        OnlineFlowState::JoiningLobby,
+        [&] { return _impl->online.joinLobby(std::move(request)); });
+}
+
 bool OnlineFlowCoordinator::refreshLobby() {
     return _impl->issue(
         {OnlineFlowState::InLobby}, OnlineFlowState::InLobby,
         [&] { return _impl->online.refreshLobby(); });
 }
 
+bool OnlineFlowCoordinator::updateLobby(UpdateLobbyRequest request) {
+    return _impl->issue(
+        {OnlineFlowState::InLobby}, OnlineFlowState::InLobby,
+        [&] { return _impl->online.updateLobby(std::move(request)); });
+}
+
 bool OnlineFlowCoordinator::updateLobbyName(std::string name) {
     return _impl->issue(
         {OnlineFlowState::InLobby}, OnlineFlowState::InLobby,
         [&] { return _impl->online.updateLobbyName(std::move(name)); });
+}
+
+bool OnlineFlowCoordinator::createLobbyInvitation(
+    uint32_t lifetimeSeconds, uint16_t maxUses) {
+    return _impl->issue(
+        {OnlineFlowState::InLobby}, OnlineFlowState::InLobby,
+        [&] { return _impl->online.createLobbyInvitation(
+            lifetimeSeconds, maxUses); });
+}
+
+LobbyInvitation OnlineFlowCoordinator::takeLobbyInvitation() {
+    return _impl->online.takeLobbyInvitation();
 }
 
 bool OnlineFlowCoordinator::leaveLobby() {
@@ -529,13 +591,22 @@ bool OnlineFlowCoordinator::startLobbySession(uint16_t virtualPort) {
 
 bool OnlineFlowCoordinator::startMatchmaking(MatchmakingRequest request) {
     return _impl->issue(
-        {OnlineFlowState::MainMenu, OnlineFlowState::BrowsingLobbies},
+        {OnlineFlowState::MainMenu, OnlineFlowState::BrowsingLobbies,
+         OnlineFlowState::InLobby},
         OnlineFlowState::Matchmaking,
         [&] { return _impl->online.startMatchmaking(std::move(request)); });
 }
 
+bool OnlineFlowCoordinator::respondToMatch(bool accept) {
+    return _impl->issue(
+        {OnlineFlowState::MatchAcceptance},
+        accept ? OnlineFlowState::Matchmaking : OnlineFlowState::MatchAcceptance,
+        [&] { return _impl->online.respondToMatch(accept); });
+}
+
 bool OnlineFlowCoordinator::cancelMatchmaking() {
-    if (!_impl->canIssueFrom({OnlineFlowState::Matchmaking})) return false;
+    if (!_impl->canIssueFrom({OnlineFlowState::Matchmaking,
+                              OnlineFlowState::MatchAcceptance})) return false;
     return _impl->beginExit(Impl::ExitTarget::MainMenu);
 }
 
@@ -552,6 +623,7 @@ bool OnlineFlowCoordinator::returnToMainMenu() {
                               OnlineFlowState::JoiningLobby,
                               OnlineFlowState::InLobby,
                               OnlineFlowState::Matchmaking,
+                              OnlineFlowState::MatchAcceptance,
                               OnlineFlowState::StartingSession,
                               OnlineFlowState::LoadingSession,
                               OnlineFlowState::InSession})) return false;
