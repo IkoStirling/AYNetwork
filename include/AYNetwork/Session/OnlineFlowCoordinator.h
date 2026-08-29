@@ -100,6 +100,11 @@ public:
     bool completeLoading(uint64_t generation);
     bool failLoading(uint64_t generation, std::string message = {});
 
+    // Fails an already-loaded gameplay world closed. This is used by the
+    // application layer when scene bindings cannot survive reconnect,
+    // migration, or an unexpected scene replacement.
+    bool failActiveSession(std::string message = {});
+
     // Recover performs any remaining online cleanup/reset before returning to
     // MainMenu (or SignedOut when no player credential exists).
     bool recover();

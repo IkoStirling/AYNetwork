@@ -190,7 +190,13 @@ struct OnlineFlowCoordinator::Impl {
 
     void beginLoading() {
         if (state == OnlineFlowState::LoadingSession ||
-            state == OnlineFlowState::InSession) return;
+            state == OnlineFlowState::InSession) {
+            // During reconnect/host migration the application flow remains
+            // InSession, but consumers still need the changed lower-level
+            // sessionState/epoch to suspend and later restore scene bindings.
+            publishIfChanged();
+            return;
+        }
         ++loadingGeneration;
         worldLoaded = false;
         loadingStartedAtMs = now();
@@ -581,6 +587,17 @@ bool OnlineFlowCoordinator::failLoading(uint64_t generation,
     return _impl->beginExit(
         Impl::ExitTarget::Failed, OnlineFlowError::LoadingFailed,
         message.empty() ? "World loading failed" : std::move(message));
+}
+
+bool OnlineFlowCoordinator::failActiveSession(std::string message) {
+    if (_impl->state != OnlineFlowState::InSession ||
+        _impl->exitTarget != Impl::ExitTarget::None) {
+        return _impl->reject(OnlineFlowError::InvalidState,
+                             "Active world failure requires InSession");
+    }
+    return _impl->beginExit(
+        Impl::ExitTarget::Failed, OnlineFlowError::WorldFailed,
+        message.empty() ? "Active session world failed" : std::move(message));
 }
 
 bool OnlineFlowCoordinator::recover() {

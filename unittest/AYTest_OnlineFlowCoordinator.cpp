@@ -375,6 +375,31 @@ TEST_CASE(SessionFailureIsSurfacedAfterFailClosedCleanup) {
     CHECK(flow.getStatus().message == "transport failed");
 }
 
+TEST_CASE(ActiveWorldFailureIsSurfacedAfterFailClosedCleanup) {
+    ayt::test::setCurrentCase(
+        "ActiveWorldFailureIsSurfacedAfterFailClosedCleanup");
+    FlowOnlineSubSystem online;
+    online.authenticated = true;
+    OnlineFlowCoordinator flow(online);
+
+    online.connectP2PSession(false);
+    flow.update();
+    const auto generation = flow.getStatus().loadingGeneration;
+    CHECK(flow.completeLoading(generation));
+    online.connectP2PSession(true);
+    flow.update();
+    CHECK(flow.getStatus().state == OnlineFlowState::InSession);
+
+    CHECK(flow.failActiveSession("scene recovery failed"));
+    CHECK(flow.getStatus().state == OnlineFlowState::Leaving);
+    CHECK(flow.getStatus().error == OnlineFlowError::WorldFailed);
+    CHECK_INT_EQ(online.leaveSessionCalls, 1);
+    flow.update();
+    CHECK(flow.getStatus().state == OnlineFlowState::Failed);
+    CHECK(flow.getStatus().error == OnlineFlowError::WorldFailed);
+    CHECK(flow.getStatus().message == "scene recovery failed");
+}
+
 TEST_CASE(CleanupTimeoutFailsClosedAndPreservesCredential) {
     ayt::test::setCurrentCase(
         "CleanupTimeoutFailsClosedAndPreservesCredential");

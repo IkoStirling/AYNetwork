@@ -36,6 +36,7 @@ enum class OnlineFlowError : uint8_t {
     SessionFailed,
     LoadingFailed,
     LoadingTimedOut,
+    WorldFailed,
     CleanupFailed,
 };
 
