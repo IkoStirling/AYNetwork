@@ -12,6 +12,7 @@ set(SRC_FILES
     src/Transport/UdpSocket.cpp
     src/Signaling/UdpSignaling.cpp
     src/Signaling/SecureUdpSignaling.cpp
+    src/Signaling/WebSocketSignaling.cpp
     src/Session/P2PSessionProtocol.cpp
     src/Session/SessionTicket.cpp
     src/Session/InMemorySessionService.cpp
@@ -28,6 +29,7 @@ set(SRC_FILES
     src/Session/OnlineFlowCoordinator.cpp
     src/Session/OnlineFlowSubSystem.cpp
     src/Session/InMemoryOnlineServices.cpp
+    src/Session/DedicatedServerRuntime.cpp
     src/Protocol/PacketAssembler.cpp
     src/Protocol/PacketCodec.cpp
     src/Protocol/AckPipeline.cpp
@@ -75,13 +77,15 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
     AYCrypto                               # authenticated P2P signaling tokens/HMAC
     GameNetworkingSockets::GameNetworkingSockets   # R1: GNS shared variant
     lz4::lz4                               # R2: PacketCodec encode side
+    # cpp-httplib is header-only and its feature macros alter class layout.
+    # Propagate them to every consumer that directly includes httplib.h.
+    httplib::httplib                       # HTTP/WebSocket transport
 )
 
-# Session-service implementation dependencies stay out of AYNetwork's public
-# compile interface.  CMake still propagates their link-only requirements to
-# consumers of this static library.
+# Remaining session-service implementation dependencies stay out of
+# AYNetwork's public compile interface. CMake still propagates their link-only
+# requirements to consumers of this static library.
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    httplib::httplib                       # P2P session-service HTTP transport
     nlohmann_json::nlohmann_json           # SessionServer wire JSON
     unofficial-sodium::sodium              # Ed25519 Join Ticket signatures
     unofficial::sqlite3::sqlite3            # durable P2P authority store
@@ -119,6 +123,8 @@ if(AYNETWORK_BUILD_SESSION_SERVER)
     target_link_libraries(AYNetwork_SessionProbe PRIVATE AYNetwork)
     add_executable(AYNetwork_OnlineProbe tools/online_probe/main.cpp)
     target_link_libraries(AYNetwork_OnlineProbe PRIVATE AYNetwork)
+    add_executable(AYNetwork_DedicatedServer tools/dedicated_server/main.cpp)
+    target_link_libraries(AYNetwork_DedicatedServer PRIVATE AYNetwork)
     if(WIN32 AND BUILD_TESTING)
         add_test(
             NAME AYNetwork_P2P_SessionService_E2E

@@ -179,14 +179,17 @@ TEST_CASE(DedicatedServerLeaseDrainAndAllocationCapacity) {
     registration.capacity = 4;
     const auto server = online.registerServer(registration);
     CHECK(server);
-    const auto allocation = online.allocateServer({"asia", "build-1", 3});
+    const auto allocation = online.allocateServer(
+        {"asia", "build-1", 3, {}, 0, {"maps/test", "1", 7}});
     CHECK(allocation);
     CHECK(allocation.value.isValid());
-    CHECK(online.allocateServer({"asia", "build-1", 2}).error ==
+    CHECK(online.allocateServer(
+        {"asia", "build-1", 2, {}, 0, {"maps/test", "1", 7}}).error ==
           OnlineServiceError::NoCapacity);
 
     CHECK(online.setServerDraining(server.value.credential, true));
-    CHECK(online.allocateServer({"asia", "build-1", 1}).error ==
+    CHECK(online.allocateServer(
+        {"asia", "build-1", 1, {}, 0, {"maps/test", "1", 7}}).error ==
           OnlineServiceError::NoCapacity);
     CHECK(online.unregisterServer(server.value.credential).error ==
           OnlineServiceError::Conflict);
@@ -365,13 +368,26 @@ TEST_CASE(MatchmakingAnyPrefersDedicatedAndDedicatedOnlyWaitsForCapacity) {
     CHECK(online.getMatch(first.value.ticketId, PeerId{"a"}).value.state ==
           MatchTicketState::Queued);
 
-    CHECK(online.registerServer(
-        {"server-a", "asia", "build-1", "203.0.113.10", 7000, 8}));
+    const auto server = online.registerServer(
+        {"server-a", "asia", "build-1", "203.0.113.10", 7000, 8});
+    CHECK(server);
     CHECK_INT_EQ(online.runMatchmaking(1), 1);
     const auto matched = online.getMatch(first.value.ticketId, PeerId{"a"});
+    const auto other = online.getMatch(second.value.ticketId, PeerId{"b"});
     CHECK(matched.value.state == MatchTicketState::Matched);
     CHECK(matched.value.assignment.topology == MatchTopology::Dedicated);
     CHECK(matched.value.assignment.dedicated.isValid());
+    CHECK(other);
+    CHECK(matched.value.assignment.dedicated.reservationToken !=
+          other.value.assignment.dedicated.reservationToken);
+    const auto serverAllocations = online.listServerAllocations(
+        server.value.credential);
+    CHECK(serverAllocations);
+    CHECK_INT_EQ(serverAllocations.value.size(), 1);
+    std::string expected;
+    CHECK(deriveDedicatedAdmissionToken(
+        serverAllocations.value.front().reservationToken, PeerId{"a"}, expected));
+    CHECK(expected == matched.value.assignment.dedicated.reservationToken);
 }
 
 TEST_CASE(OnlineServicesEnforceResourceCapsAndRateLimitConfiguration) {
@@ -396,7 +412,8 @@ TEST_CASE(OnlineServicesEnforceResourceCapsAndRateLimitConfiguration) {
     CHECK(online.registerServer(
         {"server-a", "asia", "build-1", "203.0.113.10", 7000, 5}).error ==
           OnlineServiceError::InvalidRequest);
-    CHECK(online.allocateServer({"asia", "build-1", 3}).error ==
+    CHECK(online.allocateServer(
+        {"asia", "build-1", 3, {}, 0, {"maps/test", "1", 7}}).error ==
           OnlineServiceError::InvalidRequest);
 
     uint64_t now = 4500;
@@ -511,7 +528,8 @@ TEST_CASE(HttpOnlineServicesDerivesIdentityAndCoversAllRouteFamilies) {
     CHECK(dedicated);
     CHECK_INT_EQ(owner->listServers().value.size(), 1);
     CHECK(owner->heartbeatServer(dedicated.value.credential));
-    const auto allocation = owner->allocateServer({"asia", "build-1", 3});
+    const auto allocation = owner->allocateServer(
+        {"asia", "build-1", 3, {}, 0, {"maps/test", "1", 7}});
     CHECK(allocation);
     CHECK(owner->releaseAllocation(allocation.value.allocationId,
                                    allocation.value.reservationToken));

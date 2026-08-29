@@ -144,7 +144,8 @@ TEST_CASE(RestartPreservesLobbyServerAllocationAndQueuedTicket) {
         const auto registered = service.registerServer(durableServerRequest());
         CHECK(registered);
         server = registered.value;
-        const auto reserved = service.allocateServer({"asia", "build-1", 3});
+        const auto reserved = service.allocateServer(
+            {"asia", "build-1", 3, {}, 0, {"maps/test", "1", 7}});
         CHECK(reserved);
         allocation = reserved.value;
         const auto queued = service.enqueueMatch(
@@ -300,7 +301,8 @@ TEST_CASE(MatchedAssignmentSurvivesRestartAndCredentialsStayEncrypted) {
         const auto registered = service.registerServer(durableServerRequest());
         CHECK(registered);
         server = registered.value;
-        const auto reserved = service.allocateServer({"asia", "build-1", 2});
+        const auto reserved = service.allocateServer(
+            {"asia", "build-1", 2, {}, 0, {"maps/test", "1", 7}});
         CHECK(reserved);
         allocation = reserved.value;
     }
@@ -472,9 +474,11 @@ TEST_CASE(TwoInstancesCannotOverbookDedicatedCapacity) {
     CHECK(first.registerServer(registration));
 
     auto futureA = std::async(std::launch::async,
-        [&] { return first.allocateServer({"asia", "build-1", 3}); });
+        [&] { return first.allocateServer(
+            {"asia", "build-1", 3, {}, 0, {"maps/test", "1", 7}}); });
     auto futureB = std::async(std::launch::async,
-        [&] { return second.allocateServer({"asia", "build-1", 3}); });
+        [&] { return second.allocateServer(
+            {"asia", "build-1", 3, {}, 0, {"maps/test", "1", 7}}); });
     const auto resultA = futureA.get();
     const auto resultB = futureB.get();
     CHECK(static_cast<bool>(resultA) != static_cast<bool>(resultB));
@@ -528,6 +532,14 @@ TEST_CASE(PlayerAccessTokensVerifyProviderNeutralIdentityAndTimeBounds) {
     PlayerAccessTokenVerifier wrongKey(std::move(wrongConfig));
     CHECK(wrongKey.verify(token, peer) ==
           PlayerAccessTokenError::InvalidSignature);
+
+    PlayerAccessTokenVerifierConfig rotatedConfig;
+    rotatedConfig.signingKey.fill(0x61);
+    rotatedConfig.acceptedSigningKeys.push_back(fixture.accessKey);
+    rotatedConfig.nowUnixSeconds = [&now] { return now.load(); };
+    PlayerAccessTokenVerifier rotated(std::move(rotatedConfig));
+    CHECK(rotated.verify(token, peer) == PlayerAccessTokenError::None);
+    CHECK(peer == PeerId{"account:independent-player"});
 }
 
 TEST_SUITE_END

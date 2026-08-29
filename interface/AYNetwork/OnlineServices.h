@@ -9,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -242,6 +243,13 @@ struct DedicatedAllocationRequest {
     std::string region;
     std::string buildId;
     uint16_t playerCount = 0;
+    // Matchmaking fills this list so a Dedicated process can bind the shared
+    // reservation bearer to the exact engine identities that may consume it.
+    // Direct fleet allocations may leave it empty; in that case the runtime
+    // admits at most playerCount distinct valid peers.
+    std::vector<PeerId> players;
+    uint64_t matchId = 0;
+    OnlineContentDescriptor content;
 };
 
 struct DedicatedAllocation {
@@ -250,15 +258,27 @@ struct DedicatedAllocation {
     std::string address;
     uint16_t port = 0;
     uint16_t playerCount = 0;
+    std::vector<PeerId> players;
+    uint64_t matchId = 0;
+    OnlineContentDescriptor content;
     std::string reservationToken;
     uint64_t expiresAtUnixSeconds = 0;
 
     bool isValid() const {
         return allocationId != 0 && serverId != 0 && !address.empty() &&
                port != 0 && playerCount != 0 &&
+               players.size() <= playerCount &&
+               content.isValid() &&
                reservationToken.size() == 64 && expiresAtUnixSeconds != 0;
     }
 };
+
+// Derives the per-player connection credential from the fleet-only allocation
+// reservation. Match query implementations replace the master reservation with
+// this value before returning an assignment to an authenticated player.
+bool deriveDedicatedAdmissionToken(std::string_view reservationToken,
+                                   const PeerId& peerId,
+                                   std::string& admissionToken);
 
 class IDedicatedServerService {
 public:
@@ -276,6 +296,12 @@ public:
     virtual OnlineServiceResult<SessionServiceEmpty> releaseAllocation(
         DedicatedAllocationId allocationId,
         const std::string& reservationToken) = 0;
+    // Server-scoped secret-bearing view used by the Headless runtime. The
+    // server credential must match allocation.serverId; fleet credentials
+    // are intentionally insufficient for this route.
+    virtual OnlineServiceResult<std::vector<DedicatedAllocation>>
+        listServerAllocations(
+            const DedicatedServerCredential& credential) = 0;
     virtual OnlineServiceResult<std::vector<DedicatedServerInfo>> listServers() = 0;
 };
 

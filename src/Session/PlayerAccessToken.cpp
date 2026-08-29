@@ -75,7 +75,12 @@ bool computeMac(std::string_view payload,
 } // namespace
 
 bool PlayerAccessTokenVerifierConfig::isValid() const {
-    return hasNonZero(signingKey) && maximumLifetimeSeconds != 0;
+    if (!hasNonZero(signingKey) || maximumLifetimeSeconds == 0 ||
+        acceptedSigningKeys.size() > 8) return false;
+    for (const auto& key : acceptedSigningKeys) {
+        if (!hasNonZero(key)) return false;
+    }
+    return true;
 }
 
 bool issuePlayerAccessToken(
@@ -165,12 +170,24 @@ PlayerAccessTokenError PlayerAccessTokenVerifier::verify(
     }
     const size_t signatureOffset = token.size() - fields[5].size() - 1;
     std::array<uint8_t, kMacBytes> expectedMac{};
-    if (!computeMac(token.substr(0, signatureOffset), _config.signingKey,
-                    expectedMac)) {
+    bool signatureValid = false;
+    const auto verifyKey = [&](const std::array<uint8_t, 32>& key) {
+        if (!computeMac(token.substr(0, signatureOffset), key, expectedMac)) {
+            return false;
+        }
+        const bool match = sodium_memcmp(
+            suppliedMac.data(), expectedMac.data(), expectedMac.size()) == 0;
+        signatureValid = signatureValid || match;
+        return true;
+    };
+    if (!verifyKey(_config.signingKey)) {
         return PlayerAccessTokenError::InvalidConfiguration;
     }
-    const bool signatureValid = sodium_memcmp(
-        suppliedMac.data(), expectedMac.data(), expectedMac.size()) == 0;
+    for (const auto& key : _config.acceptedSigningKeys) {
+        if (!verifyKey(key)) {
+            return PlayerAccessTokenError::InvalidConfiguration;
+        }
+    }
     sodium_memzero(expectedMac.data(), expectedMac.size());
     sodium_memzero(suppliedMac.data(), suppliedMac.size());
     sodium_memzero(nonce.data(), nonce.size());

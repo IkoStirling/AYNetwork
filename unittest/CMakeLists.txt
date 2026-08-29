@@ -75,6 +75,8 @@ add_executable(${P2P_TEST_NAME}
     AYTest_DurableSessionService.cpp
     AYTest_OnlineServices.cpp
     AYTest_DurableOnlineServices.cpp
+    AYTest_DedicatedServerRuntime.cpp
+    AYTest_WebSocketSignaling.cpp
 )
 target_compile_definitions(${P2P_TEST_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
 target_link_libraries(${P2P_TEST_NAME} PRIVATE AYNetwork AYTest AYCore)

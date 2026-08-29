@@ -54,11 +54,39 @@ P2P 会话或占用 Dedicated 容量；拒绝者被取消，其余票据重新�
 
 `IDedicatedServerService` 支持 server 注册、凭证化 heartbeat、draining、注销、容量预留
 和释放。注册返回独立 64 字符 server token；分配返回 address/port、allocation ID、短期
-reservation token 与过期时间。过期 server lease 会连同其 allocation 一起 fencing；
+reservation master token、match ID、成员名单、逻辑内容描述与过期时间。master 只供后端
+释放 allocation 和专服派生凭据；玩家调用 `getMatch()` 时会按认证 `PeerId` 得到独立的
+admission token，同局其他 ticket 无法用自己的 token 冒充该玩家。专服可用自身 bearer 调用
+`listServerAllocations()` 拉取被分配的比赛，而不需要获得 fleet control token。过期 server
+lease 会连同其 allocation 一起 fencing；
 draining server 不再接新局，仍有 allocation 时注销会进入排空并返回冲突，释放后可重试。
 
 参考选择器优先选择占用比例最低的 server，再以 server ID 打破平局，结果可复现且不会
 超卖声明容量。
+
+### Headless Dedicated Runtime
+
+`DedicatedServerRuntime` 把目录契约接到实际 Headless 游戏进程：启动时注册并监听游戏端口，
+后台执行 heartbeat 与 allocation polling；新 allocation 到达后调用
+`IDedicatedWorldHost::startAuthoritativeWorld()`，客户端连接时先校验有界 admission payload
+中的 allocation ID、`PeerId` 和按玩家派生的 admission token，再把连接交给世界。最后一名成员断开后
+停止世界并释放 allocation。SIGINT/SIGTERM 或应用调用 `beginDrain()` 时先标记 draining，
+不再接受新分配，现有世界清空后注销并退出。
+
+仓库提供可部署壳 `AYNetwork_DedicatedServer`：
+
+```powershell
+$env:AY_ONLINE_SERVER_TOKEN = "<fleet control token>"
+$env:AY_ONLINE_BACKEND_TLS = "1" # 反向代理提供 HTTPS 时
+.\AYNetwork_DedicatedServer.exe api.example.com 443 ds-sg-01 asia build-42 `
+    198.51.100.20 7350 64
+```
+
+该工具中的 `ReferenceWorldHost` 只记录内容加载和玩家进入/离开，用于部署联调；实际游戏应
+实现 `IDedicatedWorldHost`，按 `contentId/contentVersion/contentSeed` 调用自己的场景加载器、
+创建 authority world，并在 `tickAuthoritativeWorlds()` 驱动模拟。客户端可直接使用
+`NetworkDedicatedSessionConnector`，它会安装 assignment 的 admission payload 并建立 GNS
+IP 连接。
 
 ## 游戏侧 OnlineSessionCoordinator
 
@@ -216,6 +244,7 @@ Owner/revision，不能由客户端伪造成员。
 | POST | `/v1/matches/run` | Fleet control token |
 | POST/GET | `/v1/dedicated/servers` | Fleet control token |
 | POST | `/v1/dedicated/servers/{id}/heartbeat|drain|unregister` | Server Bearer |
+| GET | `/v1/dedicated/servers/{id}/allocations` | Server Bearer |
 | POST | `/v1/dedicated/allocations` | Fleet control token |
 | POST | `/v1/dedicated/allocations/{id}/release` | Reservation Bearer |
 
@@ -246,8 +275,9 @@ session backend。默认最多 64 人 Lobby/Match、4096 容量 Dedicated Server
 
 - Lobby、成员、匹配 ticket/party、Dedicated server 和 allocation 使用规范化表；写操作
   运行在 `BEGIN IMMEDIATE` 事务中，容量预留不会超卖。
-- schema v3 持久化 Lobby metadata/可见性/密码 verifier、邀请 token 摘要，以及匹配规则、
-  接受状态、match ID 和队伍 placement；邀请和密码明文不会写入数据库。
+- schema v5 持久化 Lobby metadata/可见性/密码 verifier、邀请 token 摘要、匹配规则、
+  接受状态、match ID、队伍 placement，以及 Dedicated allocation 的成员和逻辑内容；邀请和
+  密码明文不会写入数据库。
 - WAL、`synchronous=FULL` 和 schema version 门禁保证重启恢复并拒绝未知格式；数据库必须
   位于本地磁盘，不能放 SMB/NFS 共享目录。
 - Lobby launch 与 matchmaking 使用带过期时间的持久 claim，多进程 worker 只会有一个
@@ -270,17 +300,22 @@ $env:AY_SESSION_DB = "D:\AYNetwork\state.sqlite3"
 $env:AY_SESSION_STATE_KEY = "<64 个 hex 字符；同时加密 session/online state>"
 $env:AY_SESSION_TICKET_KEY_FILE = "D:\AYNetwork\ticket-signing.key"
 $env:AY_SESSION_ADMISSION_TOKEN = "<至少 32 字符>"
+$env:AY_SESSION_ADMISSION_PREVIOUS_TOKENS = "<轮换窗口内仍接受的旧 token，逗号分隔>"
 $env:AY_SESSION_AUDIT_FILE = "D:\AYNetwork\audit.jsonl"
 $env:AY_SESSION_HTTP_BIND = "127.0.0.1"
+$env:AY_SESSION_SIGNALING_TRANSPORT = "websocket"
+$env:AY_SESSION_METRICS_TOKEN = "<监控抓取 bearer>"
 
 $env:AY_ONLINE_ENABLE = "1"
 $env:AY_ONLINE_AUTH_KEY = "<账号服务与 SessionServer 共享的 64 hex HMAC key>"
+$env:AY_ONLINE_AUTH_PREVIOUS_KEYS = "<旧 HMAC key，逗号分隔，最多 8 个>"
 $env:AY_ONLINE_SERVER_TOKEN = "<至少 32 字符的 fleet/orchestrator token>"
+$env:AY_ONLINE_SERVER_PREVIOUS_TOKENS = "<轮换窗口内的旧 fleet token，逗号分隔>"
 ```
 
-生产 HTTP 必须监听回环并由反向代理终止 TLS。当前 token verifier 接受单一 signing key；
-轮换时应先滚动部署支持旧/新 key 的应用认证适配器，或在短 token 生命周期后切换。不要把
-`AY_ONLINE_AUTH_KEY` 或 fleet token 分发给游戏客户端。
+生产 HTTP 必须监听回环并由反向代理终止 TLS。轮换顺序是先把旧 key/token 放入 previous
+列表并部署新主密钥，再等待旧凭证最大寿命过去后移除 previous；列表只用于有界滚动窗口，
+不是长期密钥仓库。不要把 `AY_ONLINE_AUTH_KEY` 或 fleet token 分发给游戏客户端。
 
 ## 扩展边界
 
@@ -288,5 +323,8 @@ HTTP server 只依赖 `ILobbyService`、`IMatchmakingService`、
 `IDedicatedServerService`，没有依赖 SQLite，这就是应用后端替换边界。参考 SessionServer
 在生产模式下默认要求持久 online state 和签名玩家凭证；
 `AY_ONLINE_ALLOW_EPHEMERAL=1`、`AY_ONLINE_ALLOW_STATIC_CREDENTIALS=1` 仅用于 staging。
-尚未内置外部技能评分源、真实跨区延迟探测、运行中比赛回填、Dedicated 进程拉起或云厂商
-API。第一版技能和 ping 数值由可信应用后端提供；公网客户端自报数据不能直接用于生产匹配。
+SQLite 的多进程能力限于同机和同一本地数据库；它不是跨主机生产数据库。多节点部署应在
+这些接口后使用 PostgreSQL/MySQL 等事务存储和共享任务队列，保留 revision/epoch CAS、
+allocation 容量事务与 claim 恢复语义。尚未内置外部技能评分源、真实跨区延迟探测、运行中
+比赛回填、专服进程编排或云厂商 API。第一版技能和 ping 数值由可信应用后端提供；公网
+客户端自报数据不能直接用于生产匹配。

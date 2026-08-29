@@ -3,6 +3,7 @@
 
 #include <AYNetwork/SessionService.h>
 #include <AYNetwork/OnlineServices.h>
+#include <AYNetwork/Signaling/SecureUdpSignaling.h>
 
 #include <cstdint>
 #include <functional>
@@ -16,6 +17,7 @@ namespace ayt::net
 struct HttpP2PSessionClientConfig {
     std::string serverAddress = "127.0.0.1";
     uint16_t serverPort = 0;
+    bool useTls = false;
     uint32_t connectTimeoutMs = 2000;
     uint32_t requestTimeoutMs = 3000;
     // Optional deployment admission credential. It is sent only on create and
@@ -72,6 +74,19 @@ struct HttpP2PSessionServerConfig {
         uint64_t occurredAtUnixSeconds = 0;
     };
     std::function<void(const AuditEvent&)> auditSink;
+    std::function<bool(std::string_view)> sourceBlocker;
+
+    // Optional WebSocket rendezvous on /v1/signaling. In production wss is
+    // terminated by the reverse proxy and upgraded to this local ws route.
+    bool enableWebSocketSignaling = false;
+    size_t maxWebSocketPeers = 4096;
+    size_t maxWebSocketMessageBytes = 48u * 1024u;
+    uint32_t webSocketCredentialRecheckSeconds = 5;
+    SecureSignalingCredentialResolver signalingCredentialResolver;
+
+    // If configured, /metrics requires an Authorization bearer accepted by
+    // this callback. /livez and /readyz remain suitable for local probes.
+    std::function<bool(std::string_view)> metricsAuthenticator;
 
     // Online-service routes derive the caller identity from this callback.
     // The request body is never allowed to choose actorPeerId.
@@ -79,6 +94,18 @@ struct HttpP2PSessionServerConfig {
     std::function<bool(const PeerId&, const std::vector<PeerId>&)>
         partyAuthorizer;
     std::function<bool(std::string_view)> dedicatedControlAuthenticator;
+};
+
+struct HttpP2PSessionServerMetrics {
+    uint64_t requests = 0;
+    uint64_t responses2xx = 0;
+    uint64_t responses4xx = 0;
+    uint64_t responses5xx = 0;
+    uint64_t rateLimited = 0;
+    uint64_t blocked = 0;
+    uint64_t websocketConnections = 0;
+    uint64_t websocketForwarded = 0;
+    uint64_t websocketAuthenticationFailures = 0;
 };
 
 class HttpP2PSessionServer {
@@ -97,6 +124,9 @@ public:
     void stop();
     bool isRunning() const;
     uint16_t getBoundPort() const;
+    void setReady(bool ready);
+    bool isReady() const;
+    HttpP2PSessionServerMetrics getMetrics() const;
 
 private:
     struct Impl;

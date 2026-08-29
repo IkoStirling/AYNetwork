@@ -149,9 +149,11 @@ Host/Client 通过 `HttpP2PSessionService` 创建或加入会话，再用
 `applyP2PSessionGrant()`、validator、Join Ticket 和 `P2PSessionLeaseKeeper` 仍可供
 自定义大厅流程单独使用。
 
-开发模式使用内存状态；生产模式可启用 SQLite WAL 持久化、ChaCha20-Poly1305 token
-静态加密、持久 Ed25519 签名身份、准入认证、限流和 JSONL 审计。HTTP 仍应只监听回环
-地址并由反向代理终止 TLS；SQLite 多实例仅限同机，跨主机需要事务数据库适配器。
+开发模式使用内存状态和 UDP 信令；生产模式可启用 SQLite WAL 持久化、
+ChaCha20-Poly1305 token 静态加密、持久 Ed25519 签名身份、滚动密钥、准入认证、限流、
+来源封禁、JSONL 审计、健康/就绪探针与 Prometheus 指标，并默认通过同一 HTTPS 入口使用
+鉴权 WebSocket 信令。服务监听回环并由反向代理终止 TLS；SQLite 多实例仅限同机，跨主机
+需要事务数据库适配器。
 后端 CAS 与 AYNetwork 的多节点 Prepare/Commit 由非阻塞 authority gate 串联，但仍不
 是假装成一个分布式原子提交：CAS 后进程崩溃等跨系统失败必须按后端 epoch 关闭旧会话并
 重新加入，不能回退 epoch。
@@ -166,7 +168,10 @@ metadata 筛选、Public/Unlisted/Private 可见性、密码与限时邀请，�
 和直接启动 P2P session；Lobby Owner 同时是 Party leader。匹配支持 Lobby-backed Party、
 区域/延迟/技能容差规则、整 Party 组队、队伍平衡、接受确认、欠员开局回填，以及
 P2P/Dedicated/Any 拓扑和每个 ticket 的最小秘密暴露；Dedicated 目录支持注册凭证、租约、draining、容量
-预留和过期 fencing。`SqliteOnlineServices` 提供 WAL、事务化容量预留、多进程 expiring
+预留和过期 fencing。`DedicatedServerRuntime` 与 `AYNetwork_DedicatedServer` 已把分配轮询、
+heartbeat、Headless authority world、reservation admission、draining 和自动退出接成可部署
+运行时；游戏只需实现 `IDedicatedWorldHost` 接入自己的场景/世界。
+`SqliteOnlineServices` 提供 WAL、事务化容量预留、多进程 expiring
 claim、重启恢复和 XChaCha20-Poly1305 凭证静态加密。`HttpOnlineServices` 提供可信身份
 派生的远程客户端，路由可与 SessionServer 共用端口；生产参考进程使用账号服务签发的
 后端中立 HMAC 玩家 token、持久 SQLite state 与独立 fleet token。完整边界见
@@ -193,7 +198,7 @@ generation 回调 `completeLoading()` 或 `failLoading()`。网络就绪与关�
 
 Lobby 与 Matchmaking 现在携带后端签发的逻辑内容身份（`contentId / contentVersion /
 contentSeed`），而不是客户端文件路径。匹配兼容性要求三者完全一致；assignment 和
-Lobby launch 会把同一身份交给所有成员。SQLite Online store schema 已升到 v3，旧的
+Lobby launch 会把同一身份交给所有成员。SQLite Online store schema 已升到 v5，旧的
 开发数据库会被启动门禁拒绝（当前无兼容项目，需删除旧库后重建）。可选目标
 `AYOnlineApplication` 提供本地内容目录解析、帧末原子 Scene 切换、加载 generation 回执与
 离开会话后的主菜单恢复；接入示例见
@@ -202,10 +207,9 @@ Lobby launch 会把同一身份交给所有成员。SQLite Online store schema �
 当前推荐部署是“自建鉴权信令 + 公共 STUN + direct-only”。TURN 仍受接口支持，
 但不是当前发布门禁；在需要覆盖无法打洞的 NAT 时再部署和验证。
 
-它适合开发、自托管原型和受信网络。公网生产环境应在自定义
-`ISignalingTransport` 中加入账号鉴权、防重放、限流与 TLS/DTLS，或由现有后端
-通过 WebSocket/HTTPS 转发相同的 opaque GNS 信令。TURN 凭证应短期签发，不能
-把长期密钥写入客户端。
+公网生产路径已提供 WSS/HTTPS 的 opaque GNS 信令转发、credential 回查、限流和无秘密
+审计；反向代理仍负责证书与公网 TLS 终止。TURN 凭证应短期签发，不能把长期密钥写入
+客户端。
 
 当前 P2P 拓扑仍沿用 AYNetwork 的 authority/listen-host 模型，并已支持席位恢复和
 Host Migration。房间目录、跨分区仲裁和真正的无主机一致性协议不由信令转发器承担。

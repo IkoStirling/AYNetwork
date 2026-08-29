@@ -4,6 +4,7 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <sodium.h>
 
 #include <atomic>
 #include <charconv>
@@ -11,6 +12,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -304,7 +306,15 @@ struct HttpP2PSessionService::Impl {
             return {SessionServiceError::InvalidRequest,
                     "invalid HTTP session client configuration", {}};
         }
-        httplib::Client client(config.serverAddress, config.serverPort);
+        std::unique_ptr<httplib::Client> client;
+        if (config.useTls) {
+            const std::string endpoint = "https://" + config.serverAddress +
+                ':' + std::to_string(config.serverPort);
+            client = std::make_unique<httplib::Client>(endpoint);
+        } else {
+            client = std::make_unique<httplib::Client>(
+                config.serverAddress, config.serverPort);
+        }
         const auto timeout = [](uint32_t millis, time_t& seconds,
                                 time_t& microseconds) {
             seconds = static_cast<time_t>(millis / 1000u);
@@ -313,12 +323,13 @@ struct HttpP2PSessionService::Impl {
         time_t seconds = 0;
         time_t microseconds = 0;
         timeout(config.connectTimeoutMs, seconds, microseconds);
-        client.set_connection_timeout(seconds, microseconds);
+        client->set_connection_timeout(seconds, microseconds);
         timeout(config.requestTimeoutMs, seconds, microseconds);
-        client.set_read_timeout(seconds, microseconds);
-        client.set_write_timeout(seconds, microseconds);
-        client.set_payload_max_length(kMaxResponseBytes);
-        return decodeResponse(operation(client));
+        client->set_read_timeout(seconds, microseconds);
+        client->set_write_timeout(seconds, microseconds);
+        client->set_payload_max_length(kMaxResponseBytes);
+        if (config.useTls) client->enable_system_ca(true);
+        return decodeResponse(operation(*client));
     }
 
     HttpP2PSessionClientConfig config;
@@ -470,6 +481,22 @@ HttpP2PSessionService::getSession(uint64_t sessionId) {
 }
 
 struct HttpP2PSessionServer::Impl {
+    struct RateBucket {
+        double tokens = 0.0;
+        std::chrono::steady_clock::time_point updated{};
+    };
+
+    struct WebSocketPeer {
+        PeerId peer;
+        SignalingRoomId room;
+        SignalingToken token;
+        uint64_t credentialExpiresAt = 0;
+        uint64_t nextCredentialCheckAt = 0;
+        std::mutex credentialMutex;
+        std::mutex sendMutex;
+        httplib::ws::WebSocket* socket = nullptr;
+    };
+
     Impl(HttpP2PSessionServerConfig input,
          std::shared_ptr<IP2PSessionService> sessionService,
          std::shared_ptr<ILobbyService> lobbies,
@@ -494,6 +521,7 @@ struct HttpP2PSessionServer::Impl {
         routes.dedicatedControlAuthenticator =
             config.dedicatedControlAuthenticator;
         installHttpOnlineServicesRoutes(server, std::move(routes));
+        if (config.enableWebSocketSignaling) installWebSocketSignaling();
     }
 
     void badRequest(httplib::Response& response, const char* message) {
@@ -512,6 +540,23 @@ struct HttpP2PSessionServer::Impl {
 
     bool permit(const httplib::Request& request,
                 httplib::Response& response) {
+        if (config.sourceBlocker) {
+            bool blocked = true;
+            try {
+                blocked = config.sourceBlocker(request.remote_addr);
+            } catch (...) {
+                blocked = true;
+            }
+            if (blocked) {
+                ++blockedRequests;
+                response.status = 403;
+                response.set_content(json{
+                    {"ok", false}, {"error", "source_blocked"},
+                    {"message", "source is blocked"},
+                }.dump(), "application/json");
+                return false;
+            }
+        }
         if (config.rateLimitRequestsPerMinute == 0) return true;
         const auto now = std::chrono::steady_clock::now();
         const std::string source = request.remote_addr.empty()
@@ -534,6 +579,7 @@ struct HttpP2PSessionServer::Impl {
                         SessionServiceError::RateLimited,
                         "session service source table is full"));
                 response.set_header("Retry-After", "1");
+                ++rateLimitedRequests;
                 return false;
             }
             auto [it, inserted] = rateBuckets.try_emplace(source);
@@ -562,7 +608,157 @@ struct HttpP2PSessionServer::Impl {
                 SessionServiceError::RateLimited,
                 "session service rate limit exceeded"));
         response.set_header("Retry-After", "1");
+        ++rateLimitedRequests;
         return false;
+    }
+
+    void installWebSocketSignaling() {
+        server.WebSocket("/v1/signaling",
+            [this](const httplib::Request& request,
+                   httplib::ws::WebSocket& socket) {
+                PeerId peer{request.get_header_value("X-AY-Peer")};
+                SignalingRoomId room{request.get_header_value("X-AY-Room")};
+                const std::string authorization =
+                    request.get_header_value("Authorization");
+                SignalingToken supplied;
+                SecureSignalingCredential expected;
+                const uint64_t now = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count());
+                const bool bearer = authorization.rfind("Bearer ", 0) == 0;
+                httplib::Response gateResponse;
+                bool authenticated = ready.load() &&
+                    permit(request, gateResponse) && bearer && peer.isValid() &&
+                    room.isValid() &&
+                    parseSignalingTokenHex(authorization.substr(7), supplied);
+                try {
+                    authenticated = authenticated &&
+                        config.signalingCredentialResolver &&
+                        config.signalingCredentialResolver(peer, room, expected);
+                } catch (...) {
+                    authenticated = false;
+                }
+                authenticated = authenticated && expected.token.isValid() &&
+                    sodium_memcmp(supplied.bytes.data(), expected.token.bytes.data(),
+                                  supplied.bytes.size()) == 0 &&
+                    (expected.expiresAtUnixSeconds == 0 ||
+                     now <= expected.expiresAtUnixSeconds);
+                const std::string key = room.value + '\n' + peer.value;
+                auto connection = std::make_shared<WebSocketPeer>();
+                connection->peer = peer;
+                connection->room = room;
+                connection->token = supplied;
+                connection->credentialExpiresAt =
+                    expected.expiresAtUnixSeconds;
+                connection->nextCredentialCheckAt = now +
+                    config.webSocketCredentialRecheckSeconds;
+                connection->socket = &socket;
+                if (authenticated) {
+                    std::lock_guard lock(websocketMutex);
+                    if (websocketPeers.size() >= config.maxWebSocketPeers ||
+                        websocketPeers.contains(key)) {
+                        authenticated = false;
+                    } else {
+                        websocketPeers.emplace(key, connection);
+                    }
+                }
+                if (!authenticated) {
+                    ++websocketAuthenticationFailures;
+                    socket.close(httplib::ws::CloseStatus::PolicyViolation,
+                                 "signaling authentication failed");
+                    return;
+                }
+                ++websocketConnections;
+                constexpr char ready[] = {'A', 'Y', 'W', 'S', '1'};
+                bool readySent = false;
+                {
+                    std::lock_guard sendLock(connection->sendMutex);
+                    readySent = socket.send(ready, sizeof(ready));
+                }
+                if (!readySent) {
+                    {
+                        std::lock_guard lock(websocketMutex);
+                        websocketPeers.erase(key);
+                    }
+                    std::lock_guard sendLock(connection->sendMutex);
+                    connection->socket = nullptr;
+                    return;
+                }
+                while (socket.is_open()) {
+                    std::string frame;
+                    if (socket.read(frame) != httplib::ws::Binary ||
+                        frame.size() < 2 ||
+                        frame.size() > config.maxWebSocketMessageBytes) break;
+                    const size_t destinationSize =
+                        static_cast<uint8_t>(frame[0]);
+                    if (destinationSize == 0 || destinationSize > 63 ||
+                        1 + destinationSize >= frame.size()) break;
+                    const PeerId destination{
+                        frame.substr(1, destinationSize)};
+                    if (!destination.isValid()) break;
+                    if (!credentialValid(connection)) break;
+                    std::shared_ptr<WebSocketPeer> target;
+                    {
+                        std::lock_guard lock(websocketMutex);
+                        const auto found = websocketPeers.find(
+                            room.value + '\n' + destination.value);
+                        if (found != websocketPeers.end()) target = found->second;
+                    }
+                    if (!target || !credentialValid(target)) continue;
+                    std::vector<char> forwarded;
+                    forwarded.reserve(1 + peer.value.size() + frame.size() -
+                                      1 - destinationSize);
+                    forwarded.push_back(static_cast<char>(peer.value.size()));
+                    forwarded.insert(forwarded.end(), peer.value.begin(),
+                                     peer.value.end());
+                    forwarded.insert(forwarded.end(),
+                        frame.begin() + 1 + destinationSize, frame.end());
+                    std::lock_guard sendLock(target->sendMutex);
+                    if (target->socket &&
+                        target->socket->send(forwarded.data(), forwarded.size())) {
+                        ++websocketForwarded;
+                    }
+                }
+                {
+                    std::lock_guard lock(websocketMutex);
+                    const auto found = websocketPeers.find(key);
+                    if (found != websocketPeers.end() &&
+                        found->second == connection) websocketPeers.erase(found);
+                }
+                std::lock_guard sendLock(connection->sendMutex);
+                connection->socket = nullptr;
+            });
+    }
+
+    bool credentialValid(const std::shared_ptr<WebSocketPeer>& connection) {
+        if (!connection) return false;
+        const uint64_t now = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        std::lock_guard lock(connection->credentialMutex);
+        if (connection->credentialExpiresAt != 0 &&
+            now > connection->credentialExpiresAt) return false;
+        if (now < connection->nextCredentialCheckAt) return true;
+        SecureSignalingCredential expected;
+        bool resolved = false;
+        try {
+            resolved = config.signalingCredentialResolver &&
+                config.signalingCredentialResolver(
+                    connection->peer, connection->room, expected);
+        } catch (...) {
+            resolved = false;
+        }
+        connection->nextCredentialCheckAt = now +
+            config.webSocketCredentialRecheckSeconds;
+        if (!resolved || !expected.token.isValid() ||
+            sodium_memcmp(connection->token.bytes.data(),
+                          expected.token.bytes.data(),
+                          connection->token.bytes.size()) != 0 ||
+            (expected.expiresAtUnixSeconds != 0 &&
+             now > expected.expiresAtUnixSeconds)) return false;
+        connection->credentialExpiresAt = expected.expiresAtUnixSeconds;
+        return true;
     }
 
     bool authorizeAdmission(const httplib::Request& request,
@@ -587,6 +783,56 @@ struct HttpP2PSessionServer::Impl {
     }
 
     void installRoutes() {
+        server.Get("/livez", [this](const httplib::Request&,
+                                     httplib::Response& response) {
+            response.status = running.load() ? 200 : 503;
+            response.set_content(running.load() ? "live\n" : "stopped\n",
+                                 "text/plain");
+        });
+        server.Get("/readyz", [this](const httplib::Request&,
+                                      httplib::Response& response) {
+            response.status = ready.load() ? 200 : 503;
+            response.set_content(ready.load() ? "ready\n" : "draining\n",
+                                 "text/plain");
+        });
+        server.Get("/metrics", [this](const httplib::Request& request,
+                                       httplib::Response& response) {
+            if (config.metricsAuthenticator) {
+                const std::string authorization =
+                    request.get_header_value("Authorization");
+                bool accepted = authorization.rfind("Bearer ", 0) == 0;
+                try {
+                    accepted = accepted &&
+                        config.metricsAuthenticator(authorization.substr(7));
+                } catch (...) { accepted = false; }
+                if (!accepted) {
+                    response.status = 401;
+                    response.set_content("metrics authentication failed\n",
+                                         "text/plain");
+                    return;
+                }
+            }
+            const auto metrics = snapshotMetrics();
+            std::string body;
+            const auto add = [&body](const char* name, uint64_t value) {
+                body += name; body += ' '; body += std::to_string(value);
+                body += '\n';
+            };
+            add("aynetwork_http_requests_total", metrics.requests);
+            add("aynetwork_http_responses_2xx_total", metrics.responses2xx);
+            add("aynetwork_http_responses_4xx_total", metrics.responses4xx);
+            add("aynetwork_http_responses_5xx_total", metrics.responses5xx);
+            add("aynetwork_http_rate_limited_total", metrics.rateLimited);
+            add("aynetwork_http_blocked_total", metrics.blocked);
+            add("aynetwork_websocket_connections_total",
+                metrics.websocketConnections);
+            add("aynetwork_websocket_forwarded_total",
+                metrics.websocketForwarded);
+            add("aynetwork_websocket_auth_failures_total",
+                metrics.websocketAuthenticationFailures);
+            response.status = 200;
+            response.set_content(std::move(body), "text/plain; version=0.0.4");
+        });
         server.Post("/v1/sessions", [this](const httplib::Request& request,
                                            httplib::Response& response) {
             if (!permit(request, response)) return;
@@ -708,6 +954,10 @@ struct HttpP2PSessionServer::Impl {
         });
         server.set_logger([this](const httplib::Request& request,
                                  const httplib::Response& response) {
+            ++requests;
+            if (response.status >= 200 && response.status < 300) ++responses2xx;
+            else if (response.status >= 400 && response.status < 500) ++responses4xx;
+            else if (response.status >= 500) ++responses5xx;
             if (!config.auditSink) return;
             HttpP2PSessionServerConfig::AuditEvent event;
             event.method = request.method;
@@ -725,19 +975,35 @@ struct HttpP2PSessionServer::Impl {
         });
     }
 
-    struct RateBucket {
-        double tokens = 0.0;
-        std::chrono::steady_clock::time_point updated{};
-    };
+    HttpP2PSessionServerMetrics snapshotMetrics() const {
+        return {requests.load(), responses2xx.load(), responses4xx.load(),
+                responses5xx.load(), rateLimitedRequests.load(),
+                blockedRequests.load(), websocketConnections.load(),
+                websocketForwarded.load(),
+                websocketAuthenticationFailures.load()};
+    }
 
     HttpP2PSessionServerConfig config;
     std::shared_ptr<IP2PSessionService> service;
     httplib::Server server;
     std::thread thread;
     std::atomic<bool> running{false};
+    std::atomic<bool> ready{false};
     uint16_t boundPort = 0;
     std::mutex rateMutex;
     std::unordered_map<std::string, RateBucket> rateBuckets;
+    std::mutex websocketMutex;
+    std::unordered_map<std::string, std::shared_ptr<WebSocketPeer>>
+        websocketPeers;
+    std::atomic<uint64_t> requests{0};
+    std::atomic<uint64_t> responses2xx{0};
+    std::atomic<uint64_t> responses4xx{0};
+    std::atomic<uint64_t> responses5xx{0};
+    std::atomic<uint64_t> rateLimitedRequests{0};
+    std::atomic<uint64_t> blockedRequests{0};
+    std::atomic<uint64_t> websocketConnections{0};
+    std::atomic<uint64_t> websocketForwarded{0};
+    std::atomic<uint64_t> websocketAuthenticationFailures{0};
     bool hasPlayerRoutes = false;
     bool hasDedicatedRoutes = false;
 };
@@ -762,6 +1028,11 @@ bool HttpP2PSessionServer::start() {
         (_impl->hasPlayerRoutes && !_impl->config.playerAuthenticator) ||
         (_impl->hasDedicatedRoutes &&
          !_impl->config.dedicatedControlAuthenticator) ||
+        (_impl->config.enableWebSocketSignaling &&
+         (!_impl->config.signalingCredentialResolver ||
+          _impl->config.maxWebSocketPeers == 0 ||
+          _impl->config.maxWebSocketMessageBytes < 2 ||
+          _impl->config.webSocketCredentialRecheckSeconds == 0)) ||
         ((_impl->config.rateLimitRequestsPerMinute == 0) !=
          (_impl->config.rateLimitBurst == 0)) ||
         (_impl->config.rateLimitRequestsPerMinute != 0 &&
@@ -774,6 +1045,7 @@ bool HttpP2PSessionServer::start() {
     if (port <= 0 || port > 65535) return false;
     _impl->boundPort = static_cast<uint16_t>(port);
     _impl->running.store(true);
+    _impl->ready.store(true);
     _impl->thread = std::thread([impl = _impl.get()] {
         (void)impl->server.listen_after_bind();
         impl->running.store(false);
@@ -786,6 +1058,7 @@ void HttpP2PSessionServer::stop() {
     _impl->server.stop();
     if (_impl->thread.joinable()) _impl->thread.join();
     _impl->running.store(false);
+    _impl->ready.store(false);
 }
 
 bool HttpP2PSessionServer::isRunning() const {
@@ -794,6 +1067,18 @@ bool HttpP2PSessionServer::isRunning() const {
 
 uint16_t HttpP2PSessionServer::getBoundPort() const {
     return _impl ? _impl->boundPort : 0;
+}
+
+void HttpP2PSessionServer::setReady(bool ready) {
+    if (_impl) _impl->ready.store(ready && _impl->running.load());
+}
+
+bool HttpP2PSessionServer::isReady() const {
+    return _impl && _impl->running.load() && _impl->ready.load();
+}
+
+HttpP2PSessionServerMetrics HttpP2PSessionServer::getMetrics() const {
+    return _impl ? _impl->snapshotMetrics() : HttpP2PSessionServerMetrics{};
 }
 
 } // namespace ayt::net

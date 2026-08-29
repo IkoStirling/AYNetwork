@@ -342,9 +342,14 @@ bool dedicatedInfoFromJson(const json& value, DedicatedServerInfo& out) {
 }
 
 json allocationToJson(const DedicatedAllocation& value) {
+    json players = json::array();
+    for (const PeerId& peer : value.players) players.push_back(peer.value);
     return {{"allocation_id", value.allocationId}, {"server_id", value.serverId},
             {"address", value.address}, {"port", value.port},
             {"player_count", value.playerCount},
+            {"players", std::move(players)},
+            {"match_id", value.matchId},
+            {"content", contentToJson(value.content)},
             {"reservation_token", value.reservationToken},
             {"expires_at", value.expiresAtUnixSeconds}};
 }
@@ -356,9 +361,16 @@ bool allocationFromJson(const json& value, DedicatedAllocation& out) {
             !readUnsigned(value, "server_id", parsed.serverId) ||
             !readUnsigned(value, "port", parsed.port) ||
             !readUnsigned(value, "player_count", parsed.playerCount) ||
+            !readUnsigned(value, "match_id", parsed.matchId) ||
             !readUnsigned(value, "expires_at", parsed.expiresAtUnixSeconds)) return false;
         parsed.address = value.at("address").get<std::string>();
         parsed.reservationToken = value.at("reservation_token").get<std::string>();
+        for (const auto& player : value.at("players")) {
+            PeerId peer{player.get<std::string>()};
+            if (!peer.isValid()) return false;
+            parsed.players.push_back(std::move(peer));
+        }
+        if (!contentFromJson(value.at("content"), parsed.content)) return false;
         if (!parsed.isValid()) return false;
         out = std::move(parsed);
         return true;
@@ -576,7 +588,15 @@ struct HttpOnlineServices::Impl {
             return {OnlineServiceError::InvalidRequest,
                     "invalid online HTTP client configuration", {}};
         }
-        httplib::Client client(config.serverAddress, config.serverPort);
+        std::unique_ptr<httplib::Client> client;
+        if (config.useTls) {
+            const std::string endpoint = "https://" + config.serverAddress +
+                ':' + std::to_string(config.serverPort);
+            client = std::make_unique<httplib::Client>(endpoint);
+        } else {
+            client = std::make_unique<httplib::Client>(
+                config.serverAddress, config.serverPort);
+        }
         auto setTimeout = [](uint32_t milliseconds, time_t& seconds,
                              time_t& microseconds) {
             seconds = static_cast<time_t>(milliseconds / 1000u);
@@ -585,12 +605,13 @@ struct HttpOnlineServices::Impl {
         time_t seconds = 0;
         time_t microseconds = 0;
         setTimeout(config.connectTimeoutMs, seconds, microseconds);
-        client.set_connection_timeout(seconds, microseconds);
+        client->set_connection_timeout(seconds, microseconds);
         setTimeout(config.requestTimeoutMs, seconds, microseconds);
-        client.set_read_timeout(seconds, microseconds);
-        client.set_write_timeout(seconds, microseconds);
-        client.set_payload_max_length(kMaxResponseBytes);
-        return decodeResponse(operation(client));
+        client->set_read_timeout(seconds, microseconds);
+        client->set_write_timeout(seconds, microseconds);
+        client->set_payload_max_length(kMaxResponseBytes);
+        if (config.useTls) client->enable_system_ca(true);
+        return decodeResponse(operation(*client));
     }
 
     httplib::Headers playerHeaders(const std::string& token) const {
@@ -1026,8 +1047,13 @@ OnlineServiceResult<SessionServiceEmpty> HttpOnlineServices::unregisterServer(
 
 OnlineServiceResult<DedicatedAllocation> HttpOnlineServices::allocateServer(
     const DedicatedAllocationRequest& request) {
+    json players = json::array();
+    for (const PeerId& peer : request.players) players.push_back(peer.value);
     const json body{{"region", request.region}, {"build_id", request.buildId},
-                    {"player_count", request.playerCount}};
+                    {"player_count", request.playerCount},
+                    {"players", std::move(players)},
+                    {"match_id", request.matchId},
+                    {"content", contentToJson(request.content)}};
     const auto response = _impl->invoke([&](httplib::Client& client) {
         return client.Post("/v1/dedicated/allocations", _impl->controlHeaders(),
                            body.dump(), "application/json");
@@ -1054,6 +1080,38 @@ OnlineServiceResult<SessionServiceEmpty> HttpOnlineServices::releaseAllocation(
         OnlineServiceResult<SessionServiceEmpty>::failure(response.error,
                                                            response.message);
     return OnlineServiceResult<SessionServiceEmpty>::success({});
+}
+
+OnlineServiceResult<std::vector<DedicatedAllocation>>
+HttpOnlineServices::listServerAllocations(
+    const DedicatedServerCredential& credential) {
+    const std::string path = "/v1/dedicated/servers/" +
+        std::to_string(credential.serverId) + "/allocations";
+    const httplib::Headers headers{
+        {"Authorization", "Bearer " + credential.token}};
+    const auto response = _impl->invoke([&](httplib::Client& client) {
+        return client.Get(path, headers);
+    });
+    if (response.error != OnlineServiceError::None) {
+        return OnlineServiceResult<std::vector<DedicatedAllocation>>::failure(
+            response.error, response.message);
+    }
+    try {
+        std::vector<DedicatedAllocation> allocations;
+        for (const auto& entry : response.value) {
+            DedicatedAllocation allocation;
+            if (!allocationFromJson(entry, allocation)) {
+                throw std::runtime_error("invalid allocation");
+            }
+            allocations.push_back(std::move(allocation));
+        }
+        return OnlineServiceResult<std::vector<DedicatedAllocation>>::success(
+            std::move(allocations));
+    } catch (...) {
+        return OnlineServiceResult<std::vector<DedicatedAllocation>>::failure(
+            OnlineServiceError::InternalError,
+            "invalid server allocation response");
+    }
 }
 
 OnlineServiceResult<std::vector<DedicatedServerInfo>>
@@ -1459,14 +1517,41 @@ void installHttpOnlineServicesRoutes(
             try {
                 input.region = body.at("region").get<std::string>();
                 input.buildId = body.at("build_id").get<std::string>();
+                if (!contentFromJson(body.at("content"), input.content)) {
+                    badRequest(response, "invalid allocation content"); return;
+                }
+                for (const auto& player : body.at("players")) {
+                    input.players.emplace_back(player.get<std::string>());
+                }
             } catch (...) { badRequest(response, "invalid allocation request"); return; }
-            if (!readUnsigned(body, "player_count", input.playerCount)) {
+            if (!readUnsigned(body, "player_count", input.playerCount) ||
+                !readUnsigned(body, "match_id", input.matchId)) {
                 badRequest(response, "invalid allocation request"); return;
             }
             const auto result = config.dedicated->allocateServer(input);
             if (!result) writeFailure(response, result);
             else writeSuccess(response, allocationToJson(result.value));
         });
+
+        server.Get(R"(/v1/dedicated/servers/(\d+)/allocations)",
+            [config, permit](const httplib::Request& request,
+                             httplib::Response& response) {
+                if (!permit(request, response)) return;
+                DedicatedServerCredential credential;
+                if (!parseId(request, 1, credential.serverId) ||
+                    !readBearer(request, credential.token)) {
+                    badRequest(response, "invalid server credential");
+                    return;
+                }
+                const auto result =
+                    config.dedicated->listServerAllocations(credential);
+                if (!result) { writeFailure(response, result); return; }
+                json allocations = json::array();
+                for (const auto& allocation : result.value) {
+                    allocations.push_back(allocationToJson(allocation));
+                }
+                writeSuccess(response, std::move(allocations));
+            });
 
         server.Post(R"(/v1/dedicated/allocations/(\d+)/release)",
             [config, permit](const httplib::Request& request,

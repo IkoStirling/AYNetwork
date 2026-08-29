@@ -141,6 +141,7 @@ public:
             HttpP2PSessionClientConfig sessionConfig;
             sessionConfig.serverAddress = _config.backend.serverAddress;
             sessionConfig.serverPort = _config.backend.serverPort;
+            sessionConfig.useTls = _config.backend.useTls;
             sessionConfig.connectTimeoutMs = _config.backend.connectTimeoutMs;
             sessionConfig.requestTimeoutMs = _config.backend.requestTimeoutMs;
             const auto credentials = _credentials;
@@ -153,6 +154,7 @@ public:
             HttpOnlineServicesClientConfig onlineConfig;
             onlineConfig.serverAddress = _config.backend.serverAddress;
             onlineConfig.serverPort = _config.backend.serverPort;
+            onlineConfig.useTls = _config.backend.useTls;
             onlineConfig.connectTimeoutMs = _config.backend.connectTimeoutMs;
             onlineConfig.requestTimeoutMs = _config.backend.requestTimeoutMs;
             onlineConfig.localPeerId = _config.localPeerId;

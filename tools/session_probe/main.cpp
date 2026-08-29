@@ -4,6 +4,7 @@
 #include <AYNetwork/Session/P2PSessionBackend.h>
 #include <AYNetwork/Session/SessionTicket.h>
 #include <AYNetwork/Signaling/SecureUdpSignaling.h>
+#include <AYNetwork/Signaling/WebSocketSignaling.h>
 
 #include <charconv>
 #include <chrono>
@@ -29,18 +30,39 @@ bool parsePort(const char* text, uint16_t& port) {
     return true;
 }
 
-bool waitReady(ayt::net::SecureUdpSignalingClient& first,
-               ayt::net::SecureUdpSignalingClient& second) {
+bool signalingReady(ayt::net::ISignalingTransport& signaling) {
+    if (auto* udp = dynamic_cast<ayt::net::SecureUdpSignalingClient*>(
+            &signaling)) return udp->isReady();
+    return signaling.isRunning();
+}
+
+bool waitReady(ayt::net::ISignalingTransport& first,
+               ayt::net::ISignalingTransport& second) {
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::seconds(5);
     const auto discard = [](const ayt::net::PeerId&, const void*, size_t) {};
     while (std::chrono::steady_clock::now() < deadline) {
         first.poll(discard);
         second.poll(discard);
-        if (first.isReady() && second.isReady()) return true;
+        if (signalingReady(first) && signalingReady(second)) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return false;
+}
+
+std::shared_ptr<ayt::net::ISignalingTransport> makeSignaling(
+    const ayt::net::P2PSessionGrant& grant,
+    ayt::net::P2PConfig& p2p) {
+    if (ayt::net::usesWebSocketSignaling(grant)) {
+        ayt::net::WebSocketSignalingClientConfig config;
+        if (!ayt::net::applyP2PSessionGrant(grant, p2p, config)) return {};
+        return std::make_shared<ayt::net::WebSocketSignalingClient>(
+            std::move(config));
+    }
+    ayt::net::SecureUdpSignalingClientConfig config;
+    if (!ayt::net::applyP2PSessionGrant(grant, p2p, config)) return {};
+    return std::make_shared<ayt::net::SecureUdpSignalingClient>(
+        std::move(config));
 }
 
 } // namespace
@@ -57,6 +79,10 @@ int main(int argc, char** argv) {
     ayt::net::HttpP2PSessionClientConfig clientConfig;
     clientConfig.serverAddress = argv[1];
     clientConfig.serverPort = httpPort;
+    if (const char* tls = std::getenv("AY_SESSION_BACKEND_TLS")) {
+        clientConfig.useTls = std::strcmp(tls, "1") == 0 ||
+            std::strcmp(tls, "true") == 0;
+    }
     if (const char* admission = std::getenv("AY_SESSION_ADMISSION_TOKEN")) {
         clientConfig.admissionToken = admission;
     }
@@ -88,49 +114,42 @@ int main(int argc, char** argv) {
 
     ayt::net::P2PConfig hostP2P;
     hostP2P.localPeerId = create.hostPeerId;
-    ayt::net::SecureUdpSignalingClientConfig hostSignalConfig;
-    if (!ayt::net::applyP2PSessionGrant(
-            host.value, hostP2P, hostSignalConfig)) return 14;
+    auto hostSignal = makeSignaling(host.value, hostP2P);
+    if (!hostSignal) return 14;
     ayt::net::P2PConfig joinP2P;
     joinP2P.localPeerId = join.peerId;
-    ayt::net::SecureUdpSignalingClientConfig joinSignalConfig;
-    if (!ayt::net::applyP2PSessionGrant(
-            member.value, joinP2P, joinSignalConfig)) return 15;
+    auto joinSignal = makeSignaling(member.value, joinP2P);
+    if (!joinSignal) return 15;
 
-    ayt::net::SecureUdpSignalingClient hostSignal(hostSignalConfig);
-    ayt::net::SecureUdpSignalingClient joinSignal(joinSignalConfig);
-    const bool hostStarted = hostSignal.start(create.hostPeerId);
-    const bool joinStarted = joinSignal.start(join.peerId);
-    if (!hostStarted || !joinStarted || !waitReady(hostSignal, joinSignal)) {
+    const bool hostStarted = hostSignal->start(create.hostPeerId);
+    const bool joinStarted = joinSignal->start(join.peerId);
+    if (!hostStarted || !joinStarted || !waitReady(*hostSignal, *joinSignal)) {
         std::fprintf(stderr,
-            "signal registration failed host_started=%d host_state=%u host_error=%u "
-            "join_started=%d join_state=%u join_error=%u room=%s port=%u\n",
+            "signal registration failed host_started=%d join_started=%d "
+            "transport=%s\n",
             hostStarted ? 1 : 0,
-            static_cast<unsigned>(hostSignal.getState()),
-            static_cast<unsigned>(hostSignal.getLastError()),
             joinStarted ? 1 : 0,
-            static_cast<unsigned>(joinSignal.getState()),
-            static_cast<unsigned>(joinSignal.getLastError()),
-            hostSignalConfig.roomId.value.c_str(), hostSignalConfig.serverPort);
+            ayt::net::usesWebSocketSignaling(host.value)
+                ? "websocket" : "udp");
         return 16;
     }
     constexpr char payload[] = "session-issued-signal";
-    if (!hostSignal.sendSignal(join.peerId, payload, sizeof(payload))) return 17;
+    if (!hostSignal->sendSignal(join.peerId, payload, sizeof(payload))) return 17;
     bool received = false;
     const auto discard = [](const ayt::net::PeerId&, const void*, size_t) {};
     const auto signalDeadline = std::chrono::steady_clock::now() +
         std::chrono::seconds(3);
     while (!received && std::chrono::steady_clock::now() < signalDeadline) {
-        hostSignal.poll(discard);
-        joinSignal.poll([&](const ayt::net::PeerId& sender,
+        hostSignal->poll(discard);
+        joinSignal->poll([&](const ayt::net::PeerId& sender,
                             const void* bytes, size_t size) {
             received = sender == create.hostPeerId && size == sizeof(payload) &&
                 std::memcmp(bytes, payload, size) == 0;
         });
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    hostSignal.stop();
-    joinSignal.stop();
+    hostSignal->stop();
+    joinSignal->stop();
     if (!received) return 18;
 
     ayt::net::P2PSessionHeartbeatRequest heartbeat;

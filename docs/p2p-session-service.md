@@ -8,7 +8,8 @@
 参考部署把两个逻辑服务放进同一进程：
 
 1. TCP/HTTP 会话 API：创建/加入、成员凭证、Host lease、epoch CAS。
-2. UDP 安全信令：只转发 GNS 建连所需的 opaque signaling blob。
+2. 鉴权信令：生产默认在同一 HTTPS 入口使用 WebSocket；开发模式可选 UDP。两者都只转发
+   GNS 建连所需的 opaque signaling blob。
 
 GNS 建立 ICE 路径后，游戏消息直接在玩家间传输，不经过 SessionServer。
 
@@ -26,8 +27,8 @@ GNS 建立 ICE 路径后，游戏消息直接在玩家间传输，不经过 Sess
 .\AYNetwork_SessionServer.exe 0.0.0.0 18080 203.0.113.10 28080
 ```
 
-需要开放 TCP 18080 和 UDP 28080。第四个参数是本机 UDP 监听端口；第三个参数是写入
-客户端 grant 的公网信令地址，可以是公网 IP，也可以是可解析域名。
+开发默认需要开放 TCP 18080 和 UDP 28080。第四个参数是 UDP 模式的监听端口；第三个参数
+是写入客户端 grant 的公网信令地址，可以是公网 IP 或域名。
 
 开发模式默认使用内存目录。生产模式显式启用 SQLite WAL、持久签名身份、静态准入
 认证、HTTP 限流和 JSONL 审计；HTTP 应只监听回环地址并由反向代理终止 TLS：
@@ -40,8 +41,13 @@ $env:AY_SESSION_TICKET_KEY_FILE = "D:\AYNetwork\secrets\ticket.key"
 $env:AY_SESSION_ADMISSION_TOKEN = "<至少 32 字符的准入秘密>"
 $env:AY_SESSION_AUDIT_FILE = "D:\AYNetwork\logs\session-audit.jsonl"
 $env:AY_SESSION_HTTP_BIND = "127.0.0.1"
-.\AYNetwork_SessionServer.exe 0.0.0.0 18080 session.example.com 28080
+$env:AY_SESSION_SIGNALING_TRANSPORT = "websocket"
+.\AYNetwork_SessionServer.exe 127.0.0.1 18080 wss://session.example.com/v1/signaling 28080
 ```
+
+生产模式未显式设置 `AY_SESSION_SIGNALING_TRANSPORT` 时默认 `websocket`；HTTP API、
+`/v1/signaling` WebSocket 和在线服务路由共享同一端口，由 Caddy/nginx/IIS 终止 TLS。
+开发默认仍为 `udp`，便于与早期公网打洞探针兼容。
 
 `AY_SESSION_RATE_PER_MINUTE` 与 `AY_SESSION_RATE_BURST` 必须成对设置；生产默认分别为
 600 和 100。`AY_SESSION_ALLOW_PUBLIC_PLAINTEXT=1` 只用于明确接受风险的隔离测试，
@@ -54,7 +60,7 @@ $env:AY_SESSION_HTTP_BIND = "127.0.0.1"
 ```
 
 成功输出 `AY_SESSION_RESULT state=passed ...`。探针会真实走 HTTP，并用服务签发的
-两份独立信令凭证完成 UDP 注册和转发。
+两份独立信令凭证完成所选信令传输的注册和转发。
 
 ## 3. HTTP 契约
 
@@ -78,6 +84,10 @@ $env:AY_SESSION_HTTP_BIND = "127.0.0.1"
 | POST | `/v1/sessions/{id}/claim-host` | Member Bearer | 优雅转移或租约过期后的 self-claim |
 | POST | `/v1/sessions/{id}/leave` | Member Bearer | 成员离开；有效 Host 离开则结束会话 |
 | GET | `/v1/sessions/{id}` | v1 无 | 读取不含秘密的会话状态 |
+| GET | `/livez` | 无 | 进程存活探针 |
+| GET | `/readyz` | 无 | 接流量/排空状态 |
+| GET | `/metrics` | 可选 Bearer | Prometheus 文本指标 |
+| WS | `/v1/signaling` | Peer/room/signaling Bearer | 房间内 opaque 信令转发 |
 
 Member Bearer 是 create/join 返回的 64 字符成员 token，只用于 HTTP 会话操作。安全 UDP
 信令 token 是另一份独立秘密，二者不能互换。Host claim 只返回公开会话状态，不返回
@@ -177,15 +187,26 @@ key 校验值与 Ed25519 公钥，使用错误密钥或错误签名身份会拒�
 
 以下仍是部署层责任：
 
-- HTTP 实现本身是明文，公网入口必须由 Caddy、nginx、IIS 等反向代理提供 HTTPS、证书、
-  请求大小/超时策略和真实客户端地址治理。
+- 内置服务监听明文回环；公网入口必须由 Caddy、nginx、IIS 等反向代理提供 HTTPS/WSS、
+  证书、请求大小/超时策略和真实客户端地址治理。客户端配置 `useTls=true` 后使用 HTTPS，
+  grant 中的信令地址应是 `wss://.../v1/signaling`。
 - 内置 Admission Token 是部署级最小门禁，不是玩家账号系统。正式项目应在代理或自定义
   `IP2PSessionService` 适配器中验证账号 JWT/平台票据，并把认证后的 `PeerId` 传入服务。
 - SQLite WAL 只支持同机多进程，不支持网络共享盘或跨主机多活。跨主机部署需用具备事务
   CAS 的 PostgreSQL/MySQL 等后端实现同一接口。
-- 尚未实现在线密钥轮换、token refresh、跨区复制和自动备份恢复。
+- `AY_SESSION_ADMISSION_PREVIOUS_TOKENS`、`AY_ONLINE_AUTH_PREVIOUS_KEYS` 和
+  `AY_ONLINE_SERVER_PREVIOUS_TOKENS` 支持滚动密钥窗口；旧凭证最大寿命过去后必须移除。
+- `/metrics` 暴露 HTTP 状态码、限流/封禁和 WebSocket 连接/转发计数；
+  `AY_SESSION_METRICS_TOKEN` 可保护抓取。`AY_SESSION_BLOCKLIST_FILE` 每行一个精确来源地址。
+  SIGINT/SIGTERM 会先令 `/readyz` 返回 503，并按 `AY_SESSION_DRAIN_SECONDS` 排空后退出。
+- 告警规则、日志收集、证书自动续期、跨区复制和自动备份恢复属于部署平台责任。
 - TURN 仍是独立 ICE relay 服务，与 SessionServer 持久化无关。
 
 故障矩阵覆盖总分区、慢后端不阻塞网络线程、CAS 已提交但响应丢失的重读收敛、leave
 传输丢失后的凭证保留，以及旧 Host 分区恢复后被新 epoch fencing。SQLite 测试另覆盖
 重启、密文存储、双实例并发 CAS 和错误密钥拒绝。
+
+同机可运行多个 SessionServer 共享 SQLite WAL，但不能把数据库放到 SMB/NFS，也不能据此
+宣称跨主机多活。跨主机必须用实现同一接口的事务数据库后端。当前 WebSocket peer 目录是
+进程内状态：多实例时负载均衡器必须按 signaling room 一致路由，使同房成员落到同一实例；
+若无法提供 room affinity，则应把转发层替换为共享 broker。仅有普通连接粘性并不足够。

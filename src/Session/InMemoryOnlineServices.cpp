@@ -797,10 +797,19 @@ OnlineServiceResult<DedicatedAllocation>
 InMemoryOnlineServices::allocateServer(
     const DedicatedAllocationRequest& request) {
     if (!validKey(request.region) || !validKey(request.buildId) ||
-        request.playerCount == 0 ||
-        request.playerCount > _impl->config.maxMatchPlayers) {
+        !request.content.isValid() || request.playerCount == 0 ||
+        request.playerCount > _impl->config.maxMatchPlayers ||
+        request.players.size() > request.playerCount) {
         return OnlineServiceResult<DedicatedAllocation>::failure(
             OnlineServiceError::InvalidRequest, "invalid allocation request");
+    }
+    std::unordered_set<std::string> requestedPeers;
+    for (const PeerId& peer : request.players) {
+        if (!peer.isValid() || !requestedPeers.emplace(peer.value).second) {
+            return OnlineServiceResult<DedicatedAllocation>::failure(
+                OnlineServiceError::InvalidRequest,
+                "allocation players must be valid and unique");
+        }
     }
     std::lock_guard<std::mutex> lock(_impl->mutex);
     _impl->expireDedicatedLocked();
@@ -837,6 +846,9 @@ InMemoryOnlineServices::allocateServer(
     allocation.address = selected->info.address;
     allocation.port = selected->info.port;
     allocation.playerCount = request.playerCount;
+    allocation.players = request.players;
+    allocation.matchId = request.matchId;
+    allocation.content = request.content;
     allocation.reservationToken = token;
     allocation.expiresAtUnixSeconds =
         _impl->now() + _impl->config.allocationLifetimeSeconds;
@@ -875,6 +887,39 @@ InMemoryOnlineServices::releaseAllocation(
     }
     _impl->allocations.erase(found);
     return OnlineServiceResult<SessionServiceEmpty>::success({});
+}
+
+OnlineServiceResult<std::vector<DedicatedAllocation>>
+InMemoryOnlineServices::listServerAllocations(
+    const DedicatedServerCredential& credential) {
+    if (!credential.isValid()) {
+        return OnlineServiceResult<std::vector<DedicatedAllocation>>::failure(
+            OnlineServiceError::InvalidRequest, "invalid server credential");
+    }
+    std::lock_guard<std::mutex> lock(_impl->mutex);
+    _impl->expireDedicatedLocked();
+    const auto server = _impl->servers.find(credential.serverId);
+    if (server == _impl->servers.end()) {
+        return OnlineServiceResult<std::vector<DedicatedAllocation>>::failure(
+            OnlineServiceError::NotFound, "server not found");
+    }
+    if (!tokenEqual(server->second.token, credential.token)) {
+        return OnlineServiceResult<std::vector<DedicatedAllocation>>::failure(
+            OnlineServiceError::Unauthorized, "invalid server credential");
+    }
+    std::vector<DedicatedAllocation> result;
+    for (const auto& [id, record] : _impl->allocations) {
+        (void)id;
+        if (record.allocation.serverId == credential.serverId) {
+            result.push_back(record.allocation);
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const auto& left,
+                                               const auto& right) {
+        return left.allocationId < right.allocationId;
+    });
+    return OnlineServiceResult<std::vector<DedicatedAllocation>>::success(
+        std::move(result));
 }
 
 OnlineServiceResult<std::vector<DedicatedServerInfo>>
@@ -996,7 +1041,21 @@ OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::getMatch(
         return OnlineServiceResult<MatchTicketInfo>::failure(
             OnlineServiceError::Unauthorized, "peer does not own this ticket");
     }
-    return OnlineServiceResult<MatchTicketInfo>::success(found->second.info);
+    MatchTicketInfo result = found->second.info;
+    if (result.assignment.topology == MatchTopology::Dedicated &&
+        result.assignment.dedicated.isValid()) {
+        std::string admissionToken;
+        if (!deriveDedicatedAdmissionToken(
+                result.assignment.dedicated.reservationToken,
+                authenticatedPeer, admissionToken)) {
+            return OnlineServiceResult<MatchTicketInfo>::failure(
+                OnlineServiceError::InternalError,
+                "failed to derive dedicated admission credential");
+        }
+        result.assignment.dedicated.reservationToken =
+            std::move(admissionToken);
+    }
+    return OnlineServiceResult<MatchTicketInfo>::success(std::move(result));
 }
 
 OnlineServiceResult<MatchTicketInfo> InMemoryOnlineServices::cancelMatch(
@@ -1233,7 +1292,8 @@ size_t InMemoryOnlineServices::runMatchmaking(size_t maxMatches) {
             matchRequest.topology == MatchTopology::Any) {
             auto allocated = allocateServer({
                 matchRequest.region, matchRequest.buildId,
-                static_cast<uint16_t>(peers.size())});
+                static_cast<uint16_t>(peers.size()), peers,
+                assignment.matchId, matchRequest.content});
             if (allocated) {
                 assignment.topology = MatchTopology::Dedicated;
                 assignment.dedicated = std::move(allocated.value);

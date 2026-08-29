@@ -1366,6 +1366,12 @@ static size_t appendU32LE(uint8_t* buf, uint32_t v) {
     return 4;
 }
 
+static size_t appendU16LE(uint8_t* buf, uint16_t v) {
+    buf[0] = static_cast<uint8_t>(v & 0xFF);
+    buf[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    return 2;
+}
+
 // Read a little-endian uint32 from buf; returns bytes consumed.
 static size_t readU32LE(const uint8_t* buf, uint32_t& out) {
     out =  static_cast<uint32_t>(buf[0])
@@ -1375,23 +1381,54 @@ static size_t readU32LE(const uint8_t* buf, uint32_t& out) {
     return 4;
 }
 
+static size_t readU16LE(const uint8_t* buf, uint16_t& out) {
+    out = static_cast<uint16_t>(buf[0]) |
+          static_cast<uint16_t>(static_cast<uint16_t>(buf[1]) << 8);
+    return 2;
+}
+
+bool GnsConnection::setHandshakeAdmissionToken(
+    const void* bytes, size_t size) {
+    if ((!bytes && size != 0) || size > kConnectionAdmissionMaxBytes ||
+        _state != GnsConnectionState::Disconnected) {
+        return false;
+    }
+    if (size == 0) {
+        _handshakeAdmissionToken.clear();
+        return true;
+    }
+    const auto* first = static_cast<const uint8_t*>(bytes);
+    _handshakeAdmissionToken.assign(first, first + size);
+    return true;
+}
+
 void GnsConnection::_sendHello() {
     // R2: build the same R1 body bytes (HandshakeMsgType=Hello, version,
     // name) then seal via PacketCodec with msgType=kMsgTypeHandshake so
     // onRawData can demux by msgType instead of sniffing the first byte.
-    uint8_t buf[1 + 4 + 1 + kHandshakeMaxNameLen] = {};
+    std::vector<uint8_t> buf(
+        1 + 4 + 1 + kHandshakeMaxNameLen + 2 +
+        _handshakeAdmissionToken.size());
     size_t pos = 0;
     buf[pos++] = static_cast<uint8_t>(HandshakeMsgType::Hello);
-    pos += appendU32LE(buf + pos, _protocolVersion);
+    pos += appendU32LE(buf.data() + pos, _protocolVersion);
     std::string name = _address;
     if (name.size() > kHandshakeMaxNameLen) name.resize(kHandshakeMaxNameLen);
     buf[pos++] = static_cast<uint8_t>(name.size());
     if (!name.empty()) {
-        std::memcpy(buf + pos, name.data(), name.size());
+        std::memcpy(buf.data() + pos, name.data(), name.size());
         pos += name.size();
     }
+    pos += appendU16LE(buf.data() + pos,
+                       static_cast<uint16_t>(_handshakeAdmissionToken.size()));
+    if (!_handshakeAdmissionToken.empty()) {
+        std::memcpy(buf.data() + pos, _handshakeAdmissionToken.data(),
+                    _handshakeAdmissionToken.size());
+        pos += _handshakeAdmissionToken.size();
+    }
+    buf.resize(pos);
     auto wire = PacketCodec::encode(
-        buf, pos,
+        buf.data(), buf.size(),
         kMsgTypeHandshake, kSchemaVersion,
         CHANNEL_RELIABLE,
         /*flags=*/0,
@@ -1471,6 +1508,58 @@ void GnsConnection::_handleHandshake(const uint8_t* data, size_t len) {
                 // linger duration is bounded by enableLingerMessage for finer
                 // control, but for R1 a simple linger works.
                 s_gns->CloseConnection(_conn, 0, "protocol mismatch", true);
+            }
+            return;
+        }
+        size_t pos = 1 + 4;
+        if (pos >= len) {
+            _sendReject(DisconnectReason::ProtocolMismatch);
+            _lastDisconnectReason = DisconnectReason::ProtocolMismatch;
+            setState(GnsConnectionState::Disconnecting);
+            if (s_gns && _conn != k_HSteamNetConnection_Invalid) {
+                s_gns->CloseConnection(_conn, 0, "malformed hello", true);
+            }
+            return;
+        }
+        const size_t nameSize = data[pos++];
+        if (nameSize > kHandshakeMaxNameLen || pos + nameSize + 2 > len) {
+            _sendReject(DisconnectReason::ProtocolMismatch);
+            _lastDisconnectReason = DisconnectReason::ProtocolMismatch;
+            setState(GnsConnectionState::Disconnecting);
+            if (s_gns && _conn != k_HSteamNetConnection_Invalid) {
+                s_gns->CloseConnection(_conn, 0, "malformed hello", true);
+            }
+            return;
+        }
+        pos += nameSize;
+        uint16_t admissionSize = 0;
+        pos += readU16LE(data + pos, admissionSize);
+        if (admissionSize > kConnectionAdmissionMaxBytes ||
+            pos + admissionSize != len) {
+            _sendReject(DisconnectReason::ProtocolMismatch);
+            _lastDisconnectReason = DisconnectReason::ProtocolMismatch;
+            setState(GnsConnectionState::Disconnecting);
+            if (s_gns && _conn != k_HSteamNetConnection_Invalid) {
+                s_gns->CloseConnection(_conn, 0, "malformed admission", true);
+            }
+            return;
+        }
+        bool admitted = true;
+        if (_handshakeAdmissionValidator) {
+            try {
+                admitted = _handshakeAdmissionValidator(
+                    admissionSize == 0 ? nullptr : data + pos,
+                    admissionSize);
+            } catch (...) {
+                admitted = false;
+            }
+        }
+        if (!admitted) {
+            _sendReject(DisconnectReason::AdmissionRejected);
+            _lastDisconnectReason = DisconnectReason::AdmissionRejected;
+            setState(GnsConnectionState::Disconnecting);
+            if (s_gns && _conn != k_HSteamNetConnection_Invalid) {
+                s_gns->CloseConnection(_conn, 0, "admission rejected", true);
             }
             return;
         }

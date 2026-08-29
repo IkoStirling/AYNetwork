@@ -14,6 +14,7 @@ namespace ayt::net
 struct HttpOnlineServicesClientConfig {
     std::string serverAddress = "127.0.0.1";
     uint16_t serverPort = 0;
+    bool useTls = false;
     uint32_t connectTimeoutMs = 2000;
     uint32_t requestTimeoutMs = 3000;
 
@@ -80,6 +81,9 @@ public:
     OnlineServiceResult<SessionServiceEmpty> releaseAllocation(
         DedicatedAllocationId allocationId,
         const std::string& reservationToken) override;
+    OnlineServiceResult<std::vector<DedicatedAllocation>>
+        listServerAllocations(
+            const DedicatedServerCredential& credential) override;
     OnlineServiceResult<std::vector<DedicatedServerInfo>> listServers() override;
 
 private:

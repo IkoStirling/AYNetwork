@@ -8,6 +8,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ayt::net
 {
@@ -24,6 +25,9 @@ enum class PlayerAccessTokenError : uint8_t {
 
 struct PlayerAccessTokenVerifierConfig {
     std::array<uint8_t, 32> signingKey{};
+    // Previous verification-only keys permit zero-downtime rotation. New
+    // tokens are always issued with signingKey by the account service.
+    std::vector<std::array<uint8_t, 32>> acceptedSigningKeys;
     uint32_t maximumLifetimeSeconds = 24u * 60u * 60u;
     uint32_t clockSkewSeconds = 30;
     std::function<uint64_t()> nowUnixSeconds;

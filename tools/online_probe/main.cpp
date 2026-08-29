@@ -35,6 +35,8 @@ ayt::net::HttpOnlineServices makeClient(
     ayt::net::HttpOnlineServicesClientConfig config;
     config.serverAddress = address;
     config.serverPort = port;
+    const std::string tls = environment("AY_SESSION_BACKEND_TLS");
+    config.useTls = tls == "1" || tls == "true";
     config.localPeerId = ayt::net::PeerId{peer};
     config.playerAccessToken = token;
     config.dedicatedControlToken = fleetToken;
@@ -129,7 +131,8 @@ int main(int argc, char** argv) {
     const auto server = owner.registerServer(registration);
     if (!server || !owner.heartbeatServer(server.value.credential)) return 17;
     const auto allocation = owner.allocateServer(
-        {"test-region", "test-build", 4});
+        {"test-region", "test-build", 4, {}, 0,
+         {"maps/e2e", "1", 1}});
     if (!allocation || !owner.setServerDraining(server.value.credential, true)) {
         return 18;
     }

@@ -18,6 +18,7 @@ namespace ayt::net
 struct OnlineBackendClientConfig {
     std::string serverAddress = "127.0.0.1";
     uint16_t serverPort = 0;
+    bool useTls = false;
     uint32_t connectTimeoutMs = 2000;
     uint32_t requestTimeoutMs = 3000;
 

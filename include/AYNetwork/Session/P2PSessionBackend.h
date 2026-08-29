@@ -4,6 +4,7 @@
 #include <AYNetwork/Session/SessionTicket.h>
 #include <AYNetwork/SessionService.h>
 #include <AYNetwork/Signaling/SecureUdpSignaling.h>
+#include <AYNetwork/Signaling/WebSocketSignaling.h>
 
 #include <functional>
 
@@ -16,6 +17,10 @@ using P2PBackendJoinValidator = std::function<P2PJoinDecision(
 bool applyP2PSessionGrant(const P2PSessionGrant& grant,
                           P2PConfig& p2pConfig,
                           SecureUdpSignalingClientConfig& signalingConfig);
+bool usesWebSocketSignaling(const P2PSessionGrant& grant);
+bool applyP2PSessionGrant(const P2PSessionGrant& grant,
+                          P2PConfig& p2pConfig,
+                          WebSocketSignalingClientConfig& signalingConfig);
 
 P2PBackendJoinValidator makeP2PSessionJoinValidator(
     const P2PSessionGrant& grant);

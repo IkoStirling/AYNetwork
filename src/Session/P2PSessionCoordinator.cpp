@@ -341,16 +341,27 @@ struct P2PSessionCoordinator::Impl {
         // local transport rejects a later bootstrap step.
         status.backendSession = result.grant.session;
         P2PConfig p2p = config.p2p;
-        SecureUdpSignalingClientConfig signalingConfig;
-        if (!applyP2PSessionGrant(result.grant, p2p, signalingConfig)) {
+        std::shared_ptr<ISignalingTransport> transport;
+        if (usesWebSocketSignaling(result.grant)) {
+            WebSocketSignalingClientConfig signalingConfig;
+            if (applyP2PSessionGrant(result.grant, p2p, signalingConfig)) {
+                transport = std::make_shared<WebSocketSignalingClient>(
+                    std::move(signalingConfig));
+            }
+        } else {
+            SecureUdpSignalingClientConfig signalingConfig;
+            if (applyP2PSessionGrant(result.grant, p2p, signalingConfig)) {
+                transport = std::make_shared<SecureUdpSignalingClient>(
+                    std::move(signalingConfig));
+            }
+        }
+        if (!transport) {
             return failBootstrap(
                 result.grant.member,
                 P2PSessionCoordinatorError::NetworkConfigurationFailed,
                 SessionServiceError::ProtocolError,
                 "session grant could not be applied to P2P configuration");
         }
-        auto transport = std::make_shared<SecureUdpSignalingClient>(
-            std::move(signalingConfig));
         if (!network.configureP2P(p2p, transport)) {
             return failBootstrap(
                 result.grant.member,
@@ -544,7 +555,7 @@ struct P2PSessionCoordinator::Impl {
     P2PSessionCoordinatorConfig config;
     P2PSessionCoordinatorStatus status;
     P2PSessionGrant grant;
-    std::shared_ptr<SecureUdpSignalingClient> signaling;
+    std::shared_ptr<ISignalingTransport> signaling;
     std::unique_ptr<P2PSessionLeaseKeeper> lease;
     std::future<OperationResult> operation;
     std::future<AuthorityResult> authorityTask;

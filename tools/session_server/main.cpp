@@ -25,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -97,6 +98,50 @@ bool constantTimeEqual(std::string_view left, std::string_view right) {
            sodium_memcmp(left.data(), right.data(), left.size()) == 0;
 }
 
+bool constantTimeEqualAny(std::string_view supplied,
+                          const std::vector<std::string>& accepted) {
+    bool matched = false;
+    for (const auto& value : accepted) {
+        matched = constantTimeEqual(supplied, value) || matched;
+    }
+    return matched;
+}
+
+std::vector<std::string> secrets(const std::string& primary,
+                                 const std::string& previous) {
+    std::vector<std::string> result;
+    if (!primary.empty()) result.push_back(primary);
+    size_t begin = 0;
+    while (begin < previous.size()) {
+        const size_t end = previous.find(',', begin);
+        const std::string value = previous.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (!value.empty()) result.push_back(value);
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return result;
+}
+
+bool parseStorageKeys(const std::string& text,
+                      std::vector<std::array<uint8_t, 32>>& keys) {
+    keys.clear();
+    if (text.empty()) return true;
+    size_t begin = 0;
+    while (begin < text.size()) {
+        const size_t end = text.find(',', begin);
+        std::array<uint8_t, 32> key{};
+        if (!parseStorageKey(text.substr(
+                begin, end == std::string::npos
+                    ? std::string::npos : end - begin), key)) return false;
+        keys.push_back(key);
+        if (keys.size() > 8) return false;
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return true;
+}
+
 class AuditWriter {
 public:
     explicit AuditWriter(const std::string& path)
@@ -161,13 +206,34 @@ private:
     std::vector<std::pair<ayt::net::PeerId, std::string>> _entries;
 };
 
+class SourceBlocklist {
+public:
+    bool load(const std::string& path) {
+        std::ifstream input(path);
+        if (!input) return false;
+        std::string source;
+        while (input >> source) {
+            if (source.empty() || source.size() > 255) return false;
+            _sources.insert(std::move(source));
+        }
+        return input.eof();
+    }
+
+    bool contains(std::string_view source) const {
+        return _sources.contains(std::string{source});
+    }
+
+private:
+    std::unordered_set<std::string> _sources;
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc != 5) {
         std::fprintf(stderr,
             "usage: AYNetwork_SessionServer <bind-address> <http-port> "
-            "<public-signaling-address> <signaling-udp-port>\n");
+            "<public-signaling-address> <public-signaling-port>\n");
         return 2;
     }
     uint16_t httpPort = 0;
@@ -183,15 +249,54 @@ int main(int argc, char** argv) {
     const std::string keyFile = environment("AY_SESSION_TICKET_KEY_FILE");
     const std::string storageKeyText = environment("AY_SESSION_STATE_KEY");
     const std::string admissionToken = environment("AY_SESSION_ADMISSION_TOKEN");
+    const auto admissionTokens = secrets(
+        admissionToken, environment("AY_SESSION_ADMISSION_PREVIOUS_TOKENS"));
     const std::string auditPath = environment("AY_SESSION_AUDIT_FILE");
+    std::string signalingTransport =
+        environment("AY_SESSION_SIGNALING_TRANSPORT");
+    if (signalingTransport.empty()) {
+        signalingTransport = production ? "websocket" : "udp";
+    }
+    const bool websocketSignaling = signalingTransport == "websocket";
+    if (!websocketSignaling && signalingTransport != "udp") {
+        std::fprintf(stderr,
+            "AY_SESSION_SIGNALING_TRANSPORT must be udp or websocket\n");
+        return 2;
+    }
+    std::string publicSignalingAddress = argv[3];
+    if (websocketSignaling &&
+        publicSignalingAddress.rfind("ws://", 0) != 0 &&
+        publicSignalingAddress.rfind("wss://", 0) != 0) {
+        publicSignalingAddress = std::string{production ? "wss://" : "ws://"} +
+            publicSignalingAddress + "/v1/signaling";
+    }
+    const std::string sourceBlocklistPath =
+        environment("AY_SESSION_BLOCKLIST_FILE");
+    const std::string metricsToken = environment("AY_SESSION_METRICS_TOKEN");
+    uint32_t drainSeconds = production ? 10 : 0;
+    const std::string drainText = environment("AY_SESSION_DRAIN_SECONDS");
+    if (!drainText.empty()) {
+        const auto parsed = std::from_chars(
+            drainText.data(), drainText.data() + drainText.size(), drainSeconds);
+        if (parsed.ec != std::errc{} ||
+            parsed.ptr != drainText.data() + drainText.size() ||
+            drainSeconds > 300) {
+            std::fprintf(stderr, "invalid AY_SESSION_DRAIN_SECONDS\n");
+            return 2;
+        }
+    }
     const bool onlineEnabled = enabled("AY_ONLINE_ENABLE");
     const std::string onlineCredentials =
         environment("AY_ONLINE_CREDENTIALS_FILE");
     std::string onlineDatabase = environment("AY_ONLINE_DB");
     const std::string onlineAuthKeyText =
         environment("AY_ONLINE_AUTH_KEY");
+    const std::string onlinePreviousAuthKeys =
+        environment("AY_ONLINE_AUTH_PREVIOUS_KEYS");
     const std::string onlineServerToken =
         environment("AY_ONLINE_SERVER_TOKEN");
+    const auto onlineServerTokens = secrets(
+        onlineServerToken, environment("AY_ONLINE_SERVER_PREVIOUS_TOKENS"));
     std::string httpBind = environment("AY_SESSION_HTTP_BIND");
     if (httpBind.empty()) httpBind = argv[1];
 
@@ -257,7 +362,7 @@ int main(int argc, char** argv) {
     if (!databasePath.empty()) {
         ayt::net::SqliteP2PSessionServiceConfig coreConfig;
         coreConfig.databasePath = databasePath;
-        coreConfig.publicSignalingAddress = argv[3];
+        coreConfig.publicSignalingAddress = publicSignalingAddress;
         coreConfig.signalingPort = signalingPort;
         if (!parseStorageKey(storageKeyText, coreConfig.storageKey)) {
             std::fprintf(stderr,
@@ -282,7 +387,7 @@ int main(int argc, char** argv) {
         core = std::move(durable);
     } else {
         ayt::net::InMemoryP2PSessionServiceConfig coreConfig;
-        coreConfig.publicSignalingAddress = argv[3];
+        coreConfig.publicSignalingAddress = publicSignalingAddress;
         coreConfig.signalingPort = signalingPort;
         auto memory = std::make_shared<ayt::net::InMemoryP2PSessionService>(
             std::move(coreConfig), &ticketKeys);
@@ -316,6 +421,13 @@ int main(int argc, char** argv) {
             if (!parseStorageKey(onlineAuthKeyText, authConfig.signingKey)) {
                 std::fprintf(stderr,
                     "AY_ONLINE_AUTH_KEY must contain exactly 64 hex characters\n");
+                return 2;
+            }
+            if (!parseStorageKeys(onlinePreviousAuthKeys,
+                                  authConfig.acceptedSigningKeys)) {
+                std::fprintf(stderr,
+                    "AY_ONLINE_AUTH_PREVIOUS_KEYS must be a comma-separated "
+                    "list of 64-character hex keys\n");
                 return 2;
             }
             playerTokenVerifier =
@@ -356,25 +468,34 @@ int main(int argc, char** argv) {
         }
     }
 
-    ayt::net::SecureUdpSignalingServerConfig signalingConfig;
-    signalingConfig.bindAddress = argv[1];
-    signalingConfig.port = signalingPort;
-    signalingConfig.resolveCredential = std::move(resolveSignaling);
-    ayt::net::SecureUdpSignalingServer signaling(std::move(signalingConfig));
-    if (!signaling.start()) {
-        std::fprintf(stderr, "failed to bind SessionServer signaling socket\n");
-        return 1;
+    std::unique_ptr<ayt::net::SecureUdpSignalingServer> signaling;
+    if (!websocketSignaling) {
+        ayt::net::SecureUdpSignalingServerConfig signalingConfig;
+        signalingConfig.bindAddress = argv[1];
+        signalingConfig.port = signalingPort;
+        signalingConfig.resolveCredential = resolveSignaling;
+        signaling = std::make_unique<ayt::net::SecureUdpSignalingServer>(
+            std::move(signalingConfig));
+        if (!signaling->start()) {
+            std::fprintf(stderr,
+                "failed to bind SessionServer signaling socket\n");
+            return 1;
+        }
     }
 
     ayt::net::HttpP2PSessionServerConfig httpConfig;
     httpConfig.bindAddress = httpBind;
     httpConfig.port = httpPort;
+    httpConfig.enableWebSocketSignaling = websocketSignaling;
+    if (websocketSignaling) {
+        httpConfig.signalingCredentialResolver = resolveSignaling;
+    }
     if (!admissionToken.empty()) {
         httpConfig.requireAdmissionAuthentication = true;
         httpConfig.admissionAuthenticator =
-            [admissionToken](std::string_view supplied,
+            [admissionTokens](std::string_view supplied,
                              const ayt::net::PeerId&) {
-                return constantTimeEqual(supplied, admissionToken);
+                return constantTimeEqualAny(supplied, admissionTokens);
             };
     }
     if (production) {
@@ -410,6 +531,23 @@ int main(int argc, char** argv) {
             audit->write(event);
         };
     }
+    std::shared_ptr<SourceBlocklist> sourceBlocklist;
+    if (!sourceBlocklistPath.empty()) {
+        sourceBlocklist = std::make_shared<SourceBlocklist>();
+        if (!sourceBlocklist->load(sourceBlocklistPath)) {
+            std::fprintf(stderr, "failed to load AY_SESSION_BLOCKLIST_FILE\n");
+            return 1;
+        }
+        httpConfig.sourceBlocker = [sourceBlocklist](std::string_view source) {
+            return sourceBlocklist->contains(source);
+        };
+    }
+    if (!metricsToken.empty()) {
+        httpConfig.metricsAuthenticator =
+            [metricsToken](std::string_view supplied) {
+                return constantTimeEqual(supplied, metricsToken);
+            };
+    }
     if (lobbies) {
         httpConfig.playerAuthenticator =
             [playerCredentials, playerTokenVerifier](
@@ -421,14 +559,14 @@ int main(int argc, char** argv) {
                        playerCredentials->authenticate(token, peer);
             };
         httpConfig.dedicatedControlAuthenticator =
-            [onlineServerToken](std::string_view supplied) {
-                return constantTimeEqual(supplied, onlineServerToken);
+            [onlineServerTokens](std::string_view supplied) {
+                return constantTimeEqualAny(supplied, onlineServerTokens);
             };
     }
     ayt::net::HttpP2PSessionServer http(
         std::move(httpConfig), core, lobbies, matchmaking, dedicated);
     if (!http.start()) {
-        signaling.stop();
+        if (signaling) signaling->stop();
         std::fprintf(stderr, "failed to bind SessionServer HTTP socket\n");
         return 1;
     }
@@ -436,26 +574,48 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
     std::printf("AY_SESSION_SERVER state=ready mode=%s store=%s online=%s "
-                "online_store=%s http=%s:%u signaling=%s:%u\n",
+                "online_store=%s http=%s:%u signaling=%s:%s:%u\n",
                 production ? "production" : "development",
                 databasePath.empty() ? "memory" : "sqlite",
                 lobbies ? "enabled" : "disabled", onlineStore,
-                httpBind.c_str(), http.getBoundPort(), argv[3],
-                signaling.getBoundPort());
+                httpBind.c_str(), http.getBoundPort(), signalingTransport.c_str(),
+                publicSignalingAddress.c_str(),
+                signaling ? signaling->getBoundPort() : signalingPort);
     std::fflush(stdout);
 
-    while (g_running.load() && http.isRunning()) {
+    bool draining = false;
+    std::chrono::steady_clock::time_point drainDeadline{};
+    while (http.isRunning()) {
+        if (!g_running.load() && !draining) {
+            draining = true;
+            http.setReady(false);
+            drainDeadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(drainSeconds);
+            std::printf("AY_SESSION_SERVER state=draining grace_seconds=%u\n",
+                        drainSeconds);
+            std::fflush(stdout);
+        }
+        if (draining && std::chrono::steady_clock::now() >= drainDeadline) break;
         if (matchmaking) (void)matchmaking->runMatchmaking(8);
-        if (signaling.pump() == 0) {
+        if (!signaling || signaling->pump() == 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 
     http.stop();
-    const auto stats = signaling.getStats();
-    signaling.stop();
-    std::printf("AY_SESSION_SERVER state=stopped forwarded=%llu auth_fail=%llu\n",
-                static_cast<unsigned long long>(stats.forwardedSignals),
-                static_cast<unsigned long long>(stats.authenticationFailures));
+    ayt::net::SecureSignalingServerStats udpStats;
+    if (signaling) {
+        udpStats = signaling->getStats();
+        signaling->stop();
+    }
+    const auto metrics = http.getMetrics();
+    std::printf("AY_SESSION_SERVER state=stopped forwarded=%llu auth_fail=%llu "
+                "http_requests=%llu ws_forwarded=%llu\n",
+                static_cast<unsigned long long>(udpStats.forwardedSignals),
+                static_cast<unsigned long long>(
+                    udpStats.authenticationFailures +
+                    metrics.websocketAuthenticationFailures),
+                static_cast<unsigned long long>(metrics.requests),
+                static_cast<unsigned long long>(metrics.websocketForwarded));
     return 0;
 }

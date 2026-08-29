@@ -15,6 +15,25 @@ $probeErr = Join-Path $tempRoot "probe.err.log"
 $server = $null
 $savedEnvironment = @{}
 
+# CTest launched from some VS/Codex environments can inherit both `Path` and
+# `PATH`. Windows accepts that environment block, but Windows PowerShell's
+# Start-Process copies it into a case-insensitive dictionary and throws before
+# spawning the child. Keep the most complete value under one canonical key.
+$processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+$pathEntries = @($processEnvironment.GetEnumerator() | Where-Object {
+    [string]$_.Key -ieq "Path"
+})
+if ($pathEntries.Count -gt 1) {
+    $pathValue = ($pathEntries | Sort-Object {
+        ([string]$_.Value).Length
+    } -Descending | Select-Object -First 1).Value
+    foreach ($entry in $pathEntries) {
+        [Environment]::SetEnvironmentVariable(
+            [string]$entry.Key, $null, "Process")
+    }
+    [Environment]::SetEnvironmentVariable("Path", $pathValue, "Process")
+}
+
 function Get-FreeTcpPort {
     $listener = [System.Net.Sockets.TcpListener]::new(
         [System.Net.IPAddress]::Loopback, 0)
@@ -57,6 +76,8 @@ try {
             AY_SESSION_ADMISSION_TOKEN = ("admission-test-" + ("a" * 50))
             AY_SESSION_AUDIT_FILE = (Join-Path $tempRoot "audit.jsonl")
             AY_SESSION_HTTP_BIND = "127.0.0.1"
+            AY_SESSION_SIGNALING_TRANSPORT = "websocket"
+            AY_SESSION_DRAIN_SECONDS = "0"
         }
         foreach ($entry in $productionEnvironment.GetEnumerator()) {
             $savedEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable(
@@ -66,9 +87,12 @@ try {
         }
     }
     $httpPort = Get-FreeTcpPort
-    $signalPort = Get-FreeUdpPort
+    $signalPort = if ($Production) { $httpPort } else { Get-FreeUdpPort }
+    $signalAddress = if ($Production) {
+        "ws://127.0.0.1/v1/signaling"
+    } else { "127.0.0.1" }
     $server = Start-Process -FilePath $SessionServer -ArgumentList @(
-        "127.0.0.1", [string]$httpPort, "127.0.0.1", [string]$signalPort
+        "127.0.0.1", [string]$httpPort, $signalAddress, [string]$signalPort
     ) -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr `
       -PassThru -WindowStyle Hidden
     $null = $server.Handle

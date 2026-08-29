@@ -308,6 +308,13 @@ public:
         hookGnsConnection(rawChild);                        // R5.5
         auto netConn = std::make_unique<NetConnectionImpl>(rawChild, netId);
         NetConnectionImpl* netPtr = netConn.get();
+        if (_connectionAdmissionValidator) {
+            rawChild->setHandshakeAdmissionValidator(
+                [this, netPtr](const uint8_t* bytes, size_t size) {
+                    return _connectionAdmissionValidator &&
+                           _connectionAdmissionValidator(netPtr, bytes, size);
+                });
+        }
 
         // Both public admission APIs participate in the same atomic gate.
         bool accepted = !_acceptCallback || _acceptCallback(netPtr);
@@ -2209,6 +2216,9 @@ public:
         }
         auto transport = std::make_unique<GnsConnection>();
         transport->setProtocolVersion(_protocolVersion);
+        if (!transport->setHandshakeAdmissionToken(
+                _connectionAdmissionToken.data(),
+                _connectionAdmissionToken.size())) return false;
         if (!transport->initP2PClient(remotePeer, _p2pConfig, _p2pSignaling)) return false;
         const uint32_t clientNetId = allocateNetId();
         transport->setNetId(clientNetId);
@@ -2713,6 +2723,12 @@ public:
         }
         _clientConn = std::make_unique<GnsConnection>();
         _clientConn->setProtocolVersion(_protocolVersion);
+        if (!_clientConn->setHandshakeAdmissionToken(
+                _connectionAdmissionToken.data(),
+                _connectionAdmissionToken.size())) {
+            _clientConn.reset();
+            return;
+        }
         _clientConn->initClient(address, port);
         const uint32_t clientNetId = allocateNetId();
         _clientConn->setNetId(clientNetId);                    // R5.4
@@ -2850,6 +2866,27 @@ public:
     }
 
     uint32_t getProtocolVersion() const override { return _protocolVersion; }
+
+    bool setConnectionAdmissionToken(
+        const void* bytes, size_t size) override {
+        if (_clientConn || _serverConn || !_serverClients.empty() ||
+            (!bytes && size != 0) || size > kConnectionAdmissionMaxBytes) {
+            return false;
+        }
+        if (size == 0) {
+            _connectionAdmissionToken.clear();
+            return true;
+        }
+        const auto* first = static_cast<const uint8_t*>(bytes);
+        _connectionAdmissionToken.assign(first, first + size);
+        return true;
+    }
+
+    void setConnectionAdmissionValidator(
+        ConnectionAdmissionValidator validator) override {
+        if (_clientConn || _serverConn || !_serverClients.empty()) return;
+        _connectionAdmissionValidator = std::move(validator);
+    }
 
     void setLimits(const NetworkLimits& limits) override {
         _limits.maxConnections = std::max(1u, limits.maxConnections);
@@ -3376,6 +3413,8 @@ private:
     MessageHandler _messageHandlers[256];
     ConnectionHandler _connectionHandler;
     AcceptCallback _acceptCallback;
+    std::vector<uint8_t> _connectionAdmissionToken;
+    ConnectionAdmissionValidator _connectionAdmissionValidator;
     INetworkExtension* _extension = nullptr;
 
     // R1.A: subsystem owns one client conn (or none), one server parent

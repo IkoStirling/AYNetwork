@@ -140,7 +140,9 @@ enum class DisconnectReason : uint8_t {
 // Wire format (host byte order, no PacketHeader to keep R1 independent of
 // R2 protocol layer — PacketHeader/Assembler is R2 work):
 //
-//   Client -> Server:  [u8 msgType=1][u32 protocolVersion][u8 clientNameLen][clientName bytes...]
+//   Client -> Server:  [u8 msgType=1][u32 protocolVersion]
+//                      [u8 clientNameLen][clientName bytes...]
+//                      [u16 admissionBytes][opaque admission bytes...]
 //   Server -> Client:  [u8 msgType=2][u32 protocolVersion][u8 reasonCode=0 (accept)]
 //                   or [u8 msgType=3][u8 reasonCode=DisconnectReason (reject)]
 //
@@ -164,6 +166,7 @@ enum class HandshakeMsgType : uint8_t {
 // GNS reliable message comfortably fits in one MTU.
 constexpr uint32_t kProtocolVersion   = 1;
 constexpr uint8_t  kHandshakeMaxNameLen = 32;
+constexpr size_t kConnectionAdmissionMaxBytes = 512;
 
 // R2 (2026-07-27): PacketHeader v2 msgType namespace. 0xFFFF is reserved
 // for handshake (HandshakeMsgType lives in the body). 0 is the default app
@@ -425,6 +428,19 @@ public:
     // is kProtocolVersion; version 0 is an explicit legacy/test opt-out.
     virtual void setProtocolVersion(uint32_t version) { (void)version; }
     virtual uint32_t getProtocolVersion() const { return 0; }
+
+    // Optional IP/listen-server admission carried inside the encrypted GNS
+    // transport handshake. It is separate from P2P Join Tickets and is used
+    // by Dedicated reservations. Configure it before connect()/listen().
+    virtual bool setConnectionAdmissionToken(const void* bytes, size_t size) {
+        (void)bytes; (void)size; return false;
+    }
+    using ConnectionAdmissionValidator = std::function<bool(
+        NetConnection*, const uint8_t*, size_t)>;
+    virtual void setConnectionAdmissionValidator(
+        ConnectionAdmissionValidator validator) {
+        (void)validator;
+    }
 
     virtual void setLimits(const NetworkLimits& limits) { (void)limits; }
     virtual NetworkLimits getLimits() const { return {}; }

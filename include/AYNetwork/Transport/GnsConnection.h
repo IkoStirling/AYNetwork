@@ -219,6 +219,12 @@ public:
     // to take effect. Default = 0 (handshake skipped).
     void setProtocolVersion(uint32_t version) { _protocolVersion = version; }
     uint32_t getProtocolVersion() const { return _protocolVersion; }
+    bool setHandshakeAdmissionToken(const void* bytes, size_t size);
+    using HandshakeAdmissionValidator =
+        std::function<bool(const uint8_t*, size_t)>;
+    void setHandshakeAdmissionValidator(HandshakeAdmissionValidator validator) {
+        _handshakeAdmissionValidator = std::move(validator);
+    }
 
     // R5.4 (2026-08-25): attach the fault controller. Called once by
     // NetworkSubSystem at startup. The interceptor is created lazily on
@@ -364,6 +370,8 @@ private:
     // R1 done: 0 = no handshake (legacy). Non-zero enables HELLO/WELCOME.
     uint32_t _protocolVersion = 0;
     DisconnectReason _lastDisconnectReason = DisconnectReason::Unknown;
+    std::vector<uint8_t> _handshakeAdmissionToken;
+    HandshakeAdmissionValidator _handshakeAdmissionValidator;
 
     // R2: per-connection reassembly state. Fragments are routed through
     // _assembler.consume() and the optional result is dispatched.

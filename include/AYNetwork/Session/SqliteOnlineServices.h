@@ -94,6 +94,9 @@ public:
     OnlineServiceResult<SessionServiceEmpty> releaseAllocation(
         DedicatedAllocationId allocationId,
         const std::string& reservationToken) override;
+    OnlineServiceResult<std::vector<DedicatedAllocation>>
+        listServerAllocations(
+            const DedicatedServerCredential& credential) override;
     OnlineServiceResult<std::vector<DedicatedServerInfo>> listServers() override;
 
 private:

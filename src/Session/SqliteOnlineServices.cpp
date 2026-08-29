@@ -27,7 +27,7 @@ constexpr size_t kMaxMetadataEntries = 32;
 constexpr size_t kMaxMetadataValueBytes = 256;
 constexpr size_t kMaxPasswordBytes = 128;
 constexpr size_t kMaxAssignmentBytes = 2u * 1024u * 1024u;
-constexpr uint8_t kSchemaVersion = 3;
+constexpr uint8_t kSchemaVersion = 5;
 constexpr char kHex[] = "0123456789abcdef";
 constexpr std::array<uint8_t, 32> kStorageCheck = {
     'A','Y','N','e','t','w','o','r','k','-','O','n','l','i','n','e',
@@ -423,6 +423,11 @@ json allocationToJson(const DedicatedAllocation& value) {
     return {{"id", value.allocationId}, {"server", value.serverId},
             {"address", value.address}, {"port", value.port},
             {"players", value.playerCount},
+            {"player_ids", peersToText(value.players)},
+            {"match_id", value.matchId},
+            {"content_id", value.content.contentId},
+            {"content_version", value.content.contentVersion},
+            {"content_seed", value.content.contentSeed},
             {"token", value.reservationToken},
             {"expires", value.expiresAtUnixSeconds}};
 }
@@ -435,6 +440,13 @@ bool allocationFromJson(const json& value, DedicatedAllocation& out) {
         parsed.address = value.at("address").get<std::string>();
         parsed.port = value.at("port").get<uint16_t>();
         parsed.playerCount = value.at("players").get<uint16_t>();
+        if (!peersFromText(value.at("player_ids").get<std::string>(),
+                           parsed.players)) return false;
+        parsed.matchId = value.at("match_id").get<uint64_t>();
+        parsed.content.contentId = value.at("content_id").get<std::string>();
+        parsed.content.contentVersion =
+            value.at("content_version").get<std::string>();
+        parsed.content.contentSeed = value.at("content_seed").get<uint64_t>();
         parsed.reservationToken = value.at("token").get<std::string>();
         parsed.expiresAtUnixSeconds = value.at("expires").get<uint64_t>();
         if (!parsed.isValid()) return false;
@@ -631,7 +643,10 @@ struct SqliteOnlineServices::Impl {
             "ay_online_servers(region,build_id,draining,server_id);"
             "CREATE TABLE IF NOT EXISTS ay_online_allocations("
             "allocation_id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL,address TEXT NOT NULL,"
-            "port INTEGER NOT NULL,player_count INTEGER NOT NULL,expires INTEGER NOT NULL,"
+            "port INTEGER NOT NULL,player_count INTEGER NOT NULL,players TEXT NOT NULL,"
+            "match_id INTEGER NOT NULL,content_id TEXT NOT NULL,"
+            "content_version TEXT NOT NULL,content_seed INTEGER NOT NULL,"
+            "expires INTEGER NOT NULL,"
             "token BLOB NOT NULL,FOREIGN KEY(server_id) REFERENCES "
             "ay_online_servers(server_id) ON DELETE CASCADE);"
             "CREATE INDEX IF NOT EXISTS ay_online_allocation_expiry ON "
@@ -2264,11 +2279,20 @@ OnlineServiceResult<DedicatedAllocation>
 SqliteOnlineServices::allocateServer(
     const DedicatedAllocationRequest& request) {
     if (!validKey(request.region) || !validKey(request.buildId) ||
-        request.playerCount == 0 ||
-        request.playerCount > _impl->config.maxMatchPlayers) {
+        !request.content.isValid() || request.playerCount == 0 ||
+        request.playerCount > _impl->config.maxMatchPlayers ||
+        request.players.size() > request.playerCount) {
         return OnlineServiceResult<DedicatedAllocation>::failure(
             OnlineServiceError::InvalidRequest,
             "invalid durable allocation request");
+    }
+    std::unordered_set<std::string> requestedPeers;
+    for (const PeerId& peer : request.players) {
+        if (!peer.isValid() || !requestedPeers.emplace(peer.value).second) {
+            return OnlineServiceResult<DedicatedAllocation>::failure(
+                OnlineServiceError::InvalidRequest,
+                "allocation players must be valid and unique");
+        }
     }
     std::lock_guard lock(_impl->mutex);
     if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
@@ -2311,6 +2335,9 @@ SqliteOnlineServices::allocateServer(
     allocation.allocationId = _impl->allocateId(
         "ay_online_allocations", "allocation_id");
     allocation.playerCount = request.playerCount;
+    allocation.players = request.players;
+    allocation.matchId = request.matchId;
+    allocation.content = request.content;
     allocation.reservationToken = randomToken();
     allocation.expiresAtUnixSeconds = _impl->now() +
         _impl->config.allocationLifetimeSeconds;
@@ -2328,7 +2355,8 @@ SqliteOnlineServices::allocateServer(
     }
     Statement insert(_impl->database,
         "INSERT INTO ay_online_allocations(allocation_id,server_id,address,port,"
-        "player_count,expires,token) VALUES(?1,?2,?3,?4,?5,?6,?7)");
+        "player_count,players,match_id,content_id,content_version,content_seed,"
+        "expires,token) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)");
     Statement reserve(_impl->database,
         "UPDATE ay_online_servers SET reserved_players=reserved_players+?1 "
         "WHERE server_id=?2 AND draining=0 AND reserved_players+?1<=capacity");
@@ -2338,8 +2366,13 @@ SqliteOnlineServices::allocateServer(
         bindText(insert.get(), 3, allocation.address) &&
         sqlite3_bind_int(insert.get(), 4, allocation.port) == SQLITE_OK &&
         sqlite3_bind_int(insert.get(), 5, allocation.playerCount) == SQLITE_OK &&
-        bindU64(insert.get(), 6, allocation.expiresAtUnixSeconds) &&
-        bindBlob(insert.get(), 7, sealed) &&
+        bindText(insert.get(), 6, peersToText(allocation.players)) &&
+        bindU64(insert.get(), 7, allocation.matchId) &&
+        bindText(insert.get(), 8, allocation.content.contentId) &&
+        bindText(insert.get(), 9, allocation.content.contentVersion) &&
+        bindU64(insert.get(), 10, allocation.content.contentSeed) &&
+        bindU64(insert.get(), 11, allocation.expiresAtUnixSeconds) &&
+        bindBlob(insert.get(), 12, sealed) &&
         sqlite3_step(insert.get()) == SQLITE_DONE &&
         sqlite3_bind_int(reserve.get(), 1, allocation.playerCount) == SQLITE_OK &&
         bindU64(reserve.get(), 2, allocation.serverId) &&
@@ -2434,6 +2467,96 @@ SqliteOnlineServices::releaseAllocation(
             "failed to persist allocation release");
     }
     return OnlineServiceResult<SessionServiceEmpty>::success({});
+}
+
+OnlineServiceResult<std::vector<DedicatedAllocation>>
+SqliteOnlineServices::listServerAllocations(
+    const DedicatedServerCredential& credential) {
+    if (!credential.isValid()) {
+        return OnlineServiceResult<std::vector<DedicatedAllocation>>::failure(
+            OnlineServiceError::InvalidRequest, "invalid server credential");
+    }
+    std::lock_guard lock(_impl->mutex);
+    if (!_impl->ready || !_impl->begin() || !_impl->expireDedicated()) {
+        _impl->rollback();
+        return _impl->databaseFailure<std::vector<DedicatedAllocation>>(
+            "failed to begin server allocation query");
+    }
+    Impl::ServerRecord server;
+    if (!_impl->loadServer(credential.serverId, server)) {
+        const int exists = _impl->rowExists(
+            "ay_online_servers", "server_id", credential.serverId);
+        if (!_impl->commit()) _impl->rollback();
+        if (exists == 0) {
+            return OnlineServiceResult<
+                std::vector<DedicatedAllocation>>::failure(
+                    OnlineServiceError::NotFound, "server not found");
+        }
+        return _impl->databaseFailure<std::vector<DedicatedAllocation>>(
+            "failed to load server credential");
+    }
+    if (!tokenEqual(server.token, credential.token)) {
+        if (!_impl->commit()) _impl->rollback();
+        return OnlineServiceResult<std::vector<DedicatedAllocation>>::failure(
+            OnlineServiceError::Unauthorized, "invalid server credential");
+    }
+    Statement statement(_impl->database,
+        "SELECT allocation_id,address,port,player_count,players,match_id,"
+        "content_id,content_version,content_seed,expires,token "
+        "FROM ay_online_allocations WHERE server_id=?1 ORDER BY allocation_id");
+    if (!statement || !bindU64(statement.get(), 1, credential.serverId)) {
+        _impl->rollback();
+        return _impl->databaseFailure<std::vector<DedicatedAllocation>>(
+            "failed to prepare server allocation query");
+    }
+    std::vector<DedicatedAllocation> allocations;
+    int step = SQLITE_ROW;
+    while ((step = sqlite3_step(statement.get())) == SQLITE_ROW) {
+        DedicatedAllocation allocation;
+        allocation.allocationId = static_cast<uint64_t>(
+            sqlite3_column_int64(statement.get(), 0));
+        allocation.serverId = credential.serverId;
+        allocation.address = columnText(statement.get(), 1);
+        allocation.port = static_cast<uint16_t>(
+            sqlite3_column_int(statement.get(), 2));
+        allocation.playerCount = static_cast<uint16_t>(
+            sqlite3_column_int(statement.get(), 3));
+        allocation.matchId = static_cast<uint64_t>(
+            sqlite3_column_int64(statement.get(), 5));
+        allocation.content.contentId = columnText(statement.get(), 6);
+        allocation.content.contentVersion = columnText(statement.get(), 7);
+        allocation.content.contentSeed = static_cast<uint64_t>(
+            sqlite3_column_int64(statement.get(), 8));
+        allocation.expiresAtUnixSeconds = static_cast<uint64_t>(
+            sqlite3_column_int64(statement.get(), 9));
+        std::vector<uint8_t> plain;
+        const auto sealed = columnBlob(statement.get(), 10);
+        if (!peersFromText(columnText(statement.get(), 4), allocation.players) ||
+            !openSecret(_impl->config.storageKey,
+                        secretContext("allocation", allocation.allocationId),
+                        sealed, plain)) {
+            if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+            _impl->rollback();
+            return _impl->databaseFailure<std::vector<DedicatedAllocation>>(
+                "invalid durable allocation record");
+        }
+        allocation.reservationToken.assign(
+            reinterpret_cast<const char*>(plain.data()), plain.size());
+        if (!plain.empty()) sodium_memzero(plain.data(), plain.size());
+        if (!allocation.isValid()) {
+            _impl->rollback();
+            return _impl->databaseFailure<std::vector<DedicatedAllocation>>(
+                "invalid durable allocation record");
+        }
+        allocations.push_back(std::move(allocation));
+    }
+    if (step != SQLITE_DONE || !_impl->commit()) {
+        _impl->rollback();
+        return _impl->databaseFailure<std::vector<DedicatedAllocation>>(
+            "failed to read server allocations");
+    }
+    return OnlineServiceResult<std::vector<DedicatedAllocation>>::success(
+        std::move(allocations));
 }
 
 OnlineServiceResult<std::vector<DedicatedServerInfo>>
@@ -2678,6 +2801,19 @@ OnlineServiceResult<MatchTicketInfo> SqliteOnlineServices::getMatch(
     if (!_impl->loadTicket(ticketId, info)) {
         return _impl->databaseFailure<MatchTicketInfo>(
             "failed to load durable match ticket");
+    }
+    if (info.assignment.topology == MatchTopology::Dedicated &&
+        info.assignment.dedicated.isValid()) {
+        std::string admissionToken;
+        if (!deriveDedicatedAdmissionToken(
+                info.assignment.dedicated.reservationToken,
+                authenticatedPeer, admissionToken)) {
+            return OnlineServiceResult<MatchTicketInfo>::failure(
+                OnlineServiceError::InternalError,
+                "failed to derive durable dedicated admission credential");
+        }
+        info.assignment.dedicated.reservationToken =
+            std::move(admissionToken);
     }
     return OnlineServiceResult<MatchTicketInfo>::success(std::move(info));
 }
@@ -2982,7 +3118,8 @@ size_t SqliteOnlineServices::runMatchmaking(size_t maxMatches) {
             request.topology == MatchTopology::Any) {
             auto allocated = allocateServer({
                 request.region, request.buildId,
-                static_cast<uint16_t>(peers.size())});
+                static_cast<uint16_t>(peers.size()), peers,
+                assignment.matchId, request.content});
             if (allocated) {
                 assignment.topology = MatchTopology::Dedicated;
                 assignment.dedicated = std::move(allocated.value);
