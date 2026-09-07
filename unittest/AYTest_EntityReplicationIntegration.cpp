@@ -152,6 +152,11 @@ TEST_CASE(WorldBinderDiscoversMultipleComponentsAndRemovals) {
 
     World::instance().initialize();
     ayt::entity::registerEntityComponents();
+    const auto secondaryRegistration =
+        ayt::entity::ComponentRegistry::instance()
+            .registerType<SecondaryReplicatedComponent>(
+                "SecondaryReplicatedComponent");
+    CHECK(secondaryRegistration.succeeded());
 
     ReplicationManager manager(nullptr);
     Entity* entity = Entity::create();

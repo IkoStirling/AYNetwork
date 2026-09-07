@@ -6,6 +6,7 @@ set(MODULE_NAME AYNetwork)
 
 set(SRC_FILES
     src/AYNetworkSubSystem.cpp
+    src/AYNetworkRuntimeModule.cpp
     src/NetConnectionImpl.cpp
     src/BitStream.cpp
     src/Transport/GnsConnection.cpp
@@ -26,8 +27,10 @@ set(SRC_FILES
     src/Session/P2PSessionCoordinator.cpp
     src/Session/OnlineSessionCoordinator.cpp
     src/Session/OnlineSubSystem.cpp
+    src/Session/OnlineRuntimeModule.cpp
     src/Session/OnlineFlowCoordinator.cpp
     src/Session/OnlineFlowSubSystem.cpp
+    src/Session/OnlineFlowRuntimeModule.cpp
     src/Session/InMemoryOnlineServices.cpp
     src/Session/DedicatedServerRuntime.cpp
     src/Protocol/PacketAssembler.cpp
@@ -71,6 +74,7 @@ add_library(${MODULE_NAME} STATIC ${SRC_FILES})
 target_link_libraries(${PROJECT_NAME} PUBLIC
     AYCore
     AYGameLoop
+    AY::Module
     AYStorage                              # R2: Lz4Decompressor (decode side)
     AYReflect                              # R3.0: ITypeInfo + FieldAttribute::NetReplicate walk
     AYReplay                               # R5.3 (2026-08-24): IReplayRecorder interface

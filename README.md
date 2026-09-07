@@ -7,6 +7,7 @@ AYNetwork 是网络传输、协议、复制与 RPC 模块，使用 GameNetworkin
 ```cpp
 #include <AYNetwork.h>
 #include <AYNetwork/INetwork.h>
+#include <AYNetwork/NetworkRuntimeModule.h>
 #include <AYNetwork/Protocol/PacketCodec.h>
 #include <AYNetwork/Replication/ReplicationManager.h>
 ```
@@ -15,9 +16,19 @@ AYNetwork 是网络传输、协议、复制与 RPC 模块，使用 GameNetworkin
 
 ## 依赖
 
-- AYCore、AYGameLoop、AYStorage、AYReflect
+- AYCore、AYGameLoop、AYModule、AYStorage、AYReflect
 - GameNetworkingSockets、LZ4、cpp-httplib、nlohmann-json、libsodium、SQLite
 - Win32：ws2_32
+
+## GameLoop 模块装配
+
+`NetworkRuntimeModule` 以模块 ID `AYNetwork.Runtime` 发布 `Network`
+SubSystem，并声明对 `AYEntity.Runtime` 的可选依赖。默认 Editor composition root
+已通过该模块装配网络；其他 Host 可按需把它加入自己的 `EngineModuleRuntime`。
+
+`registerNetworkSubSystem()` 继续作为工具程序和旧调用方的幂等兼容入口，但不再依赖
+静态初始化自动注册，也不再是默认 Editor 启动路径。模块卸载后，同一进程可以在下一
+个 Host 生命周期重新注册网络 SubSystem。
 
 ## P2P、NAT 穿透与中继
 
@@ -189,6 +200,12 @@ InSession / Failed`，
 也可完整注入平台或测试后端；账号刷新后可直接轮换玩家 bearer，无需重建网络对象。
 状态和大厅列表变化通过 `OnlineSessionStatusChangedEvent` / `OnlineLobbyListChangedEvent`
 延迟发布，退出 Play Session 时会在有界时间内取消票据、离开会话和 Lobby。
+
+启动装配提供三个稳定模块节点：`AYNetwork.Runtime → AYNetwork.Online →
+AYNetwork.OnlineFlow`。Online/OnlineFlow 在安装时通过当前 `IModuleContext` 获取前置
+SubSystem，因此可用于默认 Host 或自定义 Host；普通客户端只加入 `AYNetwork.Runtime`
+也不会链接或启动在线应用流程。旧的 `registerNetworkSubSystem()`、
+`registerOnlineSubSystem()` 和 `registerOnlineFlowSubSystem()` 继续作为直接注册兼容入口。
 
 `OnlineFlowCoordinator` 再向上提供不绑定 UI/场景实现的应用流程：`SignedOut → MainMenu →
 Lobby/Matchmaking → MatchAcceptance → LoadingSession → InSession → MainMenu`。账号层把签发结果交给

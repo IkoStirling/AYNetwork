@@ -3525,9 +3525,10 @@ private:
     bool     _replayRngSeedSet = false;
 };
 
-// 注册宏 — may be stripped from static libs; callers should also invoke
-// registerNetworkSubSystem() explicitly (Editor Play, tests).
-REGISTER_SUBSYSTEM(NetworkSubSystem, {}, 100);
+std::unique_ptr<INetworkSubSystem> createNetworkSubSystem()
+{
+    return std::make_unique<NetworkSubSystem>();
+}
 
 INetworkSubSystem* findRegisteredNetworkSubSystem()
 {
@@ -3537,20 +3538,16 @@ INetworkSubSystem* findRegisteredNetworkSubSystem()
 
 void registerNetworkSubSystem()
 {
-    static bool registered = false;
-    if (registered) {
-        return;
-    }
-    registered = true;
     if (findRegisteredNetworkSubSystem() != nullptr) {
         return;
     }
-    ::ayt::game::IGameLoop::instance().registerSubSystem(new NetworkSubSystem());
+    auto system = createNetworkSubSystem();
+    ::ayt::game::IGameLoop::instance().registerSubSystem(system.release());
 }
 
 #if defined(AYNETWORK_BUILD_TESTS)
 INetworkSubSystem* createNetworkSubSystemForTest() {
-    return new NetworkSubSystem();
+    return createNetworkSubSystem().release();
 }
 #endif
 

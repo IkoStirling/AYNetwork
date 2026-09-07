@@ -59,6 +59,21 @@ target_include_directories(${MODULE_NAME} PRIVATE
 
 ay_add_test(${MODULE_NAME})
 
+# Module assembly/compatibility stays isolated from socket integration suites.
+add_executable(AYNetworkRuntimeModuleTest
+    main.cpp
+    AYTest_RuntimeModule.cpp
+)
+target_link_libraries(AYNetworkRuntimeModuleTest PRIVATE
+    AYNetwork
+    AYTest
+    AYCore
+)
+target_include_directories(AYNetworkRuntimeModuleTest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+ay_add_test(AYNetworkRuntimeModuleTest)
+
 # Standalone process: GNS has one identity per process, and ResetIdentity is
 # intentionally rejected while any legacy IP test connection remains active.
 # Isolating P2P also mirrors production where each peer is a separate process.
