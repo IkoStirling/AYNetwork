@@ -321,6 +321,21 @@ public:
     virtual ~INetworkSubSystem() = default;
 
     // ===== 连接管理 =====
+    /**
+     * @brief Starts an asynchronous client connection to an IP endpoint.
+     * @param address Non-empty address accepted by the active transport backend.
+     * @param port Remote service port.
+     * @framephase
+     * Submit from the network/game control phase. If transport callbacks are
+     * being pumped, the request is copied and applied at the next safe boundary.
+     * @threading
+     * Call on the thread that owns Network SubSystem updates; do not race it
+     * with update(), listen(), disconnect(), or another connect().
+     * @failure
+     * This function has no immediate result. Observe connection state/events;
+     * failure leaves isConnected() false. A new request replaces the current
+     * client connection and exits an active P2P-listen mode.
+     */
     virtual void connect(const char* address, uint16_t port) = 0;
     virtual void listen(uint16_t port) = 0;
     virtual void disconnect() = 0;
@@ -808,15 +823,30 @@ public:
     ~ReplicationManager();
 
     // ---- R3.0 primary entry ----
-    // Register an object for replication. `obj` must outlive the manager (or
-    // until unregisterObject). `type` is the AYReflect ITypeInfo for T; use
-    // TypeRegistryImpl::findType<T>() to obtain. On authority, tick() sends
-    // Spawn + Full independently to each newly visible peer. On a client this
-    // only records the local mapping.
+    /**
+     * @brief Registers a reflected object under a stable network identifier.
+     * @param obj Borrowed address of the object whose replicated fields are read
+     * or written.
+     * @param type Wire-stable AYReflect metadata describing obj.
+     * @param netId Non-zero identifier unique within this replication manager.
+     * @ownership
+     * The manager does not own obj or type. Call unregisterObject(netId) before
+     * either becomes invalid or before their connection generation ends.
+     * @framephase
+     * Register before the authority replication tick that should announce the
+     * object. Clients use the same call to install the local receive mapping.
+     * @threading
+     * Call on the network/game thread; do not mutate registrations concurrently
+     * with tick() or receive processing.
+     * @failure
+     * Null obj/type and netId zero are ignored. Reusing a netId replaces the
+     * existing borrowed mapping and restarts its spawn bookkeeping.
+     */
     void registerObject(void* obj, const ayt::reflect::ITypeInfo* type, uint32_t netId);
     void unregisterObject(uint32_t netId);
 
     // ---- R1 deprecated wrapper (kept) ----
+    /** @deprecated Use the reflected overload; this wrapper has no field metadata. */
     void registerObject(IReplicable* obj, uint32_t netId);
 
     // ---- Lookups ----
