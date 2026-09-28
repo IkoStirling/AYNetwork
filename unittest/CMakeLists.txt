@@ -57,7 +57,9 @@ target_include_directories(${MODULE_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Transport  # R5.4 (2026-08-25): TransportFault* headers
 )
 
-ay_add_test(${MODULE_NAME})
+ay_add_test_tiers(${MODULE_NAME} PREFIX network DEFAULT_TIER integration
+    FAST_SUITES BitStream TokenBucket DelayedFrameQueue TransportFaultProfile
+    TIMEOUT 240 RUN_SERIAL)
 
 # Module assembly/compatibility stays isolated from socket integration suites.
 add_executable(AYNetworkRuntimeModuleTest
@@ -72,7 +74,8 @@ target_link_libraries(AYNetworkRuntimeModuleTest PRIVATE
 target_include_directories(AYNetworkRuntimeModuleTest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
-ay_add_test(AYNetworkRuntimeModuleTest)
+ay_add_test(AYNetworkRuntimeModuleTest CASE_REPORT LABELS "network;network-full;network-integration;integration"
+    TIMEOUT 60 RUN_SERIAL)
 
 # Standalone process: GNS has one identity per process, and ResetIdentity is
 # intentionally rejected while any legacy IP test connection remains active.
@@ -100,7 +103,8 @@ target_include_directories(${P2P_TEST_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Session
 )
-ay_add_test(${P2P_TEST_NAME})
+ay_add_test(${P2P_TEST_NAME} CASE_REPORT LABELS "network;network-full;network-integration;integration"
+    TIMEOUT 240 RUN_SERIAL)
 
 # AYEntity integration is optional at the AYNetwork library boundary. Keep its
 # test in a separate executable so transport/protocol/replication tests do not
@@ -117,5 +121,13 @@ if(TARGET AYEntity)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/..
     )
-    ay_add_test(${ENTITY_TEST_NAME})
+    ay_add_test(${ENTITY_TEST_NAME} CASE_REPORT LABELS "network;network-full;network-integration;integration"
+        TIMEOUT 120 RUN_SERIAL)
 endif()
+if(TARGET AYNetwork_EntityIntegration_Test)
+    set(AYNETWORK_TEST_ENTITY ON)
+else()
+    set(AYNETWORK_TEST_ENTITY OFF)
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/test-features.json"
+    "{\"entity\":\"${AYNETWORK_TEST_ENTITY}\"}\n")
