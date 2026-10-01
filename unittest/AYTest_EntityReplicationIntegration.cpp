@@ -7,6 +7,7 @@
 #include <AYTest.h>
 #include <AYEntity.h>
 #include <AYEntity/EntityModule.h>
+#include <AYEntity/ComponentRegistration.h>
 
 #include <AYNetwork/Replication/EntityReplicationAdapter.h>
 #include <AYNetwork/Replication/EntityReplicationWorldBinder.h>
@@ -33,6 +34,11 @@ struct SecondaryReplicatedComponent : ayt::entity::IComponent {
     const char* getName() const override { return "SecondaryReplicatedComponent"; }
 };
 
+struct MultiReplicatedComponent : ayt::entity::IComponent {
+    int32_t value = 0;
+    const char* getName() const override { return "MultiReplicatedComponent"; }
+};
+
 struct SecondaryReplicatedRegistrar {
     SecondaryReplicatedRegistrar() {
         auto& registry = ayt::reflect::TypeRegistryImpl::instance();
@@ -49,6 +55,18 @@ struct SecondaryReplicatedRegistrar {
             ayt::reflect::FieldAttribute::Serialize |
                 ayt::reflect::FieldAttribute::NetReplicate));
         registry.registerTypeInfo("SecondaryReplicatedComponent", info);
+        using MultiInfo = ayt::reflect::TypeInfoImpl<MultiReplicatedComponent>;
+        auto* multiInfo = new MultiInfo(
+            "MultiReplicatedComponent",
+            ayt::reflect::detail::defaultCreate<MultiReplicatedComponent>,
+            ayt::reflect::detail::defaultDestroy<MultiReplicatedComponent>,
+            ayt::reflect::detail::defaultCopy<MultiReplicatedComponent>);
+        multiInfo->addField(new ayt::reflect::FieldInfoImpl(
+            "value", registry.findType<int32_t>(),
+            offsetof(MultiReplicatedComponent, value),
+            ayt::reflect::FieldAttribute::Serialize |
+                ayt::reflect::FieldAttribute::NetReplicate));
+        registry.registerTypeInfo("MultiReplicatedComponent", multiInfo);
     }
 };
 
@@ -72,6 +90,45 @@ void pumpAll(const std::vector<INetworkSubSystem*>& systems, float dt = 0.016f) 
 } // anonymous namespace
 
 TEST_SUITE(EntityReplicationIntegration)
+
+TEST_CASE(WorldBinderUsesInstanceIdsForReplicatedMultiComponents) {
+    World::instance().initialize();
+    ayt::entity::registerEntityComponents();
+    CHECK(ayt::entity::registerComponent<MultiReplicatedComponent>(
+        ayt::entity::ComponentRegistry::instance(),
+        "MultiReplicatedComponent", "Multi Replicated", "Tests",
+        ayt::entity::ComponentMultiplicity::Multiple).succeeded());
+    ReplicationManager manager(nullptr);
+    Entity* entity = Entity::create();
+    constexpr uint32_t kEntityNetId = 9182;
+    entity->addComponent<NetworkComponent>()->setNetId(kEntityNetId);
+    auto* first = entity->createComponent<MultiReplicatedComponent>();
+    auto* second = entity->createComponent<MultiReplicatedComponent>();
+    CHECK_NOT_NULL(first);
+    CHECK_NOT_NULL(second);
+    const std::string firstId = entity->componentInstance(first)->id;
+    const std::string secondId = entity->componentInstance(second)->id;
+    EntityReplicationWorldBinder binder(manager, World::instance());
+    CHECK_INT_EQ(binder.synchronize(), 2u);
+    auto* type = ayt::reflect::TypeRegistryImpl::instance()
+        .findType<MultiReplicatedComponent>();
+    CHECK_NOT_NULL(type);
+    const uint64_t schema = ReflectSerializer::hashTypeSchema(type);
+    const uint32_t firstNetId = EntityReplicationWorldBinder::makeComponentNetId(
+        kEntityNetId, schema, firstId);
+    const uint32_t secondNetId = EntityReplicationWorldBinder::makeComponentNetId(
+        kEntityNetId, schema, secondId);
+    CHECK(firstNetId != secondNetId);
+    CHECK(manager.findObject(firstNetId) == first);
+    CHECK(manager.findObject(secondNetId) == second);
+    CHECK(entity->removeComponentById(firstId));
+    CHECK_INT_EQ(binder.synchronize(), 1u);
+    CHECK(manager.findObject(firstNetId) == nullptr);
+    CHECK(manager.findObject(secondNetId) == second);
+    binder.clear();
+    Entity::destroy(entity);
+    World::instance().shutdown();
+}
 
 TEST_CASE(HealthComponentReplicatesViaAdapter) {
     ayt::test::setCurrentCase("HealthComponentReplicatesViaAdapter");

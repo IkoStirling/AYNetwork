@@ -8,6 +8,7 @@
 #include <AYNetwork/Replication/ReflectSerializer.h>
 
 #include <AYEntity.h>
+#include <AYEntity/ComponentRegistry.h>
 #include <AYEntity/components/NetworkComponent.h>
 #include <AYReflect/ReflectRegistry.h>
 
@@ -56,8 +57,20 @@ public:
                     typeid(*component).hash_code());
                 if (!hasReplicatedFields(type)) continue;
 
-                const uint32_t objectNetId = makeComponentNetId(
-                    network->getNetId(), ReflectSerializer::hashTypeSchema(type));
+                const uint64_t schemaHash = ReflectSerializer::hashTypeSchema(type);
+                const auto* descriptor =
+                    ayt::entity::ComponentRegistry::instance().find(*component);
+                const bool multiple = descriptor && descriptor->multiplicity
+                    == ayt::entity::ComponentMultiplicity::Multiple;
+                const auto* instance = multiple
+                    ? entity->componentInstance(component) : nullptr;
+                if (multiple && (!instance
+                    || !ayt::entity::isValidComponentInstanceId(instance->id)))
+                    continue;
+                const uint32_t objectNetId = multiple
+                    ? makeComponentNetId(network->getNetId(), schemaHash,
+                                         instance->id)
+                    : makeComponentNetId(network->getNetId(), schemaHash);
                 if (objectNetId == INVALID_NET_ID || !desired.emplace(
                         objectNetId, DesiredBinding{component, type, network->getNetId()}).second) {
                     collisions.insert(objectNetId);
@@ -115,6 +128,19 @@ public:
         };
         for (int i = 0; i < 4; ++i) append(static_cast<uint8_t>(entityNetId >> (i * 8)));
         for (int i = 0; i < 8; ++i) append(static_cast<uint8_t>(schemaHash >> (i * 8)));
+        return hash == INVALID_NET_ID ? 1u : hash;
+    }
+
+    // Multi-instance bindings include the authored component slot. Peers must
+    // create the same component IDs before synchronizing the binder.
+    static uint32_t makeComponentNetId(uint32_t entityNetId,
+                                       uint64_t schemaHash,
+                                       const std::string& componentId) {
+        uint32_t hash = makeComponentNetId(entityNetId, schemaHash);
+        for (unsigned char byte : componentId) {
+            hash ^= byte;
+            hash *= 0x01000193u;
+        }
         return hash == INVALID_NET_ID ? 1u : hash;
     }
 
