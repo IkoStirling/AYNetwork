@@ -109,25 +109,24 @@ ay_add_test(${P2P_TEST_NAME} CASE_REPORT LABELS "network;network-full;network-in
 # AYEntity integration is optional at the AYNetwork library boundary. Keep its
 # test in a separate executable so transport/protocol/replication tests do not
 # pull the renderer-heavy AYEntity dependency graph into every network build.
-if(TARGET AYEntity)
+function(ay_network_add_entity_test)
+if(TARGET AYEntity AND NOT TARGET AYNetwork_EntityIntegration_Test)
     set(ENTITY_TEST_NAME AYNetwork_EntityIntegration_Test)
     add_executable(${ENTITY_TEST_NAME}
-        main.cpp
-        AYTest_EntityReplicationIntegration.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/main.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/AYTest_EntityReplicationIntegration.cpp
     )
     target_compile_definitions(${ENTITY_TEST_NAME} PRIVATE AYNETWORK_BUILD_TESTS)
     target_link_libraries(${ENTITY_TEST_NAME} PRIVATE AYNetwork AYTest AYCore AYEntity)
     target_include_directories(${ENTITY_TEST_NAME} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/..
     )
     ay_add_test(${ENTITY_TEST_NAME} CASE_REPORT LABELS "network;network-full;network-integration;integration"
         TIMEOUT 120 RUN_SERIAL)
 endif()
-if(TARGET AYNetwork_EntityIntegration_Test)
-    set(AYNETWORK_TEST_ENTITY ON)
-else()
-    set(AYNETWORK_TEST_ENTITY OFF)
-endif()
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/test-features.json"
-    "{\"entity\":\"${AYNETWORK_TEST_ENTITY}\"}\n")
+endfunction()
+ay_network_add_entity_test()
+# Resolve after the superproject has had a chance to add Entity integration.
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/test-features.json"
+    CONTENT "{\"entity\":\"$<IF:$<TARGET_EXISTS:AYNetwork_EntityIntegration_Test>,ON,OFF>\"}\n")

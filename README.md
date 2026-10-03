@@ -1,5 +1,9 @@
 # AYNetwork
 
+Entity 复制集成测试保持在独立的 `AYNetwork_EntityIntegration_Test` 进程中。
+根工程先配置 Network、再配置 Entity 时调用 `ay_network_add_entity_test()`；
+生成阶段的 `test-features.json` 与最终 target 一致，完整层不漏算或重复执行该分区。
+
 AYNetwork 是网络传输、协议、复制与 RPC 模块，使用 GameNetworkingSockets，并通过 AYReflect 元数据支持实体复制。
 
 ## 公开接口
