@@ -36,6 +36,7 @@ public:
     int getPing() const override;
 
     void send(uint8_t channel, const void* data, size_t size) override;
+    NetSendResult trySend(uint8_t channel, const void* data, size_t size, uint32_t maxQueuedBytes) override;
     void disconnect(const char* reason = nullptr) override;
 
     void setUserData(void* data) override { _userData = data; }

@@ -14,6 +14,11 @@ cmake_minimum_required(VERSION 3.20)
 
 set(MODULE_NAME AYNetwork_Test)
 
+add_executable(AYNetwork_CheckedSendTests main.cpp AYTest_CheckedSend.cpp)
+target_compile_definitions(AYNetwork_CheckedSendTests PRIVATE AYNETWORK_BUILD_TESTS)
+target_link_libraries(AYNetwork_CheckedSendTests PRIVATE AYNetwork AYTest AYCore)
+ay_add_test(AYNetwork_CheckedSendTests LABELS "network;network-integration;determinism" TIMEOUT 30 RUN_SERIAL)
+
 set(CORE_SRC_FILES
     main.cpp
     AYTest_Transport.cpp

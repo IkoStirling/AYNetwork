@@ -26,6 +26,9 @@ int NetConnectionImpl::getPing() const {
 void NetConnectionImpl::send(uint8_t channel, const void* data, size_t size) {
     if (_gns) _gns->send(channel, data, size);
 }
+NetSendResult NetConnectionImpl::trySend(uint8_t channel, const void* data, size_t size, uint32_t maxQueuedBytes) {
+    return _gns ? _gns->trySend(channel, data, size, maxQueuedBytes) : NetSendResult::Disconnected;
+}
 
 void NetConnectionImpl::disconnect(const char* reason /*= nullptr*/) {
     if (_gns) _gns->disconnect(reason);

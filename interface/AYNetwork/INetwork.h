@@ -116,6 +116,10 @@ struct NetworkLimits {
     uint32_t maxQueuedInboundBytes = 8u * 1024u * 1024u;
 };
 
+/// Accepted means locally queued, not peer delivery. RetryLater may include
+/// partial fragmentation; retry the complete idempotent application message.
+enum class NetSendResult : uint8_t { Accepted, RetryLater, Disconnected, Invalid, Unsupported };
+
 // =============================================================================
 // R1 done (2026-07-27): DisconnectReason — applied enum that travels with
 // every disconnect so receivers can react meaningfully (kick UI, reconnect,
@@ -463,6 +467,15 @@ public:
     // ===== 消息发送 =====
     virtual void send(uint8_t channel, const void* data, size_t size) = 0;
     virtual void sendTo(NetConnection* conn, uint8_t channel, const void* data, size_t size) = 0;
+    /** @brief Checked application send with a local pending + unacked byte ceiling.
+     * @note Owner thread only; preserves admission/migration gates and PacketCodec.
+     * Older adapters report Unsupported without sending. No delivery acknowledgment.
+     * maxQueuedBytes counts encoded application frames, excluding GNS wire overhead.
+     */
+    virtual NetSendResult trySendTo(NetConnection*, uint8_t, const void*, size_t,
+                                   uint32_t maxQueuedBytes = 256u * 1024u) {
+        (void)maxQueuedBytes; return NetSendResult::Unsupported;
+    }
     virtual void broadcast(uint8_t channel, const void* data, size_t size) = 0;
     virtual void broadcastExcept(NetConnection* exclude, uint8_t channel, const void* data, size_t size) = 0;
 
@@ -637,6 +650,10 @@ public:
     virtual int getPing() const = 0;
 
     virtual void send(uint8_t channel, const void* data, size_t size) = 0;
+    /// Checked counterpart; unsupported implementations never silently send.
+    virtual NetSendResult trySend(uint8_t, const void*, size_t, uint32_t maxQueuedBytes) {
+        (void)maxQueuedBytes; return NetSendResult::Unsupported;
+    }
     virtual void disconnect(const char* reason = nullptr) = 0;
 
     // 游戏数据关联

@@ -2922,6 +2922,23 @@ public:
         conn->send(channel, data, size);
     }
 
+    NetSendResult trySendTo(NetConnection* conn, uint8_t channel, const void* data, size_t size,
+                            uint32_t maxQueuedBytes) override {
+        if (!conn) return NetSendResult::Disconnected;
+        if (_p2pMigrationFrozen) return NetSendResult::RetryLater;
+        if (_clientNetConn.get() == conn && _clientConn) {
+            if (_clientConn->isP2P() && _clientAdmission != P2PAdmissionState::Admitted)
+                return NetSendResult::RetryLater;
+            return conn->trySend(channel, data, size, maxQueuedBytes);
+        }
+        if (const ServerClientRecord* record = findServerRecord(conn)) {
+            if (record->transport && record->transport->isP2P() && !record->sessionAdmitted)
+                return NetSendResult::RetryLater;
+            return conn->trySend(channel, data, size, maxQueuedBytes);
+        }
+        return NetSendResult::Invalid; // Not a connection owned by this subsystem.
+    }
+
     void broadcast(uint8_t channel, const void* data, size_t size) override {
         if (_p2pMigrationFrozen) return;
         // R1.A: actually iterate all server children and send to each.

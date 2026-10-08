@@ -185,6 +185,7 @@ public:
     // ===== Send / Close =====
     // channel: 0..3 (CHANNEL_RELIABLE/UNRELIABLE/FRAGMENTED/ACK)
     int  send(uint8_t channel, const void* data, size_t len);
+    NetSendResult trySend(uint8_t channel, const void* data, size_t len, uint32_t maxQueuedBytes);
     int  sendEncoded(uint8_t channel, const void* data, size_t len);
     // R4.1-B: seal with RequiresAck + seq prefix; optional callback when
     // the peer echoes kMsgTypeAppAck on CHANNEL_ACK.

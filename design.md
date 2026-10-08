@@ -2194,3 +2194,22 @@ The online-service boundary and first-version behavior are documented in
 - [Unity NetCode](https://docs.unity3d.com/Packages/com.unity.netcode@1.0/manual/index.html)
 - [O3DE Networking](https://o3de.org/docs/learning-guide/gems/multiplayer/)
 - [Gaffer on Games — Networked Physics](https://gafferongames.com/post/networked_physics_2004/)
+
+## Stage16: checked application send contract
+
+Additive `NetSendResult`/`trySendTo`/connection `trySend` preserve legacy void APIs.
+Default adapters return Unsupported without sending. The subsystem validates owned
+connection identity and existing admission/migration gates before GNS checked send.
+GNS validates ready/channel/body bounds, estimates PacketCodec framing, queries
+pending reliable/unreliable and unacked reliable bytes, and retries under pressure.
+It only reports Accepted after every fragment succeeds; a partial failure can
+leave frames queued and must retry the whole idempotent application message.
+
+The byte ceiling includes encoded application frames, excludes GNS transport
+overhead, and is an owner-thread preflight rather than a concurrent reservation.
+An active asynchronous fault interceptor is explicitly unsupported by checked send;
+its delay queue lacks acceptance/completion feedback. Portable scheduling fault
+tests and real application ingress faults exercise congestion/loss without claiming
+that unchecked interceptor queue is bounded. CheckedSendTests covers real local
+GNS pressure, framing/foreign/invalid rejection, and a real send-path fake that
+fails a later fragment before a complete retry.

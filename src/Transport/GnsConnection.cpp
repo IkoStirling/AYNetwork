@@ -912,6 +912,29 @@ GnsPumpResult GnsConnection::pump(const GnsPumpBudget& requestedBudget) {
     return result;
 }
 
+NetSendResult GnsConnection::trySend(uint8_t channel, const void* data, size_t len, uint32_t maxQueuedBytes) {
+    if ((!data && len) || len > PacketCodec::kMaxDecodedBodySize || channel > CHANNEL_ACK || !maxQueuedBytes)
+        return NetSendResult::Invalid;
+    if (!s_gns || !isConnected() || _conn == k_HSteamNetConnection_Invalid) return NetSendResult::Disconnected;
+    // A fault interceptor owns a separate asynchronous queue without completion
+    // feedback. Do not claim bounded GNS acceptance through that path.
+    if (auto* interceptor = getFaultInterceptor(); interceptor && interceptor->isEnabled())
+        return NetSendResult::Unsupported;
+    constexpr size_t envelope = PacketCodec::kHeaderSize + PacketCodec::kCrcSize;
+    constexpr size_t fragmentedEnvelope = envelope + PacketCodec::kFragmentHeaderSize;
+    const size_t encodedBytes = len <= kFrameMtu - envelope ? len + envelope
+        : len + ((len + kFrameMtu - fragmentedEnvelope - 1) / (kFrameMtu - fragmentedEnvelope)) * fragmentedEnvelope;
+    if (encodedBytes > maxQueuedBytes) return NetSendResult::Invalid;
+    SteamNetConnectionRealTimeStatus_t status{};
+    if (s_gns->GetConnectionRealTimeStatus(_conn, &status, 0, nullptr) != k_EResultOK)
+        return NetSendResult::RetryLater;
+    const auto queued = uint64_t(std::max(0, status.m_cbPendingReliable))
+        + uint64_t(std::max(0, status.m_cbPendingUnreliable)) + uint64_t(std::max(0, status.m_cbSentUnackedReliable));
+    if (queued + encodedBytes > maxQueuedBytes) return NetSendResult::RetryLater;
+    if (send(channel, data, len) == 0) return NetSendResult::Accepted;
+    return isConnected() ? NetSendResult::RetryLater : NetSendResult::Disconnected;
+}
+
 int GnsConnection::send(uint8_t channel, const void* data, size_t len) {
     if (!s_gns || _conn == k_HSteamNetConnection_Invalid) return -1;
     if ((data == nullptr && len != 0) ||

@@ -236,3 +236,21 @@ Lobby launch 会把同一身份交给所有成员。SQLite Online store schema �
 Host Migration。房间目录、跨分区仲裁和真正的无主机一致性协议不由信令转发器承担。
 
 协议版本、Authority 模型和复制/RPC 阶段见 [design.md](design.md)。
+
+## Checked sends and backpressure
+
+`INetworkSubSystem::trySendTo(connection,channel,data,size,maxQueuedBytes)` is the
+checked application path. It applies normal admission/migration gates and rejects
+foreign connection pointers. `Accepted` means all PacketCodec frames were locally
+accepted, not peer delivery; `RetryLater` may follow partial fragmentation, so
+idempotent protocols retry the complete message. `Disconnected`, `Invalid` and
+`Unsupported` are explicit. Legacy `sendTo` retains its void compatibility API.
+
+The GNS path preflights encoded pending + unacked bytes, including application
+framing but excluding GNS wire overhead. Use one owner thread. Other traffic and
+GNS retransmissions share this queue; this is a preflight ceiling, not a reservation
+against concurrent producers. Active asynchronous fault interceptors return
+Unsupported because they own another queue without checked completion feedback.
+Use `AYEntity/DeterministicNetwork.h`'s `pumpDetTransport` for budgeted rollback or
+lockstep egress. Authentication, admission, timeout/disconnect/recovery policy
+remain application responsibilities. See [Stage16](../../AYDocs/DETERMINISTIC-TRANSPORT-STAGE16.md).
