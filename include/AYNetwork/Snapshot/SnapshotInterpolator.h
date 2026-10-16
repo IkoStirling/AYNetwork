@@ -121,6 +121,12 @@ public:
         return sample(netId, getInterpolationTimeSec(), out);
     }
 
+    /// Owner-thread diagnostic copy at the current clock; never advances time or writes a live object.
+    /// Requires the registered type and its live layout object; limits output to64KiB.
+    /// Reflection accessors run only against layoutObject, never against unconstructed byte storage.
+    bool debugSampleNow(uint32_t netId, void* layoutObject, const ayt::reflect::ITypeInfo* type,
+                        std::vector<uint8_t>& out) const;
+
     // ---- Diagnostics ----
     size_t ghostCount() const { return _ghosts.size(); }
     size_t recordCount(uint32_t netId) const;
@@ -137,8 +143,10 @@ public:
     const NetworkTime& timeForTesting() const { return _time; }
 
 private:
+    bool sampleWithLayout(uint32_t netId, double renderTimeSec, void* out, void* layoutObject) const;
     struct GhostEntry {
         size_t                              recordBytes = 0;
+        const ayt::reflect::ITypeInfo*         type = nullptr;
         std::vector<FieldInterpSpec>        fields;
         SnapshotBuffer                      buffer;
     };

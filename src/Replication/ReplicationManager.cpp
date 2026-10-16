@@ -21,6 +21,7 @@
 #include <AYReflect/IReflect.h>
 
 #include <cstdio>
+#include <AYMath/MathTypes.h>
 #include <cstring>
 
 namespace ayt::net
@@ -64,6 +65,42 @@ struct ReplicationManager::ReflectedEntry {
 // =============================================================================
 // ctor / dtor
 // =============================================================================
+namespace {
+bool debugPosition(const void* object,const ayt::reflect::ITypeInfo* type,NetVec3& out,const std::vector<uint8_t>* bytes=nullptr) {
+    if(!object || !type)return false;
+    for(uint32_t i=0;i<type->getFieldCount();++i){const auto* field=type->getField(i);if(!field || !field->getType())continue;
+        const std::string name=field->getName();if(name!="position" && name!="location" && name!="translation")continue;
+        const auto id=field->getType()->getId();if(id!=typeid(ayt::math::FVector3).hash_code() && id!=typeid(NetVec3).hash_code())continue;
+        const auto* value=static_cast<const uint8_t*>(field->get(const_cast<void*>(object)));if(!value)continue;
+        if(bytes){const auto address=reinterpret_cast<uintptr_t>(value),base=reinterpret_cast<uintptr_t>(object);if(address<base || address-base>bytes->size() || sizeof(float)*3>bytes->size()-(address-base))return false;value=bytes->data()+(address-base);}
+        std::memcpy(&out.x,value,sizeof(float));std::memcpy(&out.y,value+sizeof(float),sizeof(float));std::memcpy(&out.z,value+sizeof(float)*2,sizeof(float));
+        return std::isfinite(out.x)&&std::isfinite(out.y)&&std::isfinite(out.z);
+    }return false;
+}
+}
+void ReplicationManager::setDebugCaptureEnabled(bool enabled) noexcept {_debugCapture=enabled;if(!enabled)clearDebugHistory();}
+void ReplicationManager::clearDebugHistory() noexcept {_debugReceivedPoses.clear();}
+void ReplicationManager::observeDebugReceive(uint32_t id,const void* object,const ayt::reflect::ITypeInfo* type) noexcept {
+    if(!_debugCapture)return;
+    try{NetVec3 authority;if(!debugPosition(object,type,authority))return;
+        if(_debugReceivedPoses.size()>=256 && !_debugReceivedPoses.contains(id))return;
+        float distance=0;std::vector<uint8_t> bytes;NetVec3 predicted;
+        if(_prediction && _prediction->tryGetPredictedBytes(id,bytes,65536) && debugPosition(object,type,predicted,&bytes)){
+            const auto x=predicted.x-authority.x,y=predicted.y-authority.y,z=predicted.z-authority.z;distance=std::sqrt(x*x+y*y+z*z);}
+        _debugReceivedPoses[id]={authority,distance};
+    }catch(...){}
+}
+ReplicationManager::DebugSnapshot ReplicationManager::debugSnapshot() const {
+    DebugSnapshot result;result.serverTick=_serverTick;result.authority=isAuthority();result.tick=_lastTickStats;
+    for(const auto& [id,entry]:_objects){if(result.objects.size()==256){++result.dropped;continue;}DebugObject row;row.netId=id;row.proxy=getObjectProxyKind(id);row.ownerConnection=getObjectOwnerConnectionId(id);row.dirtyFields=getDirtyFieldCount(id);row.hasLocation=entry._hasLocation;row.location=entry._location;
+        if(result.authority)row.hasAuthority=debugPosition(entry.obj,entry.type,row.authority);
+        else if(const auto found=_debugReceivedPoses.find(id);found!=_debugReceivedPoses.end()){row.hasAuthority=true;row.authority=found->second.position;row.lastCorrectionDistance=found->second.correction;}
+        std::vector<uint8_t> bytes;
+        if(_prediction){row.predictedInput=_prediction->lastPredictedInputSeq(id);if(_prediction->tryGetPredictedBytes(id,bytes,65536))row.hasPredicted=debugPosition(entry.obj,entry.type,row.predicted,&bytes);}
+        if(_snapshotInterpolator){row.interpolationRecords=uint32_t(_snapshotInterpolator->recordCount(id));if(entry.type && entry.type->getSize() && entry.type->getSize()<=65536){bytes.resize(entry.type->getSize());if(_snapshotInterpolator->debugSampleNow(id,entry.obj,entry.type,bytes))row.hasInterpolated=debugPosition(entry.obj,entry.type,row.interpolated,&bytes);}}
+        result.objects.push_back(row);
+    }return result;
+}
 ReplicationManager::ReplicationManager(INetworkSubSystem* network)
     : _network(network)
     , _prediction(new PredictionManager(/*ringCapacity=*/ 32))
@@ -428,6 +465,7 @@ void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo
     // allocated lazily when a connection first becomes interested.
     buildNetFieldMap(type, e._netFieldSparseIndex);
     _objects[netId] = e;
+    _debugReceivedPoses.erase(netId);
     _spawnAnnouncements.erase(netId);
 
     // R5.2 (2026-08-24): default ProxyKind = SimulatedProxy. Keeps R3.x
@@ -438,6 +476,7 @@ void ReplicationManager::registerObject(void* obj, const ayt::reflect::ITypeInfo
 }
 
 void ReplicationManager::unregisterObject(uint32_t netId) {
+    _debugReceivedPoses.erase(netId);
     auto it = _objects.find(netId);
     if (it == _objects.end()) return;
     ReflectedEntry& entry = it->second;
@@ -485,6 +524,7 @@ void ReplicationManager::registerObject(IReplicable* obj, uint32_t netId) {
     e.type  = nullptr; // legacy path has no AYReflect metadata; will skip reflection walk
     e.iface = obj;
     _objects[netId] = e;
+    _debugReceivedPoses.erase(netId);
 
     // Legacy IReplicable objects are NOT replicated via ReflectSerializer in
     // R3.0 — the user is expected to migrate to AYReflect-marked fields.
@@ -983,6 +1023,7 @@ bool ReplicationManager::onReceive(uint16_t messageType, BitStream& stream, NetC
                 };
             }
             const bool decoded = ReflectSerializer::deserializeObject(type, obj, stream, hdr.fieldCount, onFieldApplied);
+            if(decoded)observeDebugReceive(hdr.netId,obj,type);
 
             // R5.2 (2026-08-24): Full Snapshot bodies may carry an optional
             // 8-byte ack tail when the destination connection owns an
@@ -1148,6 +1189,7 @@ void ReplicationManager::forceReplicateAll() {
 }
 
 void ReplicationManager::resetForAuthorityEpoch(bool becomingAuthority) {
+    _debugReceivedPoses.clear();
     _lastAckedInputTick.clear();
     _proxyOwnerConnections.clear();
     if (_prediction) _prediction->resetForAuthorityEpoch();

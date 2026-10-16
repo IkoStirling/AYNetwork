@@ -76,6 +76,7 @@ bool SnapshotInterpolator::registerGhostKind(uint32_t netId,
 
     GhostEntry g;
     g.recordBytes = recordBytes;
+    g.type = type;
 
     // Walk AYReflect: every NetReplicate field that resolves to a wire type
     // becomes one FieldInterpSpec entry. We deliberately drop String and
@@ -162,6 +163,16 @@ void SnapshotInterpolator::push(uint32_t netId, uint32_t serverTick, const void*
 }
 
 bool SnapshotInterpolator::sample(uint32_t netId, double renderTimeSec, void* out) const {
+    return sampleWithLayout(netId,renderTimeSec,out,out);
+}
+bool SnapshotInterpolator::debugSampleNow(uint32_t netId,void* layoutObject,const ayt::reflect::ITypeInfo* type,std::vector<uint8_t>& out) const {
+    const auto found=_ghosts.find(netId);
+    if(!layoutObject || !type || found==_ghosts.end() || found->second.type!=type || found->second.recordBytes!=type->getSize() || found->second.recordBytes>65536)return false;
+    std::vector<uint8_t> sample(found->second.recordBytes);
+    if(!sampleWithLayout(netId,getInterpolationTimeSec(),sample.data(),layoutObject))return false;
+    out=std::move(sample);return true;
+}
+bool SnapshotInterpolator::sampleWithLayout(uint32_t netId,double renderTimeSec,void* out,void* layoutObject) const {
     auto it = _ghosts.find(netId);
     if (it == _ghosts.end() || !out) return false;
     const GhostEntry& g = it->second;
@@ -217,16 +228,16 @@ bool SnapshotInterpolator::sample(uint32_t netId, double renderTimeSec, void* ou
     }
 
     // Start from the lower bracket, then blend each lerpable reflected
-    // field. Resolve the field address on the real output object and use its
+    // field. Resolve the field address on the live layout object and use its
     // object-relative offset to read the byte snapshots. This supports
     // accessor-backed/inherited fields without invoking typed accessors on
     // raw storage where no object lifetime has begun.
     std::memcpy(out, aBuf.data(), g.recordBytes);
     auto* outBase = static_cast<uint8_t*>(out);
-    const uintptr_t outBaseAddress = reinterpret_cast<uintptr_t>(outBase);
+    const uintptr_t outBaseAddress = reinterpret_cast<uintptr_t>(layoutObject);
     for (const auto& f : g.fields) {
         if (!f.lerpable || !f.field) continue;
-        auto* outPtr = static_cast<uint8_t*>(f.field->get(out));
+        auto* outPtr = static_cast<uint8_t*>(f.field->get(layoutObject));
         if (!outPtr) continue;
         const uintptr_t outFieldAddress = reinterpret_cast<uintptr_t>(outPtr);
         if (outFieldAddress < outBaseAddress) continue;
@@ -239,13 +250,13 @@ bool SnapshotInterpolator::sample(uint32_t netId, double renderTimeSec, void* ou
             std::memcpy(&a, aPtr, 4);
             std::memcpy(&b, bPtr, 4);
             const float v = a + (b - a) * alphaF;
-            std::memcpy(outPtr, &v, 4);
+            std::memcpy(outBase+offset, &v, 4);
         } else if (f.sizeBytes == 8) {
             double a, b;
             std::memcpy(&a, aPtr, 8);
             std::memcpy(&b, bPtr, 8);
             const double v = a + (b - a) * static_cast<double>(alphaF);
-            std::memcpy(outPtr, &v, 8);
+            std::memcpy(outBase+offset, &v, 8);
         }
     }
     return true;

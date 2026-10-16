@@ -2213,3 +2213,9 @@ tests and real application ingress faults exercise congestion/loss without claim
 that unchecked interceptor queue is bounded. CheckedSendTests covers real local
 GNS pressure, framing/foreign/invalid rejection, and a real send-path fake that
 fails a later fragment before a complete retry.
+
+## Extended diagnostic observations (2026-10-15)
+
+ReplicationManager::debugSnapshot returns up to256 owned object observations, actual received authority position/correction and existing proxy/input/interpolation/tick counters. Exact reflected FVector3/NetVec3 position/location/translation fields are required for pose extraction; unavailable layouts remain unavailable. Optional received-position capture defaults off and is cleared on unregister/re-register/authority epoch. Bounded tryGetPredictedBytes overload preserves the destination on over-budget state. SnapshotInterpolator::debugSampleNow validates the registered type/size (max64KiB), resolves offsets on a live layout object and samples into owned bytes without invoking accessors on raw storage, writing live state or advancing time. Existing sample still targets the caller live output object.
+
+Regression sources are included. Runtime tests and interactive editor acceptance are deferred for this content task; untested changes remain uncommitted.

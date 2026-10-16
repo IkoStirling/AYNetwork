@@ -836,6 +836,19 @@ private:
 // =============================================================================
 class ReplicationManager {
 public:
+    struct DebugObject {
+        uint32_t netId=0,ownerConnection=0,predictedInput=0,interpolationRecords=0;
+        ProxyKind proxy=ProxyKind::SimulatedProxy;size_t dirtyFields=0;
+        bool hasAuthority=false,hasPredicted=false,hasInterpolated=false,hasLocation=false;
+        NetVec3 authority{},predicted{},interpolated{},location{};
+        float lastCorrectionDistance=0;
+    };
+    struct DebugSnapshot {uint32_t serverTick=0;bool authority=false;ReplicationTickStats tick;std::vector<DebugObject> objects;size_t dropped=0;};
+    /// Owner-thread owned snapshot. Typed position fields only; never advance prediction/interpolation.
+    /// Records at most256 objects, limits opaque sample copies to64KiB.
+    DebugSnapshot debugSnapshot() const;
+    void setDebugCaptureEnabled(bool enabled) noexcept;
+    void clearDebugHistory() noexcept;
     ReplicationManager(INetworkSubSystem* network);
     ~ReplicationManager();
 
@@ -1118,6 +1131,10 @@ public:
     uint32_t             ackedSeqForHash(uint32_t connectionId) const;
 
 private:
+    bool _debugCapture=false;
+    struct DebugReceivedPose {NetVec3 position{};float correction=0;};
+    std::map<uint32_t,DebugReceivedPose> _debugReceivedPoses;
+    void observeDebugReceive(uint32_t netId,const void* object,const ayt::reflect::ITypeInfo* type) noexcept;
     INetworkSubSystem* _network = nullptr;
     INetworkExtension* _extension = nullptr;
     SnapshotInterpolator* _snapshotInterpolator = nullptr;  // R5.0 client sink

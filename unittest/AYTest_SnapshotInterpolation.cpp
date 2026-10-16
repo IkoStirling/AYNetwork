@@ -274,6 +274,15 @@ TEST_SUITE_END
 // =============================================================================
 TEST_SUITE(SnapshotInterpolatorSuite)
 
+TEST_CASE(DebugSampleOwnsBytesWithoutChangingLiveObjectOrClock) {
+    ayt::test::setCurrentCase("DebugSampleOwnsBytesWithoutChangingLiveObjectOrClock");
+    const auto* type=ayt::reflect::TypeRegistryImpl::instance().findType<GhostPosition>();CHECK(type!=nullptr);if(!type)return;
+    SnapshotInterpolator interp;interp.setTickRate(1);interp.setInterpolationDelaySec(0);CHECK(interp.registerGhostKind(1,sizeof(GhostPosition),type));
+    GhostPosition a{0,0,0},b{2,4,6},live{99,98,97};interp.push(1,0,&a);interp.push(1,1,&b);interp.advanceClient(.5);
+    std::vector<uint8_t> bytes;CHECK(interp.debugSampleNow(1,&live,type,bytes));CHECK(live.x==99);CHECK(interp.getClientTimeSec()==.5);CHECK(interp.recordCount(1)==2);
+    GhostPosition observed;if(bytes.size()==sizeof(observed)){std::memcpy(&observed,bytes.data(),sizeof(observed));CHECK(observed.x==1);CHECK(observed.y==2);}
+    interp.unregisterGhost(1);CHECK(bytes.size()==sizeof(GhostPosition));CHECK(!interp.debugSampleNow(1,&live,type,bytes));
+}
 TEST_CASE(SnapshotInterpolatorEndToEnd) {
     ayt::test::setCurrentCase("SnapshotInterpolatorEndToEnd");
     const auto* type = ayt::reflect::TypeRegistryImpl::instance().findType<GhostPosition>();

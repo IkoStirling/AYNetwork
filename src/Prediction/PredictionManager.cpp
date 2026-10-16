@@ -148,8 +148,11 @@ void PredictionManager::setPredictedBytes(uint32_t netId,
 bool PredictionManager::tryGetPredictedBytes(uint32_t netId,
                                              std::vector<uint8_t>& out) const
 {
+    return tryGetPredictedBytes(netId,out,size_t(-1));
+}
+bool PredictionManager::tryGetPredictedBytes(uint32_t netId,std::vector<uint8_t>& out,size_t maxBytes) const {
     auto it = _ghosts.find(netId);
-    if (it == _ghosts.end()) return false;
+    if (it == _ghosts.end() || it->second.bytes.size()>maxBytes) return false;
     out = it->second.bytes;
     return true;
 }

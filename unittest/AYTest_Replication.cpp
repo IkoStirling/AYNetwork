@@ -396,6 +396,13 @@ TEST_CASE(RoundTripPrimitives) {
     CHECK(dst.d   == src.d);
     CHECK(dst.s   == src.s);
 }
+TEST_CASE(DebugSnapshotDoesNotGuessPrimitivePoseOrChangeRegistry) {
+    ayt::test::setCurrentCase("DebugSnapshotDoesNotGuessPrimitivePoseOrChangeRegistry");
+    const auto* type=ayt::reflect::TypeRegistryImpl::instance().findType<ReplicationAllPrimitives>();CHECK(type!=nullptr);if(!type)return;
+    ReplicationAllPrimitives object;ReplicationManager manager(nullptr);manager.registerObject(&object,type,7);auto snapshot=manager.debugSnapshot();CHECK(snapshot.objects.size()==1);
+    if(!snapshot.objects.empty()){CHECK(!snapshot.objects[0].hasAuthority);CHECK(!snapshot.objects[0].hasPredicted);CHECK(!snapshot.objects[0].hasInterpolated);}
+    (void)manager.debugSnapshot();CHECK(manager.debugSnapshot().objects.size()==1);manager.unregisterObject(7);CHECK(manager.debugSnapshot().objects.empty());CHECK(snapshot.objects.size()==1);
+}
 TEST_SUITE_END
 
 // =============================================================================
