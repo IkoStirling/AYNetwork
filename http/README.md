@@ -10,6 +10,19 @@ or let the explicit inference/application-services opt-in select it. This target
 does not link game sessions, GNS, Entity, replication or the AYNetwork main target.
 It wraps the installed cpp-httplib backend without exposing its types/macros.
 
+Optional Request.proxyOrigin selects a credential-free HTTP proxy; HTTPS uses
+CONNECT and retains server certificate verification. Request.useSystemProxy opts
+into the current Windows user's manual proxy and host bypass rules. Empty/default
+is direct, with no system-setting changes, PAC execution or proxy auto-discovery.
+systemProxyOrigin provides the same bounded resolution for other transports;
+literal loopback/localhost bypass automatic proxy use. Explicit proxy origins must
+be http://host[:port], without userinfo/path/query; authenticated/SOCKS/HTTPS proxies
+and PAC/WPAD are not implemented. Unsupported system settings resolve to direct;
+an invalid explicit proxy fails. Nothing reads Credential Manager or logs proxy
+credentials. Tests cover a real loopback HTTP proxy with an unresolvable target,
+invalid/credential-bearing proxies and loopback bypass. Public deployments remain
+separate checks; HibernationAgent's live search smoke uses this option.
+
 `perform` is synchronous and owns its client. It supports GET/POST, request/response
 budgets, finite total/connect/read/write timeouts, optional tentative chunk delivery
 and cancellation. Redirects are disabled and TLS peer verification remains enabled.

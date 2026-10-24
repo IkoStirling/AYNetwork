@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <memory>
 #include <thread>
+#include <charconv>
 
 namespace ayt::net::http {
 bool validOrigin(std::string_view origin) {
@@ -33,6 +34,15 @@ Response perform(const Request& request) {
     try {
         httplib::Client client(request.origin);
         if (!client.is_valid()) { response.status = Status::Invalid; return response; }
+        const auto proxy=request.proxyOrigin.empty()&&request.useSystemProxy?systemProxyOrigin(request.origin):request.proxyOrigin;
+        if(!proxy.empty()){
+            if(!proxy.starts_with("http://")||!validOrigin(proxy)){response.status=Status::Invalid;return response;}auto address=proxy.substr(7);std::string host;std::string portText;int port=80;
+            if(address.starts_with('[')){const auto end=address.find(']');if(end==std::string::npos){response.status=Status::Invalid;return response;}host=address.substr(1,end-1);if(end+1<address.size()){if(address[end+1]!=':'){response.status=Status::Invalid;return response;}portText=address.substr(end+2);}}
+            else {const auto colon=address.find(':');host=address.substr(0,colon);if(colon!=std::string::npos)portText=address.substr(colon+1);}
+            if(!portText.empty()){const auto parsed=std::from_chars(portText.data(),portText.data()+portText.size(),port);if(parsed.ec!=std::errc{}||parsed.ptr!=portText.data()+portText.size()||port<1||port>65535){response.status=Status::Invalid;return response;}}
+            else if(address.ends_with(':')){response.status=Status::Invalid;return response;}
+            if(host.empty()){response.status=Status::Invalid;return response;}client.set_proxy(host,port);
+        }
         client.set_follow_location(false);
         client.set_connection_timeout(request.timeout);
         client.set_read_timeout(request.timeout);

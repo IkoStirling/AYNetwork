@@ -3,6 +3,7 @@
 #include <httplib.h>
 #include <thread>
 #include <atomic>
+#include <mutex>
 using namespace ayt::net::http;
 TEST_SUITE(HttpClientTests)
 TEST_CASE(loopback_transport_handles_chunks_limits_redirects_and_cancellation) {
@@ -33,6 +34,12 @@ TEST_CASE(origins_and_header_injection_are_rejected) {
     Request req; req.origin = "http://127.0.0.1:1"; req.headers = {{"Authorization", "Bearer value\r\nInjected: yes"}};
     CHECK(perform(req).status == Status::Invalid);
     CHECK(environmentCredential("bad=name").empty());
+}
+TEST_CASE(explicit_http_proxy_routes_without_resolving_the_origin_and_rejects_credentials){
+    httplib::Server proxy;std::string target;std::mutex targetMutex;proxy.Get(R"(.*)",[&](const auto& req,auto& res){{std::lock_guard lock(targetMutex);target=req.path;}res.set_content("through-proxy","text/plain");});const auto port=proxy.bind_to_any_port("127.0.0.1");CHECK(port>0);std::jthread runner([&]{proxy.listen_after_bind();});proxy.wait_until_ready();struct Stop{httplib::Server& s;~Stop(){s.stop();}}stop{proxy};
+    Request request;request.origin="http://unresolvable-fixture.invalid";request.path="/probe";request.method="GET";request.timeout=std::chrono::seconds(2);request.proxyOrigin="http://127.0.0.1:"+std::to_string(port);auto result=perform(request);CHECK(static_cast<bool>(result));CHECK(result.body=="through-proxy");{std::lock_guard lock(targetMutex);CHECK(target.find("/probe")!=std::string::npos);}
+    request.proxyOrigin="http://user:password@127.0.0.1:1";CHECK(perform(request).status==Status::Invalid);request.proxyOrigin="https://127.0.0.1:1";CHECK(perform(request).status==Status::Invalid);request.proxyOrigin="http://127.0.0.1:999999";CHECK(perform(request).status==Status::Invalid);request.proxyOrigin="http://127.0.0.1:";CHECK(perform(request).status==Status::Invalid);
+    CHECK(systemProxyOrigin("http://127.0.0.1:1234").empty());CHECK(systemProxyOrigin("http://localhost:1234").empty());CHECK(systemProxyOrigin("invalid").empty());
 }
 TEST_SUITE_END
 int main(int argc, char** argv) { return ayt::test::runTests("AYNetworkHttp", argc, argv); }
