@@ -1,5 +1,10 @@
 # AYNetwork Design
 
+> 2026-10-26: the separate bounded `AYNetworkHttp` transport uses asynchronous
+> WinHTTP on Windows behind its synchronous owned-result facade. Cancellation
+> closes a pending request and drains HANDLE_CLOSING before context destruction;
+> other platforms retain cpp-httplib. See [transport contract](http/README.md).
+
 > **文档状态（2026-07-29）**：传输库 **锁定 GameNetworkingSockets（GNS）**（§14）。R1–R2 协议层 ✅；R3.0–R3.2 复制层 ✅；R4.0 RPC 核心 ✅；**R4.1-A 集成层 ✅ ship**；**R4.1-B polish ✅ ship**（690+ PASS）。工业可用度见 §12。
 > **2026-07-29 R4.1 范围收束补丁**：拆分 R4.1-A/B；冻结散落 4.1 开发；修正 §10 demux 表述与代码一致；§12 评分同步 R4.0 ship 后现状。
 > **2026-07-27 设计审计补丁**：消除 KCP/GNS 叙事矛盾；锁定 Protocol↔GNS 职责；新增 **§6.6 Authority 最小模型**；§4 改为 GNS 传输；§16 Changelog。

@@ -1,7 +1,8 @@
 # AYNetwork
 
 独立 `AYNetworkHttp` 目标为非游戏应用提供有限 HTTP/TLS、流式消费、超时和取消，
-无需启用整个联网运行时。见 [HTTP 子目标](http/README.md)。
+无需启用整个联网运行时。Windows内部使用异步WinHTTP，取消首响应等待后排空最终
+关闭回调再释放请求；其他平台保留cpp-httplib。见 [HTTP 子目标](http/README.md)。
 
 Entity 复制集成测试保持在独立的 `AYNetwork_EntityIntegration_Test` 进程中。
 根工程先配置 Network、再配置 Entity 时调用 `ay_network_add_entity_test()`；

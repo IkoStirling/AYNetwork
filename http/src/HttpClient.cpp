@@ -6,6 +6,9 @@
 #include <memory>
 #include <thread>
 #include <charconv>
+#ifdef _WIN32
+#include "WinHttpTransport.h"
+#endif
 
 namespace ayt::net::http {
 bool validOrigin(std::string_view origin) {
@@ -32,6 +35,14 @@ Response perform(const Request& request) {
     auto cancelled = [&] { try { return request.cancelled && request.cancelled(); } catch (...) { return true; } };
     if (cancelled()) { response.status = Status::Cancelled; return response; }
     try {
+#ifdef _WIN32
+        auto destination=std::string_view(request.origin).substr(request.origin.starts_with("https://")?8:7);
+        const bool local=destination=="localhost"||destination.starts_with("localhost:")||destination=="127.0.0.1"||destination.starts_with("127.0.0.1:")||destination=="[::1]"||destination.starts_with("[::1]:");
+        // The tested native WinHTTP path bypasses an explicit proxy for a
+        // loopback destination. Preserve the established explicit-routing
+        // contract with the existing client for this narrow compatibility case.
+        if(request.proxyOrigin.empty()||!local)return detail::performWinHttp(request);
+#endif
         httplib::Client client(request.origin);
         if (!client.is_valid()) { response.status = Status::Invalid; return response; }
         const auto proxy=request.proxyOrigin.empty()&&request.useSystemProxy?systemProxyOrigin(request.origin):request.proxyOrigin;

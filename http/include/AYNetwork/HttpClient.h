@@ -34,7 +34,9 @@ struct Response {
 };
 /// Bounded synchronous transport with verified TLS, disabled redirects, and
 /// per-call clients. No request/response logging or inclusion in error strings.
-/// Cancellation/total timeout stop active sockets; OS DNS/launch can still delay return.
+/// Windows pumps an asynchronous request and drains its final close callback;
+/// Explicit-proxy loopback compatibility and other platforms stop active sockets.
+/// Those paths and OS setup/teardown can still delay return.
 Response perform(const Request& request);
 /// Read a credential when needed. Missing/invalid names return empty; never logs.
 std::string environmentCredential(std::string_view name);
