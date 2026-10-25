@@ -41,3 +41,12 @@ headers themselves. No automatic retries are performed.
 Evidence: `unittest/Test_HttpClient.cpp`, loopback request/chunks/redirect/budget,
 timeout/cancellation and injection rejection. Live public TLS/provider calls are
 separate deployment checks, not implied by these local tests.
+# Header-only TLS composition (2026-10-26)
+
+AYNetworkHttp requires TLS rather than silently degrading to HTTP-only. If a
+header-only httplib package was installed without a TLS feature, CMake composes
+OpenSSL 3 and CPPHTTPLIB_OPENSSL_SUPPORT on its global imported interface target,
+so the client and local consumers use a consistent class layout. A precompiled
+httplib without TLS is rejected with a configuration error. Existing packages
+with an enabled TLS backend retain that backend. AYNetwork_HttpTests covers the
+bounded transport; local tests do not certify public TLS service availability.

@@ -1,7 +1,18 @@
 if(TARGET AYNetworkHttp)
     return()
 endif()
-find_package(httplib CONFIG REQUIRED)
+find_package(httplib CONFIG REQUIRED GLOBAL)
+# A header-only port may be installed without its optional TLS feature. The
+# bounded transport promises HTTPS; compose one consistent TLS ABI for every
+# consumer rather than silently compiling a plaintext-only client.
+if(NOT HTTPLIB_IS_USING_OPENSSL AND NOT HTTPLIB_IS_USING_WOLFSSL AND NOT HTTPLIB_IS_USING_MBEDTLS)
+    if(HTTPLIB_IS_COMPILED)
+        message(FATAL_ERROR "AYNetworkHttp requires a TLS-enabled compiled httplib or its header-only port")
+    endif()
+    find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto SSL)
+    target_compile_definitions(httplib::httplib INTERFACE CPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(httplib::httplib INTERFACE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 add_library(AYNetworkHttp STATIC src/HttpClient.cpp src/SystemProxy.cpp)
 target_include_directories(AYNetworkHttp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(AYNetworkHttp PUBLIC cxx_std_23)
