@@ -296,5 +296,16 @@ authentication, snapshot acknowledgment and gameplay decoding.
 Tombstones are retained in full snapshots; the replica refuses resurrection
 even after an authority epoch change. `activeCount` excludes tombstones.
 
-The header-only authority/history/replica tests run independently of the
-optional transport backend. End-to-end packet integration remains separate.
+`SharedObjectWireCodec` encodes one bounded object per snapshot page, an empty
+one-page baseline, and individual deltas as versioned little-endian application
+bodies. Each body fits the existing 16-bit `PacketHeader.length`. The host sends
+them on an authenticated reliable channel with its chosen message types and
+monotonic snapshot ID. `SharedObjectSnapshotAssembler` tolerates reordering and
+identical duplicates, then validates and publishes the complete baseline in
+one replica operation; partial pages never replace live state. A newer snapshot
+supersedes an incomplete one. The host handles page retry, ACK, connection
+lifetime and reliable transport admission. Do not apply a delta until its
+baseline is installed; a Gap requires a new full snapshot.
+
+The header-only authority/history/wire tests run independently of the optional
+transport backend. End-to-end packet integration remains separate.

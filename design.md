@@ -2263,3 +2263,22 @@ The table never infers deletion from absence; explicit tombstones are retained
 and a higher-revision live state cannot resurrect one. Packet ordering,
 resync request/ACK and durable state
 remain transport/host work, while opaque payloads remain gameplay-owned.
+
+`SharedObjectWireCodec` defines a versioned little-endian application body:
+magic/version/kind, authoritative epoch, and either one `(snapshotId,index,count)`
+page or one object delta. A page contains exactly one state (including explicit
+tombstones); an empty table uses a one-page empty baseline. Body size is bounded
+to 16,436 bytes and fits the existing PacketHeader length. The codec rejects
+truncation, trailing bytes, invalid counts, oversize payloads and noncanonical
+tombstones without modifying the output. The authenticated host chooses message
+types and reliable channel, sends all pages with one increasing snapshot ID,
+and handles missing-page retry and baseline ACK.
+
+`SharedObjectSnapshotAssembler` keeps at most 2048 bounded pages on the client
+owner thread. It accepts out-of-order and identical repeated pages, discards
+older snapshot IDs, supersedes incomplete baselines with a newer one, and calls
+`SharedObjectReplica::installSnapshot` only after all pages are present.
+Failed validation leaves the live replica untouched. The host must clear the
+assembler when leaving a session and block deltas until the baseline commits;
+transport packet dispatch, identity binding and multi-process delivery remain
+integration work.

@@ -36,6 +36,7 @@ set(CORE_SRC_FILES
     AYTest_ServerHitHistory.cpp
     AYTest_SharedObjectAuthority.cpp
     AYTest_SharedObjectReplica.cpp
+    AYTest_SharedObjectWire.cpp
     AYTest_ClientInput.cpp        # R5.2 (2026-08-24)
     AYTest_ReplayNetwork.cpp      # R5.3 (2026-08-24)
     AYTest_TransportFaultProfile.cpp   # R5.4 (2026-08-25)
