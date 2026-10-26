@@ -263,4 +263,22 @@ remain application responsibilities. See [Stage16](../../AYDocs/DETERMINISTIC-TR
 
 ReplicationManager::debugSnapshot returns up to256 owned object observations, actual received authority position/correction and existing proxy/input/interpolation/tick counters. Exact reflected FVector3/NetVec3 position/location/translation fields are required for pose extraction; unavailable layouts remain unavailable. Optional received-position capture defaults off and is cleared on unregister/re-register/authority epoch. Bounded tryGetPredictedBytes overload preserves the destination on over-budget state. SnapshotInterpolator::debugSampleNow validates the registered type/size (max64KiB), resolves offsets on a live layout object and samples into owned bytes without invoking accessors on raw storage, writing live state or advancing time. Existing sample still targets the caller live output object.
 
+## Authority-side hit history and shared objects (2026-10-26)
+
+`ServerHitHistory` records complete, validated AABB sets supplied by gameplay
+once per server tick and returns ordered ray candidates only at an exact
+retained tick and authority epoch. It is bounded to 128 ticks and 4096 proxies
+per sample; the host maps authenticated input time to a server tick and checks
+static occlusion, collision details and damage policy after the broad-phase
+query. It does not rewind the live World or alter replication snapshots.
+
+`SharedObjectAuthority` holds stable object IDs, owner connection IDs, opaque
+state bytes and revisions for late-join snapshots. An authority validates a
+compare-and-swap command before applying Claim/Update/Transfer/Release; a
+bounded receipt window makes identical retries idempotent. Departure releases
+owned objects once, and a new authority epoch preserves object state while
+invalidating old commands. The host authenticates connection IDs, transports
+snapshots and deltas, and resolves migration membership; this registry does
+not select network policy or deserialize gameplay state.
+
 Regression sources are included. Runtime tests and interactive editor acceptance are deferred for this content task; untested changes remain uncommitted.

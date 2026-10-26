@@ -4,6 +4,8 @@
 #include <AYNetwork/INetwork.h>
 #include <AYNetwork/NetworkModule.h>
 #include <AYNetwork/NetworkRuntimeModule.h>
+#include <AYNetwork/Replication/ServerHitHistory.h>
+#include <AYNetwork/Replication/SharedObjectAuthority.h>
 #include <AYNetwork/Session/OnlineFlowCoordinator.h>
 #include <AYNetwork/Session/OnlineFlowEvents.h>
 #include <AYNetwork/Session/OnlineFlowRuntimeModule.h>

@@ -2223,4 +2223,27 @@ fails a later fragment before a complete retry.
 
 ReplicationManager::debugSnapshot returns up to256 owned object observations, actual received authority position/correction and existing proxy/input/interpolation/tick counters. Exact reflected FVector3/NetVec3 position/location/translation fields are required for pose extraction; unavailable layouts remain unavailable. Optional received-position capture defaults off and is cleared on unregister/re-register/authority epoch. Bounded tryGetPredictedBytes overload preserves the destination on over-budget state. SnapshotInterpolator::debugSampleNow validates the registered type/size (max64KiB), resolves offsets on a live layout object and samples into owned bytes without invoking accessors on raw storage, writing live state or advancing time. Existing sample still targets the caller live output object.
 
+## Authority-side history and shared object transaction core (2026-10-26)
+
+`ServerHitHistory` is an optional, owner-thread broad-phase sidecar, separate
+from client prediction. `capture(epoch,tick,proxies)` validates a complete set
+before mutation, sorts by NetId, requires forward wrap-safe ticks within the
+half-range, and evicts by both count and tick age. Epoch increases clear old
+samples. `queryRay` requires an exact retained tick and a unit ray, returns
+nearest AABB candidates, and distinguishes wrong epoch, old/missing tick and
+invalid ray. It cannot infer an authenticated client tick, static visibility,
+precise mesh/capsule contacts, damage permission or server World rewind.
+
+`SharedObjectAuthority` is a separate authority-owned CAS state table: ID,
+owner connection, opaque bytes and revision. Valid commands are atomically
+applied once per `(actorConnection,requestId)` inside a 1024-receipt window.
+The command includes expected revision and current epoch; changing the payload
+under a reused request key fails. Claim requires an unowned object; owner or
+server may update, transfer or release. Connection departure releases all its
+leases and increments only affected revisions. `beginEpoch` keeps state but
+clears receipts and rejects older messages. Up to 2048 objects and 16 KiB per
+payload are accepted. The host remains responsible for authenticated identity,
+network delivery, tombstones/despawn, late-join publication, migration owner
+reconciliation and external durable storage.
+
 Regression sources are included. Runtime tests and interactive editor acceptance are deferred for this content task; untested changes remain uncommitted.
