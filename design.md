@@ -2246,4 +2246,12 @@ payload are accepted. The host remains responsible for authenticated identity,
 network delivery, tombstones/despawn, late-join publication, migration owner
 reconciliation and external durable storage.
 
-Regression sources are included. Runtime tests and interactive editor acceptance are deferred for this content task; untested changes remain uncommitted.
+`SharedObjectReplica` mirrors the authority table on one client owner thread.
+A complete snapshot stages a sorted replacement and checks size, unique IDs,
+nonzero revisions and monotonicity of all already known objects, even across
+authority epochs. Deltas require exact next revision; same-version identical
+bytes/owner replay idempotently, conflicting replays fail, and gaps preserve
+the prior state until a fresh snapshot arrives. New objects enter at revision1.
+The table deliberately has no deletion inference because the authority has no
+tombstone command yet. Packet ordering, resync request/ACK and durable state
+remain transport/host work, while opaque payloads remain gameplay-owned.

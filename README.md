@@ -281,4 +281,13 @@ invalidating old commands. The host authenticates connection IDs, transports
 snapshots and deltas, and resolves migration membership; this registry does
 not select network policy or deserialize gameplay state.
 
-Regression sources are included. Runtime tests and interactive editor acceptance are deferred for this content task; untested changes remain uncommitted.
+`SharedObjectReplica` accepts a full late-join or recovery snapshot and then
+only consecutive object revisions from the authenticated authority. Duplicate
+identical revisions are harmless; a missing revision explicitly requests a
+new full snapshot instead of guessing object state. Snapshot validation is
+transactional, and authority migration cannot silently lower an existing
+revision or drop an object. The host owns reliable delivery, epoch
+authentication, snapshot acknowledgment and gameplay decoding.
+
+The header-only authority/history/replica tests run independently of the
+optional transport backend. End-to-end packet integration remains separate.
