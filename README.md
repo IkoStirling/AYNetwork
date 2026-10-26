@@ -265,12 +265,18 @@ ReplicationManager::debugSnapshot returns up to256 owned object observations, ac
 
 ## Authority-side hit history and shared objects (2026-10-26)
 
-`ServerHitHistory` records complete, validated AABB sets supplied by gameplay
-once per server tick and returns ordered ray candidates only at an exact
+`ServerHitHistory` records complete, validated AABB and optional capsule sets
+supplied by gameplay once per server tick. The four-argument `capture` overload
+adds capsules with IDs unique across both shape sets. AABB hits remain broad-phase
+candidates; capsule hits use the exact cylindrical body and rounded ends.
+It returns ordered ray candidates only at an exact
 retained tick and authority epoch. It is bounded to 128 ticks and 4096 proxies
 per sample; the host maps authenticated input time to a server tick and checks
-static occlusion, collision details and damage policy after the broad-phase
+static occlusion, any further collision details and damage policy after the
 query. It does not rewind the live World or alter replication snapshots.
+`queryRayRecent` additionally rejects a requested tick older than a server-owned
+rewind limit or ahead of the latest captured tick, including at `uint32` wrap.
+The host still authenticates the sender and maps its input timestamp.
 
 `SharedObjectAuthority` holds stable object IDs, owner connection IDs, opaque
 state bytes and revisions for late-join snapshots. An authority validates a

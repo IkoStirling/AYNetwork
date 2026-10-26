@@ -2225,14 +2225,22 @@ ReplicationManager::debugSnapshot returns up to256 owned object observations, ac
 
 ## Authority-side history and shared object transaction core (2026-10-26)
 
-`ServerHitHistory` is an optional, owner-thread broad-phase sidecar, separate
-from client prediction. `capture(epoch,tick,proxies)` validates a complete set
-before mutation, sorts by NetId, requires forward wrap-safe ticks within the
+`ServerHitHistory` is an optional, owner-thread historical hit sidecar, separate
+from client prediction. `capture(epoch,tick,proxies[,capsules])` validates a
+complete mixed set before mutation, enforces unique IDs across shapes, sorts by
+NetId, requires forward wrap-safe ticks within the
 half-range, and evicts by both count and tick age. Epoch increases clear old
 samples. `queryRay` requires an exact retained tick and a unit ray, returns
-nearest AABB candidates, and distinguishes wrong epoch, old/missing tick and
-invalid ray. It cannot infer an authenticated client tick, static visibility,
-precise mesh/capsule contacts, damage permission or server World rewind.
+nearest AABB broad-phase and exact capsule surface contacts, and distinguishes
+wrong epoch, old/missing tick and invalid ray. The capsule axis may collapse to
+a sphere. Computation widens coordinates to double to avoid float subtraction
+overflow at extreme world positions. It cannot infer an authenticated client
+tick, static visibility, precise mesh contacts, damage permission or server
+World rewind. The 4096 proxy limit applies to both shape sets combined.
+`queryRayRecent` checks an explicit server-owned maximum age (0 through
+`retainedTicks-1`) against the latest captured tick before exact-tick lookup.
+Future ticks and requests outside this window fail without substituting a frame;
+input-time mapping and actor authentication remain host responsibilities.
 
 `SharedObjectAuthority` is a separate authority-owned CAS state table: ID,
 owner connection, opaque bytes and revision. Valid commands are atomically
