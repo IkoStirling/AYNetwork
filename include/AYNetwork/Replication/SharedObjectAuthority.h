@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <new>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -15,9 +16,10 @@ struct SharedObjectState {
     std::uint32_t ownerConnection = 0; // 0 is authority-owned/unclaimed.
     std::uint64_t revision = 0;
     std::vector<std::uint8_t> bytes;
+    bool retired = false; // Tombstone is replicated; stable ID cannot be reused.
 };
 
-enum class SharedObjectAction { Update, Claim, Transfer, Release };
+enum class SharedObjectAction { Update, Claim, Transfer, Release, Retire };
 struct SharedObjectCommand {
     std::uint64_t epoch = 0;
     std::uint32_t actorConnection = 0; // 0 is the authoritative server.
@@ -37,7 +39,7 @@ struct SharedObjectCommand {
 
 enum class SharedObjectStatus {
     Applied, Replayed, Invalid, WrongEpoch, Missing, RevisionConflict,
-    NotOwner, Capacity
+    NotOwner, Capacity, Retired
 };
 struct SharedObjectResult {
     SharedObjectStatus status = SharedObjectStatus::Invalid;
@@ -64,14 +66,17 @@ public:
     }
     std::uint64_t epoch() const noexcept { return _epoch; }
 
-    /// Authority creates a stable object identity before replication.
+    /// Authority creates a stable object identity before replication. A
+    /// retired ID remains reserved by its tombstone for this session.
     bool publish(std::uint64_t objectId, std::uint32_t ownerConnection,
                  std::vector<std::uint8_t> bytes) {
         if (!_epoch || !objectId || bytes.size() > MaxStateBytes ||
             _objects.size() >= MaxObjects || _objects.count(objectId)) return false;
-        _objects.emplace(objectId,
-                         SharedObjectState{objectId, ownerConnection, 1, std::move(bytes)});
-        return true;
+        try {
+            _objects.emplace(objectId,
+                SharedObjectState{objectId, ownerConnection, 1, std::move(bytes)});
+            return true;
+        } catch (const std::bad_alloc&) { return false; }
     }
 
     std::optional<SharedObjectState> get(std::uint64_t objectId) const {
@@ -91,6 +96,8 @@ public:
 
     /// One successful request consumes exactly one revision. Repeating the
     /// same actor/request ID within the bounded receipt window is idempotent.
+    /// Retire clears owner/payload, publishes one final revision and prevents
+    /// later writes or reuse of the stable ID. Tombstones remain in snapshots.
     SharedObjectResult apply(const SharedObjectCommand& command) {
         if (!command.requestId || !command.objectId || command.epoch != _epoch ||
             !_epoch || command.bytes.size() > MaxStateBytes) {
@@ -107,44 +114,60 @@ public:
         const auto it = _objects.find(command.objectId);
         if (it == _objects.end()) return {SharedObjectStatus::Missing, 0, 0};
         auto& state = it->second;
+        if (state.retired)
+            return {SharedObjectStatus::Retired, state.revision, 0};
         if (state.revision != command.expectedRevision)
             return {SharedObjectStatus::RevisionConflict, state.revision,
                     state.ownerConnection};
         if (state.revision == UINT64_MAX)
             return {SharedObjectStatus::Capacity, state.revision, state.ownerConnection};
-        if (command.action == SharedObjectAction::Claim) {
-            if (!command.actorConnection || command.newOwnerConnection ||
-                !command.bytes.empty()) return {SharedObjectStatus::Invalid, 0, 0};
-            if (state.ownerConnection) return {SharedObjectStatus::NotOwner, state.revision,
-                                               state.ownerConnection};
-            state.ownerConnection = command.actorConnection;
-        } else {
-            if (command.actorConnection != 0 &&
-                command.actorConnection != state.ownerConnection)
-                return {SharedObjectStatus::NotOwner, state.revision,
-                        state.ownerConnection};
-            switch (command.action) {
-            case SharedObjectAction::Update:
-                if (command.newOwnerConnection) return {SharedObjectStatus::Invalid, 0, 0};
-                state.bytes = command.bytes;
-                break;
-            case SharedObjectAction::Transfer:
-                if (!command.newOwnerConnection || !command.bytes.empty())
-                    return {SharedObjectStatus::Invalid, 0, 0};
-                state.ownerConnection = command.newOwnerConnection;
-                break;
-            case SharedObjectAction::Release:
-                if (command.newOwnerConnection || !command.bytes.empty())
-                    return {SharedObjectStatus::Invalid, 0, 0};
-                state.ownerConnection = 0;
-                break;
-            default: return {SharedObjectStatus::Invalid, 0, 0};
+        try {
+            auto next = state;
+            if (command.action == SharedObjectAction::Claim) {
+                if (!command.actorConnection || command.newOwnerConnection ||
+                    !command.bytes.empty()) return {SharedObjectStatus::Invalid, 0, 0};
+                if (state.ownerConnection) return {SharedObjectStatus::NotOwner, state.revision,
+                                                   state.ownerConnection};
+                next.ownerConnection = command.actorConnection;
+            } else {
+                if (command.actorConnection != 0 &&
+                    command.actorConnection != state.ownerConnection)
+                    return {SharedObjectStatus::NotOwner, state.revision,
+                            state.ownerConnection};
+                switch (command.action) {
+                case SharedObjectAction::Update:
+                    if (command.newOwnerConnection) return {SharedObjectStatus::Invalid, 0, 0};
+                    next.bytes = command.bytes;
+                    break;
+                case SharedObjectAction::Transfer:
+                    if (!command.newOwnerConnection || !command.bytes.empty())
+                        return {SharedObjectStatus::Invalid, 0, 0};
+                    next.ownerConnection = command.newOwnerConnection;
+                    break;
+                case SharedObjectAction::Release:
+                    if (command.newOwnerConnection || !command.bytes.empty())
+                        return {SharedObjectStatus::Invalid, 0, 0};
+                    next.ownerConnection = 0;
+                    break;
+                case SharedObjectAction::Retire:
+                    if (command.newOwnerConnection || !command.bytes.empty())
+                        return {SharedObjectStatus::Invalid, 0, 0};
+                    next.ownerConnection = 0;
+                    next.bytes.clear();
+                    next.retired = true;
+                    break;
+                default: return {SharedObjectStatus::Invalid, 0, 0};
+                }
             }
+            ++next.revision;
+            Receipt receipt{key, command, next.revision, next.ownerConnection};
+            _receipts.push_back(std::move(receipt));
+            state = std::move(next);
+            if (_receipts.size() > MaxReceipts) _receipts.pop_front();
+            return {SharedObjectStatus::Applied, state.revision, state.ownerConnection};
+        } catch (const std::bad_alloc&) {
+            return {SharedObjectStatus::Capacity, state.revision, state.ownerConnection};
         }
-        ++state.revision;
-        _receipts.push_back({key, command, state.revision, state.ownerConnection});
-        if (_receipts.size() > MaxReceipts) _receipts.pop_front();
-        return {SharedObjectStatus::Applied, state.revision, state.ownerConnection};
     }
 
     /// Release all objects held by a departed connection; repeated calls do
@@ -152,6 +175,7 @@ public:
     std::vector<std::uint64_t> releaseConnection(std::uint32_t connectionId) {
         std::vector<std::uint64_t> changed;
         if (!connectionId) return changed;
+        changed.reserve(_objects.size());
         for (auto& [id, state] : _objects) {
             if (state.ownerConnection != connectionId || state.revision == UINT64_MAX)
                 continue;

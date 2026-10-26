@@ -2243,8 +2243,15 @@ server may update, transfer or release. Connection departure releases all its
 leases and increments only affected revisions. `beginEpoch` keeps state but
 clears receipts and rejects older messages. Up to 2048 objects and 16 KiB per
 payload are accepted. The host remains responsible for authenticated identity,
-network delivery, tombstones/despawn, late-join publication, migration owner
+network delivery, late-join publication, migration owner
 reconciliation and external durable storage.
+
+`Retire` is an owner/server-authorized final revision. It clears owner and
+payload, retains a tombstone under the stable ID, and blocks later commands or
+republishing that ID. The bounded receipt window still makes exact retries
+idempotent. Candidate object state and receipt allocate before publication;
+allocation failure returns Capacity without a half-applied revision. Tombstone
+entries continue to count toward the 2048-object session limit.
 
 `SharedObjectReplica` mirrors the authority table on one client owner thread.
 A complete snapshot stages a sorted replacement and checks size, unique IDs,
@@ -2252,6 +2259,7 @@ nonzero revisions and monotonicity of all already known objects, even across
 authority epochs. Deltas require exact next revision; same-version identical
 bytes/owner replay idempotently, conflicting replays fail, and gaps preserve
 the prior state until a fresh snapshot arrives. New objects enter at revision1.
-The table deliberately has no deletion inference because the authority has no
-tombstone command yet. Packet ordering, resync request/ACK and durable state
+The table never infers deletion from absence; explicit tombstones are retained
+and a higher-revision live state cannot resurrect one. Packet ordering,
+resync request/ACK and durable state
 remain transport/host work, while opaque payloads remain gameplay-owned.

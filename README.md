@@ -274,12 +274,17 @@ query. It does not rewind the live World or alter replication snapshots.
 
 `SharedObjectAuthority` holds stable object IDs, owner connection IDs, opaque
 state bytes and revisions for late-join snapshots. An authority validates a
-compare-and-swap command before applying Claim/Update/Transfer/Release; a
+compare-and-swap command before applying Claim/Update/Transfer/Release/Retire; a
 bounded receipt window makes identical retries idempotent. Departure releases
 owned objects once, and a new authority epoch preserves object state while
 invalidating old commands. The host authenticates connection IDs, transports
 snapshots and deltas, and resolves migration membership; this registry does
 not select network policy or deserialize gameplay state.
+
+Retire publishes a final tombstone revision, clears owner and payload, and
+reserves the stable ID for the rest of the session. Repeated identical requests
+replay their receipt; later writes or ID reuse fail. Command state and receipt
+are prepared before publication, so allocation failure leaves the old state.
 
 `SharedObjectReplica` accepts a full late-join or recovery snapshot and then
 only consecutive object revisions from the authenticated authority. Duplicate
@@ -288,6 +293,8 @@ new full snapshot instead of guessing object state. Snapshot validation is
 transactional, and authority migration cannot silently lower an existing
 revision or drop an object. The host owns reliable delivery, epoch
 authentication, snapshot acknowledgment and gameplay decoding.
+Tombstones are retained in full snapshots; the replica refuses resurrection
+even after an authority epoch change. `activeCount` excludes tombstones.
 
 The header-only authority/history/replica tests run independently of the
 optional transport backend. End-to-end packet integration remains separate.

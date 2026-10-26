@@ -1,6 +1,7 @@
 #pragma once
 
 #include <AYNetwork/Replication/SharedObjectAuthority.h>
+#include <new>
 
 namespace ayt::net {
 
@@ -15,7 +16,8 @@ class SharedObjectReplica {
 public:
     /// Full late-join/recovery snapshot. Same-epoch snapshots may only move
     /// existing object revisions forward and may not silently drop objects,
-    /// including across authority migration where the table survives.
+    /// including retired tombstones across authority migration. A tombstone
+    /// cannot become live again, even if a newer snapshot claims it did.
     /// Validation is transactional; clear only for a new unrelated session.
     SharedReplicaStatus installSnapshot(std::uint64_t epoch,
                                         std::vector<SharedObjectState> states) {
@@ -23,15 +25,19 @@ public:
             return SharedReplicaStatus::Invalid;
         if (_epoch && epoch<_epoch) return SharedReplicaStatus::Stale;
         std::map<std::uint64_t,SharedObjectState> candidate;
-        for (auto& state:states) {
-            if (!valid(state) || !candidate.emplace(state.objectId,std::move(state)).second)
-                return SharedReplicaStatus::Invalid;
-        }
+        try {
+            for (auto& state:states) {
+                if (!valid(state) || !candidate.emplace(state.objectId,std::move(state)).second)
+                    return SharedReplicaStatus::Invalid;
+            }
+        } catch (const std::bad_alloc&) { return SharedReplicaStatus::Capacity; }
         if (_epoch) {
             for (const auto& [id,current]:_objects) {
                 const auto incoming=candidate.find(id);
                 if (incoming==candidate.end() || incoming->second.revision<current.revision)
                     return SharedReplicaStatus::Stale;
+                if (current.retired && !incoming->second.retired)
+                    return SharedReplicaStatus::Invalid;
                 if (incoming->second.revision==current.revision &&
                     !same(incoming->second,current))
                     return SharedReplicaStatus::Invalid;
@@ -44,7 +50,8 @@ public:
 
     /// One authority state revision. New objects must begin at revision 1;
     /// existing objects must advance by exactly one. Equal identical state
-    /// is an idempotent replay. No deletion is inferred from absent updates.
+    /// is an idempotent replay. A tombstone is an explicit final revision;
+    /// no deletion is inferred from absent updates.
     SharedReplicaStatus applyDelta(std::uint64_t epoch,
                                    SharedObjectState state) {
         if (!epoch || epoch!=_epoch) return SharedReplicaStatus::WrongEpoch;
@@ -54,13 +61,16 @@ public:
             if (state.revision!=1) return SharedReplicaStatus::Gap;
             if (_objects.size()>=SharedObjectAuthority::MaxObjects)
                 return SharedReplicaStatus::Capacity;
-            _objects.emplace(state.objectId,std::move(state));
-            return SharedReplicaStatus::Applied;
+            try {
+                _objects.emplace(state.objectId,std::move(state));
+                return SharedReplicaStatus::Applied;
+            } catch (const std::bad_alloc&) { return SharedReplicaStatus::Capacity; }
         }
         if (state.revision==it->second.revision)
             return same(state,it->second) ? SharedReplicaStatus::Replayed
                                           : SharedReplicaStatus::Invalid;
         if (state.revision<it->second.revision) return SharedReplicaStatus::Stale;
+        if (it->second.retired) return SharedReplicaStatus::Invalid;
         if (it->second.revision==UINT64_MAX ||
             state.revision!=it->second.revision+1) return SharedReplicaStatus::Gap;
         it->second=std::move(state);
@@ -70,6 +80,12 @@ public:
     void clear() noexcept { _objects.clear(); _epoch=0; }
     std::uint64_t epoch() const noexcept { return _epoch; }
     std::size_t size() const noexcept { return _objects.size(); }
+    /// Active count excludes retained tombstones; size() includes them.
+    std::size_t activeCount() const noexcept {
+        std::size_t count=0;
+        for (const auto& [id,state]:_objects) if (!state.retired) ++count;
+        return count;
+    }
     std::optional<SharedObjectState> get(std::uint64_t id) const {
         const auto it=_objects.find(id);
         return it==_objects.end() ? std::nullopt
@@ -84,11 +100,12 @@ public:
 private:
     static bool valid(const SharedObjectState& state) noexcept {
         return state.objectId && state.revision &&
-            state.bytes.size()<=SharedObjectAuthority::MaxStateBytes;
+            state.bytes.size()<=SharedObjectAuthority::MaxStateBytes &&
+            (!state.retired || (!state.ownerConnection && state.bytes.empty()));
     }
     static bool same(const SharedObjectState& a,const SharedObjectState& b) noexcept {
         return a.objectId==b.objectId && a.ownerConnection==b.ownerConnection &&
-            a.revision==b.revision && a.bytes==b.bytes;
+            a.revision==b.revision && a.bytes==b.bytes && a.retired==b.retired;
     }
     std::map<std::uint64_t,SharedObjectState> _objects;
     std::uint64_t _epoch=0;

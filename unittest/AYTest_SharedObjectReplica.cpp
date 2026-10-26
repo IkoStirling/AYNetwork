@@ -56,4 +56,26 @@ TEST_CASE(epoch_and_conflicting_replay_cannot_corrupt_object_state) {
     CHECK_INT_EQ(replica.applyDelta(5,{10,0,6,{10}}),SharedReplicaStatus::WrongEpoch);
     CHECK_INT_EQ(replica.get(10)->ownerConnection,0);
 }
+TEST_CASE(tombstone_delta_and_snapshot_prevent_resurrection) {
+    SharedObjectAuthority authority;
+    CHECK(authority.beginEpoch(5));
+    CHECK(authority.publish(8,9,{8}));
+    SharedObjectReplica replica;
+    CHECK_INT_EQ(replica.installSnapshot(5,authority.snapshot()),SharedReplicaStatus::Applied);
+    CHECK_INT_EQ(authority.apply({5,9,1,8,1,SharedObjectAction::Retire}).status,
+                 SharedObjectStatus::Applied);
+    const auto retired=*authority.get(8);
+    CHECK_INT_EQ(replica.applyDelta(5,retired),SharedReplicaStatus::Applied);
+    CHECK_INT_EQ(replica.applyDelta(5,retired),SharedReplicaStatus::Replayed);
+    CHECK_INT_EQ(replica.size(),1);
+    CHECK_INT_EQ(replica.activeCount(),0);
+    CHECK(replica.get(8)->retired);
+    CHECK_INT_EQ(replica.applyDelta(5,{8,0,3,{9}}),SharedReplicaStatus::Invalid);
+    CHECK_INT_EQ(replica.installSnapshot(5,{{8,0,3,{9}}}),SharedReplicaStatus::Invalid);
+    CHECK_INT_EQ(replica.installSnapshot(5,{}),SharedReplicaStatus::Stale);
+    CHECK(authority.beginEpoch(6));
+    CHECK_INT_EQ(replica.installSnapshot(6,authority.snapshot()),SharedReplicaStatus::Applied);
+    CHECK(replica.get(8)->retired);
+    CHECK_INT_EQ(replica.installSnapshot(6,{{8,1,3,{},true}}),SharedReplicaStatus::Invalid);
+}
 TEST_SUITE_END

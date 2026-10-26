@@ -93,4 +93,24 @@ TEST_CASE(payload_limit_rejects_before_mutation_and_receipt_eviction_stays_safe)
                  SharedObjectStatus::RevisionConflict);
     CHECK_INT_EQ(registry.get(1)->revision, SharedObjectAuthority::MaxReceipts + 2);
 }
+TEST_CASE(retire_publishes_final_tombstone_and_reserves_stable_identity) {
+    SharedObjectAuthority registry;
+    CHECK(registry.beginEpoch(1));
+    CHECK(registry.publish(42, 7, {1,2,3}));
+    const SharedObjectCommand retire{1,7,10,42,1,SharedObjectAction::Retire};
+    CHECK_INT_EQ(registry.apply(retire).status,SharedObjectStatus::Applied);
+    CHECK_INT_EQ(registry.apply(retire).status,SharedObjectStatus::Replayed);
+    const auto state=registry.get(42);
+    CHECK(state.has_value());
+    CHECK(state->retired && state->revision==2);
+    CHECK(state->ownerConnection==0 && state->bytes.empty());
+    CHECK_FALSE(registry.publish(42,0,{9}));
+    CHECK_INT_EQ(registry.apply({1,7,11,42,2,SharedObjectAction::Update,0,{4}}).status,
+                 SharedObjectStatus::Retired);
+    CHECK(registry.releaseConnection(7).empty());
+    CHECK(registry.beginEpoch(2));
+    CHECK(registry.snapshot()[0].retired);
+    CHECK_INT_EQ(registry.apply({2,0,1,42,2,SharedObjectAction::Claim}).status,
+                 SharedObjectStatus::Retired);
+}
 TEST_SUITE_END
