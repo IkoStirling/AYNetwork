@@ -6,6 +6,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <span>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -24,10 +25,13 @@ struct HistoryCapsule {
     float radius = 0;
 };
 struct HistoryRay { HistoryVec3 origin{}, direction{}; float maxDistance = 0; };
+/// Caller-supplied static blocker proxy for the queried server tick. AABBs
+/// conservatively occlude targets; exact mesh visibility remains game-owned.
+struct HistoryStaticOccluder { HistoryVec3 min{}, max{}; };
 struct HistoryRayCandidate { std::uint32_t netId = 0; float distance = 0; };
 enum class HistoryQueryStatus {
     Ready, InvalidRay, WrongEpoch, MissingTick, TooOld,
-    InvalidWindow, OutsideWindow
+    InvalidWindow, OutsideWindow, InvalidOccluder
 };
 struct HistoryRayResult {
     HistoryQueryStatus status = HistoryQueryStatus::MissingTick;
@@ -147,6 +151,42 @@ public:
         if (age >= 0x8000'0000u || age > maxAgeTicks)
             return {HistoryQueryStatus::OutsideWindow, {}};
         return queryRay(epoch, tick, ray);
+    }
+
+    /// Apply a game-supplied, complete static AABB set after the exact-tick
+    /// rewind and server age checks. A blocker at or before a candidate's
+    /// first contact hides that candidate; a ray starting inside a blocker
+    /// hides all candidates. Invalid blockers reject the whole result. The
+    /// Host supplies geometry valid for this tick and still owns precise
+    /// visibility, client clock trust, damage and target authorization.
+    HistoryRayResult queryRayRecentOccluded(
+        std::uint64_t epoch, std::uint32_t tick,
+        std::uint32_t maxAgeTicks, const HistoryRay& ray,
+        std::span<const HistoryStaticOccluder> occluders) const {
+        auto result=queryRayRecent(epoch,tick,maxAgeTicks,ray);
+        if (result.status!=HistoryQueryStatus::Ready) return result;
+        if (occluders.size()>MaxProxies)
+            return {HistoryQueryStatus::InvalidOccluder,{}};
+        float firstBlock=ray.maxDistance;
+        bool hasBlock=false;
+        for (const auto& blocker:occluders) {
+            if (!valid(blocker.min) || !valid(blocker.max) ||
+                blocker.min.x>blocker.max.x ||
+                blocker.min.y>blocker.max.y ||
+                blocker.min.z>blocker.max.z)
+                return {HistoryQueryStatus::InvalidOccluder,{}};
+            const auto contact=intersect(ray,HistoryAabb{
+                0,blocker.min,blocker.max});
+            if (contact) {
+                hasBlock=true;
+                firstBlock=std::min(firstBlock,*contact);
+            }
+        }
+        if (hasBlock)
+            std::erase_if(result.candidates,[&](const auto& candidate) {
+                return candidate.distance>=firstBlock;
+            });
+        return result;
     }
 
 private:

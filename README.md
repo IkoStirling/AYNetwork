@@ -272,10 +272,14 @@ candidates; capsule hits use the exact cylindrical body and rounded ends.
 It returns ordered ray candidates only at an exact
 retained tick and authority epoch. It is bounded to 128 ticks and 4096 proxies
 per sample; the host maps authenticated input time to a server tick and checks
-static occlusion, any further collision details and damage policy after the
+further collision details and damage policy after the
 query. It does not rewind the live World or alter replication snapshots.
 `queryRayRecent` additionally rejects a requested tick older than a server-owned
 rewind limit or ahead of the latest captured tick, including at `uint32` wrap.
+`queryRayRecentOccluded` accepts up to 4096 game-supplied static AABBs valid
+for the queried tick and hides candidates at or behind the first blocker.
+Invalid blockers reject the whole query. AABB occlusion is conservative;
+precise mesh visibility and changed/destructible geometry remain game checks.
 The host still authenticates the sender and maps its input timestamp.
 
 `SharedObjectAuthority` holds stable object IDs, owner connection IDs, opaque

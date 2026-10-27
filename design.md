@@ -2235,12 +2235,18 @@ nearest AABB broad-phase and exact capsule surface contacts, and distinguishes
 wrong epoch, old/missing tick and invalid ray. The capsule axis may collapse to
 a sphere. Computation widens coordinates to double to avoid float subtraction
 overflow at extreme world positions. It cannot infer an authenticated client
-tick, static visibility, precise mesh contacts, damage permission or server
+tick, precise mesh contacts, damage permission or server
 World rewind. The 4096 proxy limit applies to both shape sets combined.
 `queryRayRecent` checks an explicit server-owned maximum age (0 through
 `retainedTicks-1`) against the latest captured tick before exact-tick lookup.
 Future ticks and requests outside this window fail without substituting a frame;
 input-time mapping and actor authentication remain host responsibilities.
+`queryRayRecentOccluded` additionally validates at most 4096 caller-supplied
+static AABBs after the same age/exact-tick checks and removes candidates whose
+first contact is at or behind the nearest blocker. An origin inside a blocker
+removes all candidates; malformed blockers return `InvalidOccluder` without
+partial candidates. AABB blockers may conservatively reject a visible target,
+so precise visibility and geometry changes remain game-owned.
 
 `SharedObjectAuthority` is a separate authority-owned CAS state table: ID,
 owner connection, opaque bytes and revision. Valid commands are atomically

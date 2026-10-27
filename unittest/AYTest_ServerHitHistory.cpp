@@ -1,5 +1,6 @@
 #include <AYTest.h>
 #include <AYNetwork/Replication/ServerHitHistory.h>
+#include <array>
 #include <limits>
 
 using namespace ayt::net;
@@ -143,5 +144,37 @@ TEST_CASE(server_owned_rewind_window_rejects_old_and_future_ticks) {
                  HistoryQueryStatus::InvalidRay);
     CHECK_INT_EQ(history.queryRayRecent(7, wrap, 2, ray).status,
                  HistoryQueryStatus::Ready);
+}
+TEST_CASE(static_occluders_filter_only_candidates_behind_first_blocker) {
+    ServerHitHistory history(4);
+    CHECK(history.capture(9,10,
+        {{1,{2,-1,-1},{3,1,1}},
+         {2,{6,-1,-1},{7,1,1}},
+         {3,{8,-1,-1},{9,1,1}}}));
+    const HistoryRay ray{{0,0,0},{1,0,0},12};
+    const std::array<HistoryStaticOccluder,1> wall{{
+        {{6,-2,-2},{6.5f,2,2}}}};
+    const auto visible=history.queryRayRecentOccluded(9,10,2,ray,wall);
+    CHECK_INT_EQ(visible.status,HistoryQueryStatus::Ready);
+    CHECK_INT_EQ(visible.candidates.size(),1);
+    CHECK_INT_EQ(visible.candidates[0].netId,1);
+    CHECK_INT_EQ(history.queryRayRecentOccluded(9,10,2,ray,{}).candidates.size(),3);
+    const std::array<HistoryStaticOccluder,1> offRay{{
+        {{4,3,-1},{5,4,1}}}};
+    CHECK_INT_EQ(history.queryRayRecentOccluded(9,10,2,ray,offRay)
+                     .candidates.size(),3);
+    const std::array<HistoryStaticOccluder,1> inside{{
+        {{-1,-1,-1},{1,1,1}}}};
+    CHECK_INT_EQ(history.queryRayRecentOccluded(9,10,2,ray,inside)
+                     .candidates.size(),0);
+    const std::array<HistoryStaticOccluder,1> invalid{{
+        {{4,0,0},{3,1,1}}}};
+    CHECK_INT_EQ(history.queryRayRecentOccluded(9,10,2,ray,invalid).status,
+                 HistoryQueryStatus::InvalidOccluder);
+    CHECK_INT_EQ(history.queryRayRecentOccluded(9,10,0,ray,wall).status,
+                 HistoryQueryStatus::Ready);
+    CHECK(history.capture(9,11,{}));
+    CHECK_INT_EQ(history.queryRayRecentOccluded(9,10,0,ray,wall).status,
+                 HistoryQueryStatus::OutsideWindow);
 }
 TEST_SUITE_END
