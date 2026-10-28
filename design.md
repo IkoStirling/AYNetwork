@@ -1,5 +1,9 @@
 # AYNetwork Design
 
+> 2026-10-29: historical AABB ray intervals use entry/exit names so including
+> `ServerHitHistory.h` after Windows headers remains valid. Platform macros and
+> query behavior are unchanged; the history test compiles this include order.
+
 > 2026-10-26: the separate bounded `AYNetworkHttp` transport uses asynchronous
 > WinHTTP on Windows behind its synchronous owned-result facade. Cancellation
 > closes a pending request and drains HANDLE_CLOSING before context destruction;

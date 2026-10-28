@@ -1,4 +1,12 @@
 #include <AYTest.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+// Exercise the public header after the platform header, as Editor consumers
+// do. Windows defines near/far macros even in a 64-bit build.
+#include <windows.h>
+#endif
 #include <AYNetwork/Replication/ServerHitHistory.h>
 #include <array>
 #include <limits>

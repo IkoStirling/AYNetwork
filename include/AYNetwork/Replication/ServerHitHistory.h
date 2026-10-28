@@ -276,7 +276,7 @@ private:
     }
     static std::optional<float> intersect(const HistoryRay& ray,
                                            const HistoryAabb& box) noexcept {
-        double near = 0, far = ray.maxDistance;
+        double entryDistance = 0, exitDistance = ray.maxDistance;
         const float origins[3] = {ray.origin.x, ray.origin.y, ray.origin.z};
         const float directions[3] = {ray.direction.x, ray.direction.y, ray.direction.z};
         const float mins[3] = {box.min.x, box.min.y, box.min.z};
@@ -292,11 +292,11 @@ private:
             auto last = (static_cast<double>(maxs[axis]) - origins[axis]) /
                         directions[axis];
             if (first > last) std::swap(first, last);
-            near = std::max(near, first);
-            far = std::min(far, last);
-            if (near > far) return std::nullopt;
+            entryDistance = std::max(entryDistance, first);
+            exitDistance = std::min(exitDistance, last);
+            if (entryDistance > exitDistance) return std::nullopt;
         }
-        return static_cast<float>(near);
+        return static_cast<float>(entryDistance);
     }
 
     std::deque<Frame> _frames;

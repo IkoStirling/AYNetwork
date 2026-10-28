@@ -21,6 +21,8 @@ AYNetwork 是网络传输、协议、复制与 RPC 模块，使用 GameNetworkin
 ```
 
 稳定接口位于 `interface/AYNetwork/`，实现与协议公开头位于 `include/AYNetwork/`。
+`ServerHitHistory.h` 支持在 Windows 平台头之后包含；射线区间局部变量避开平台
+`near/far` 宏，不修改调用方宏状态。对应头文件顺序由历史查询测试编译覆盖。
 
 ## 依赖
 
